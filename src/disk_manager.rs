@@ -46,3 +46,52 @@ impl DiskManager {
         self.file.flush().expect("Flush failed");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn write_and_read_page_should_be_consistent() {
+        let path = "test.db";
+
+        let mut dm = DiskManager::new(path, 4);
+
+        let data = vec![1, 2, 3, 4];
+
+        dm.write_page(0, &data);
+
+        let result = dm.read_page(0);
+
+        assert_eq!(result, data);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pages_should_not_overwrite_each_other() {
+        let path = "test.db";
+        let mut dm = DiskManager::new(path, 4);
+
+        dm.write_page(0, &[1, 1, 1, 1]);
+        dm.write_page(1, &[2, 2, 2, 2]);
+
+        assert_eq!(dm.read_page(0), vec![1, 1, 1, 1]);
+        assert_eq!(dm.read_page(1), vec![2, 2, 2, 2]);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn reading_empty_page_should_return_zeroed_buffer() {
+        let path = "test.db";
+        let mut dm = DiskManager::new(path, 4);
+
+        let data = dm.read_page(99);
+
+        assert_eq!(data, vec![0; 4]);
+
+        std::fs::remove_file(path).ok();
+    }
+}
