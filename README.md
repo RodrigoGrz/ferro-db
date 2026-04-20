@@ -5,7 +5,7 @@ A toy database built in Rust following CMU Database Systems lectures.
 ## Features (WIP)
 
 - [x] Buffer Pool Manager
-- [x] LRU Replacement
+- [x] LRU-K Replacement
 - [x] Disk Manager (file-based)
 - [ ] B-Tree Index
 - [ ] Query Execution Engine

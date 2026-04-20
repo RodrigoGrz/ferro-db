@@ -5,13 +5,13 @@ mod replacer;
 use std::{collections::HashMap};
 use page::Page;
 use disk_manager::DiskManager;
-use replacer::LRUReplacer;
+use replacer::LRUKReplacer;
 
 struct BufferPoolManager {
     pages: Vec<Page>,
     page_table: HashMap<u32, usize>,
     free_list: Vec<usize>,
-    replacer: LRUReplacer,
+    replacer: LRUKReplacer,
     disk_manager: DiskManager,
 }
 
@@ -27,7 +27,7 @@ impl BufferPoolManager {
             pages,
             page_table: HashMap::new(),
             free_list,
-            replacer: LRUReplacer::new(),
+            replacer: LRUKReplacer::new(2),
             disk_manager: DiskManager::new("data.db", page_size),
         }
     }
@@ -38,6 +38,7 @@ impl BufferPoolManager {
 
             page.pin_count += 1;
 
+            self.replacer.record_access(frame_id);
             self.replacer.pin(frame_id);
 
             return Some(page);
@@ -69,6 +70,7 @@ impl BufferPoolManager {
 
         self.page_table.insert(page_id, frame_id);
 
+        self.replacer.record_access(frame_id);
         self.replacer.pin(frame_id);
 
         Some(page)
