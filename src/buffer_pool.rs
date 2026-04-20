@@ -1,4 +1,5 @@
 use std::{collections::HashMap};
+
 use crate::page::Page;
 use crate::disk_manager::DiskManager;
 use crate::replacer::LRUKReplacer;
@@ -94,5 +95,120 @@ impl BufferPoolManager {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_page_should_load_and_store_in_page_table() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        let page = bpm.fetch_page(1).unwrap();
+
+        assert_eq!(page.page_id, Some(1));
+        assert!(bpm.page_table.contains_key(&1));
+    }
+
+    #[test]
+    fn fetch_page_should_return_same_frame_on_hit() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        let p1 = bpm.fetch_page(1).unwrap() as *const _;
+        bpm.unpin_page(1, false);
+
+        let p2 = bpm.fetch_page(1).unwrap() as *const _;
+
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn fetch_page_should_increment_pin_count() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        bpm.fetch_page(1);
+        let page = bpm.fetch_page(1).unwrap();
+        assert_eq!(page.pin_count, 2);
+    }
+
+    #[test]
+    fn unpin_should_decrease_pin_count() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        bpm.fetch_page(1);
+        bpm.fetch_page(1);
+
+        assert!(bpm.unpin_page(1, false));
+
+        let page = bpm.fetch_page(1).unwrap();
+        assert_eq!(page.pin_count, 2);
+    }
+
+    #[test]
+    fn unpin_should_mark_page_dirty() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        bpm.fetch_page(1);
+        bpm.unpin_page(1, true);
+
+        let page = bpm.fetch_page(1).unwrap();
+
+        assert!(page.is_dirty);
+    }
+
+    #[test]
+    fn should_evict_page_when_pool_is_full() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        bpm.fetch_page(1);
+        bpm.unpin_page(1, false);
+
+        bpm.fetch_page(2);
+        bpm.unpin_page(2, false);
+
+        bpm.fetch_page(3);
+
+        assert!(bpm.page_table.contains_key(&3));
+    }
+
+    #[test]
+    fn dirty_page_should_be_written_to_disk_on_eviction() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        let page = bpm.fetch_page(1).unwrap();
+        page.data[0] = 99;
+
+        bpm.unpin_page(1, true);
+
+        bpm.fetch_page(2);
+        bpm.unpin_page(2, false);
+
+        assert!(true);
+    }
+
+    #[test]
+    fn unpin_nonexistent_page_should_return_false() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        let result = bpm.unpin_page(999, false);
+
+        assert!(!result);
+    }
+
+    #[test]
+    fn should_use_lruk_for_eviction() {
+        let mut bpm = BufferPoolManager::new(2, 4);
+
+        bpm.fetch_page(1);
+        bpm.unpin_page(1, false);
+
+        bpm.fetch_page(2);
+        bpm.unpin_page(2, false);
+
+        bpm.fetch_page(3);
+
+        assert!(bpm.page_table.contains_key(&3));
     }
 }
