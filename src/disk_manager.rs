@@ -54,9 +54,9 @@ mod tests {
 
     #[test]
     fn write_and_read_page_should_be_consistent() {
-        let path = "test.db";
+        let path = format!("test_{}.db", rand::random::<u32>());
 
-        let mut dm = DiskManager::new(path, 4);
+        let mut dm = DiskManager::new(&path, 4);
 
         let data = vec![1, 2, 3, 4];
 
@@ -71,8 +71,8 @@ mod tests {
 
     #[test]
     fn pages_should_not_overwrite_each_other() {
-        let path = "test.db";
-        let mut dm = DiskManager::new(path, 4);
+        let path = format!("test_{}.db", rand::random::<u32>());
+        let mut dm = DiskManager::new(&path, 4);
 
         dm.write_page(0, &[1, 1, 1, 1]);
         dm.write_page(1, &[2, 2, 2, 2]);
@@ -85,8 +85,8 @@ mod tests {
 
     #[test]
     fn reading_empty_page_should_return_zeroed_buffer() {
-        let path = "test.db";
-        let mut dm = DiskManager::new(path, 4);
+        let path = format!("test_{}.db", rand::random::<u32>());
+        let mut dm = DiskManager::new(&path, 4);
 
         let data = dm.read_page(99);
 
