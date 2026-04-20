@@ -1,58 +1,11 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::{collections::{HashMap, VecDeque}};
+mod disk_manager;
+mod page;
+mod replacer;
 
-#[derive(Debug)]
-struct Page {
-    page_id: Option<u32>,
-    data: Vec<u8>,
-    pin_count: u32,
-    is_dirty: bool,
-}
-
-impl Page {
-    fn new(page_size: usize) -> Self {
-        Self {
-            page_id: None,
-            data: vec![0; page_size],
-            pin_count: 0,
-            is_dirty: false,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.page_id = None;
-        self.data.fill(0);
-        self.pin_count = 0;
-        self.is_dirty = false;
-    }
-}
-
-#[derive(Debug)]
-struct LRUReplacer {
-    list: VecDeque<usize>,
-}
-impl LRUReplacer {
-    fn new() -> Self {
-        Self {
-            list: VecDeque::new(),
-        }
-    }
-
-    fn victim(&mut self) -> Option<usize> {
-        self.list.pop_front()
-    }
-
-    fn pin(&mut self, frame_id: usize) {
-        self.list.retain(|&x| x != frame_id);
-    }
-
-    fn unpin(&mut self, frame_id: usize) {
-        if !self.list.contains(&frame_id) {
-            self.list.push_back(frame_id);
-        }
-    }
-}
+use std::{collections::HashMap};
+use page::Page;
+use disk_manager::DiskManager;
+use replacer::LRUReplacer;
 
 struct BufferPoolManager {
     pages: Vec<Page>,
@@ -137,52 +90,6 @@ impl BufferPoolManager {
         }
 
         false
-    }
-}
-
-struct DiskManager {
-    file: File,
-    page_size: usize,
-}
-
-impl DiskManager {
-    fn new(path: &str, page_size: usize) -> Self {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .expect("Failed to open file");
-
-        Self { file, page_size }
-    }
-
-    fn read_page(&mut self, page_id: u32) -> Vec<u8> {
-        let mut buffer = vec![0; self.page_size];
-
-        let offset = page_id as u64 * self.page_size as u64;
-
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .expect("Seek failed");
-
-        let _ = self.file.read(&mut buffer);
-
-        buffer
-    }
-
-    fn write_page(&mut self, page_id: u32, data: &[u8]) {
-        let offset = page_id as u64 * self.page_size as u64;
-
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .expect("Seek failed");
-
-        self.file
-            .write_all(data)
-            .expect("Write failed");
-
-        self.file.flush().expect("Flush failed");
     }
 }
 
