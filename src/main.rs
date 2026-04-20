@@ -60,6 +60,8 @@ impl BufferPoolManager {
 
         let page = &mut self.pages[frame_id];
 
+        page.reset_metadata();
+
         page.page_id = Some(page_id);
         page.data = data;
         page.pin_count = 1;
@@ -76,9 +78,11 @@ impl BufferPoolManager {
         if let Some(&frame_id) = self.page_table.get(&page_id) {
             let page = &mut self.pages[frame_id];
 
-            if page.pin_count > 0 {
-                page.pin_count -= 1;
+            if page.pin_count == 0 {
+                return false;
             }
+
+            page.pin_count -= 1;
 
             if is_dirty {
                 page.is_dirty = true;

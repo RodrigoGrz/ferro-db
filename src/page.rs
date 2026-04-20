@@ -16,10 +16,8 @@ impl Page {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
+    pub fn reset_metadata(&mut self) {
         self.page_id = None;
-        self.data.fill(0);
         self.pin_count = 0;
         self.is_dirty = false;
     }
