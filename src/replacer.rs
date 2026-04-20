@@ -32,10 +32,8 @@ impl LRUKReplacer {
     }
 
     pub fn victim(&mut self) -> Option<usize> {
-        let mut victim = None;
-        let mut max_distance = 0;
-
-        let mut oldest = usize::MAX;
+        let mut inf_candidate: Option<(usize, usize)> = None;
+        let mut best_candidate: Option<(usize, usize)> = None;
 
         for (&frame_id, timestamps) in &self.history {
             if !self.evictable.contains(&frame_id) {
@@ -43,34 +41,34 @@ impl LRUKReplacer {
             }
 
             if timestamps.len() < self.k {
-                let first = timestamps.front().unwrap();
-                if *first < oldest {
-                    oldest = *first;
-                    victim = Some(frame_id);
+                let oldest = *timestamps.front().unwrap();
+
+                match inf_candidate {
+                    None => inf_candidate = Some((frame_id, oldest)),
+                    Some((fid, t)) => {
+                        if oldest < t || (oldest == t && frame_id < fid) {
+                            inf_candidate = Some((frame_id, oldest));
+                        }
+                    }
                 }
-            }
-        }
-
-        if let Some(v) = victim {
-            self.evictable.remove(&v);
-            self.history.remove(&v);
-            return Some(v);
-        }
-
-        for (&frame_id, timestamps) in &self.history {
-            if !self.evictable.contains(&frame_id) {
-                continue;
-            }
-
-            if let Some(&kth_time) = timestamps.front() {
+            } else {
+                let kth_time = *timestamps.front().unwrap();
                 let distance = self.current_timestamp - kth_time;
-                
-                if distance > max_distance {
-                    max_distance = distance;
-                    victim = Some(frame_id);
+
+                match best_candidate {
+                    None => best_candidate = Some((frame_id, distance)),
+                    Some((fid, d)) => {
+                        if distance > d || (distance == d && frame_id < fid) {
+                            best_candidate = Some((frame_id, distance));
+                        }
+                    }
                 }
             }
         }
+
+        let victim = inf_candidate
+            .map(|(fid, _)| fid)
+            .or_else(|| best_candidate.map(|(fid, _)| fid));
 
         if let Some(v) = victim {
             self.evictable.remove(&v);
