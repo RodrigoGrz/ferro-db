@@ -22,3 +22,34 @@ impl Page {
         self.is_dirty = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_new_should_initialize_correctly() {
+        let page = Page::new(4);
+
+        assert_eq!(page.page_id, None);
+        assert_eq!(page.pin_count, 0);
+        assert_eq!(page.is_dirty, false);
+        assert_eq!(page.data.len(), 4);
+        assert!(page.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn reset_metadata_should_clear_fields() {
+        let mut page = Page::new(4);
+
+        page.page_id = Some(10);
+        page.pin_count = 3;
+        page.is_dirty = true;
+
+        page.reset_metadata();
+
+        assert_eq!(page.page_id, None);
+        assert_eq!(page.pin_count, 0);
+        assert_eq!(page.is_dirty, false);
+    }
+}
