@@ -86,3 +86,127 @@ impl LRUKReplacer {
         self.evictable.insert(frame_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_access_should_store_history_up_to_k() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+        replacer.record_access(1);
+        replacer.record_access(1);
+
+        let history = replacer.history.get(&1).unwrap();
+
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn victim_should_ignore_pinned_frames() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+        replacer.record_access(2);
+
+        replacer.unpin(1);
+        replacer.unpin(2);
+
+        replacer.pin(1);
+
+        let victim = replacer.victim();
+
+        assert_eq!(victim, Some(2));
+    }
+
+    #[test]
+    fn victim_should_prioritize_less_than_k_accesses() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+
+        replacer.record_access(2);
+        replacer.record_access(2);
+
+        replacer.unpin(1);
+        replacer.unpin(2);
+
+        let victim = replacer.victim();
+
+        assert_eq!(victim, Some(1));
+    }
+
+    #[test]
+    fn victim_should_use_k_distance_when_all_have_k() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+        replacer.record_access(1);
+
+        replacer.record_access(2);
+        replacer.record_access(2);
+
+        replacer.unpin(1);
+        replacer.unpin(2);
+
+        let victim = replacer.victim();
+
+        assert_eq!(victim, Some(1));
+    }
+
+    #[test]
+    fn victim_should_remove_frame_from_history_and_evictable() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+        replacer.unpin(1);
+
+        let victim = replacer.victim().unwrap();
+
+        assert_eq!(victim, 1);
+        assert!(!replacer.history.contains_key(&1));
+        assert!(!replacer.evictable.contains(&1));
+    }
+
+    #[test]
+    fn victim_should_return_none_when_no_evictable_frames() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+        replacer.record_access(2);
+
+        let victim = replacer.victim();
+
+        assert_eq!(victim, None);
+    }
+
+    #[test]
+    fn victim_should_break_tie_by_lower_frame_id() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+        replacer.record_access(2);
+
+        replacer.unpin(1);
+        replacer.unpin(2);
+
+        let victim = replacer.victim();
+
+        assert_eq!(victim, Some(1));
+    }
+
+    #[test]
+    fn pin_and_unpin_should_control_evictable_state() {
+        let mut replacer = LRUKReplacer::new(2);
+
+        replacer.record_access(1);
+
+        replacer.unpin(1);
+        assert!(replacer.evictable.contains(&1));
+
+        replacer.pin(1);
+        assert!(!replacer.evictable.contains(&1));
+    }
+}
