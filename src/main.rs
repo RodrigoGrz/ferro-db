@@ -67,6 +67,8 @@ impl BufferPoolManager {
 
         self.page_table.insert(page_id, frame_id);
 
+        self.replacer.pin(frame_id);
+
         Some(page)
     }
 
@@ -103,14 +105,21 @@ fn main() {
     bpm.unpin_page(1, true);
 
     {
-        bpm.fetch_page(2);
+        let page = bpm.fetch_page(2).unwrap();
+        page.data[0] = 43;
     }
-    bpm.unpin_page(2, false);
+    bpm.unpin_page(2, true);
 
     {
         bpm.fetch_page(3);
     }
     bpm.unpin_page(3, false);
+
+    {
+        let page = bpm.fetch_page(2).unwrap();
+        println!("{}", page.data[0]);
+    }
+    bpm.unpin_page(2, false);
 
     let page = bpm.fetch_page(1).unwrap();
     println!("{}", page.data[0]);

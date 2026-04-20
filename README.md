@@ -14,3 +14,9 @@ A toy database built in Rust following CMU Database Systems lectures.
 ## Goal
 
 Build a fully working educational database and connect real applications to it.
+
+## Run
+
+```bash
+cargo run
+```
