@@ -17,6 +17,13 @@ Build a fully working educational database and connect real applications to it.
 
 ## Run
 
+1. Tests
+
+```bash
+cargo test
+```
+2. Run app
+
 ```bash
 cargo run
 ```
