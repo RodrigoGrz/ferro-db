@@ -25,7 +25,8 @@ impl BufferPoolManager {
             page_table: HashMap::new(),
             free_list,
             replacer: LRUKReplacer::new(2),
-            disk_manager: DiskManager::new("data.db", page_size),
+            disk_manager: DiskManager::new("data.db", page_size)
+                .expect("Failed to open database file"),
         }
     }
 
@@ -48,13 +49,16 @@ impl BufferPoolManager {
         if let Some(old_page_id) = old_page.page_id {
             if old_page.is_dirty {
                 self.disk_manager
-                    .write_page(old_page_id, &old_page.data);
+                    .write_page(old_page_id, &old_page.data)
+                    .expect("Failed to write page");
             }
 
             self.page_table.remove(&old_page_id);
         }
 
-        let data = self.disk_manager.read_page(page_id);
+        let data = self.disk_manager
+            .read_page(page_id)
+            .expect("Failed to read page");
 
         let page = &mut self.pages[frame_id];
 
