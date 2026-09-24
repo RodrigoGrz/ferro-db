@@ -1,6 +1,12 @@
-# ferro-db
+# ferroDB
 
-A toy database built in Rust following CMU Database Systems lectures.
+![image](ferrodb.png)
+
+A small relational database implemented from scratch in Rust, inspired by database systems concepts from CMU Database Systems courses.
+
+The goal of ferroDB is not to compete with PostgreSQL, MySQL, or other production databases.
+
+The goal is to understand how a relational database works internally by implementing its main components from the ground up and eventually having a real, usable SQL database that small applications can connect to.
 
 ## Features (WIP)
 
@@ -55,6 +61,11 @@ A toy database built in Rust following CMU Database Systems lectures.
 - [ ] DML
 - [ ] Query Validation
 
+## Query Planning
+
+- [ ] Logical Query Plan
+- [ ] Physical Query Plan
+
 ## Query Execution
 
 - [ ] Sequential Scan
@@ -68,6 +79,7 @@ A toy database built in Rust following CMU Database Systems lectures.
 - [ ] JOIN
 - [ ] Hash Join
 - [ ] Nested Loop Join
+
 
 ## Transactions
 
@@ -122,6 +134,14 @@ A toy database built in Rust following CMU Database Systems lectures.
 - [ ] Users
 - [ ] Roles
 - [ ] Permissions
+
+## Catalog
+
+- [ ] Database Catalog
+- [ ] Table Metadata
+- [ ] Column Metadata
+- [ ] Index Metadata
+- [ ] Constraint Metadata
 
 ## Reliability
 
