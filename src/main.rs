@@ -6,7 +6,7 @@ mod replacer;
 use buffer_pool::BufferPoolManager;
 
 fn main() {
-    let mut bpm = BufferPoolManager::new(2, 4096);
+    let mut bpm = BufferPoolManager::new(2, 4096, "data.db").unwrap();
 
     {
         let page = bpm.fetch_page(1).unwrap();
@@ -21,7 +21,7 @@ fn main() {
     bpm.unpin_page(2, true);
 
     {
-        bpm.fetch_page(3);
+        bpm.fetch_page(3).unwrap();
     }
     bpm.unpin_page(3, false);
 

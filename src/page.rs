@@ -95,6 +95,10 @@ impl Page {
         self.is_dirty
     }
 
+    pub fn mark_clean(&mut self) {
+        self.is_dirty = false;
+    }
+
     pub fn data(&self) -> &[u8] {
         &self.data
     }
