@@ -15,7 +15,7 @@ pub struct BufferPoolManager {
 impl BufferPoolManager {
     pub fn new(pool_size: usize, page_size: usize) -> Self {
         let pages = (0..pool_size)
-            .map(|_| Page::new(page_size))
+            .map(|_| Page::new(page_size).expect("Failed to create page"))
             .collect();
 
         let free_list = (0..pool_size).collect();
@@ -34,7 +34,7 @@ impl BufferPoolManager {
         if let Some(&frame_id) = self.page_table.get(&page_id) {
             let page = &mut self.pages[frame_id];
 
-            page.pin_count += 1;
+            page.pin();
 
             self.replacer.record_access(frame_id);
             self.replacer.pin(frame_id);
@@ -46,10 +46,10 @@ impl BufferPoolManager {
 
         let old_page = &mut self.pages[frame_id];
 
-        if let Some(old_page_id) = old_page.page_id {
-            if old_page.is_dirty {
+        if let Some(old_page_id) = old_page.page_id() {
+            if old_page.is_dirty() {
                 self.disk_manager
-                    .write_page(old_page_id, &old_page.data)
+                    .write_page(old_page_id, old_page.data())
                     .expect("Failed to write page");
             }
 
@@ -62,12 +62,7 @@ impl BufferPoolManager {
 
         let page = &mut self.pages[frame_id];
 
-        page.reset_metadata();
-
-        page.page_id = Some(page_id);
-        page.data = data;
-        page.pin_count = 1;
-        page.is_dirty = false;
+        page.load(page_id, data).expect("Failed to load page");
 
         self.page_table.insert(page_id, frame_id);
 
@@ -81,17 +76,11 @@ impl BufferPoolManager {
         if let Some(&frame_id) = self.page_table.get(&page_id) {
             let page = &mut self.pages[frame_id];
 
-            if page.pin_count == 0 {
+            if !page.try_unpin(is_dirty) {
                 return false;
             }
 
-            page.pin_count -= 1;
-
-            if is_dirty {
-                page.is_dirty = true;
-            }
-
-            if page.pin_count == 0 {
+            if page.pin_count() == 0 {
                 self.replacer.unpin(frame_id);
             }
 
@@ -112,7 +101,7 @@ mod tests {
 
         let page = bpm.fetch_page(1).unwrap();
 
-        assert_eq!(page.page_id, Some(1));
+        assert_eq!(page.page_id(), Some(1));
         assert!(bpm.page_table.contains_key(&1));
     }
 
@@ -134,7 +123,7 @@ mod tests {
 
         bpm.fetch_page(1);
         let page = bpm.fetch_page(1).unwrap();
-        assert_eq!(page.pin_count, 2);
+        assert_eq!(page.pin_count(), 2);
     }
 
     #[test]
@@ -147,7 +136,7 @@ mod tests {
         assert!(bpm.unpin_page(1, false));
 
         let page = bpm.fetch_page(1).unwrap();
-        assert_eq!(page.pin_count, 2);
+        assert_eq!(page.pin_count(), 2);
     }
 
     #[test]
@@ -159,7 +148,7 @@ mod tests {
 
         let page = bpm.fetch_page(1).unwrap();
 
-        assert!(page.is_dirty);
+        assert!(page.is_dirty());
     }
 
     #[test]
@@ -182,7 +171,7 @@ mod tests {
         let mut bpm = BufferPoolManager::new(2, 4);
 
         let page = bpm.fetch_page(1).unwrap();
-        page.data[0] = 99;
+        page.data_mut()[0] = 99;
 
         bpm.unpin_page(1, true);
 
