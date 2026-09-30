@@ -41,7 +41,7 @@ impl LRUKReplacer {
     pub fn record_access(&mut self, frame_id: usize) {
         self.current_timestamp += 1;
 
-        let entry = self.history.entry(frame_id).or_insert(VecDeque::new());
+        let entry = self.history.entry(frame_id).or_default();
 
         entry.push_back(self.current_timestamp);
 

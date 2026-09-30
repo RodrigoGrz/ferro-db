@@ -1,36 +1,41 @@
-mod buffer_pool;
-mod disk_manager;
-mod page;
-mod replacer;
+use std::error::Error;
 
-use buffer_pool::BufferPoolManager;
+use ferro_db::buffer_pool::BufferPoolManager;
+use ferro_db::config::PAGE_SIZE;
+use ferro_db::rid::Rid;
+use ferro_db::slotted_page::SlottedPage;
 
-fn main() {
-    let mut bpm = BufferPoolManager::new(2, 4096, "data.db").unwrap();
-
-    {
-        let page = bpm.fetch_page(1).unwrap();
-        page.data_mut()[0] = 42;
-    }
-    bpm.unpin_page(1, true);
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut bpm = BufferPoolManager::new(2, PAGE_SIZE, "data.db")?;
+    let page_id = 0;
+    let mut rids = Vec::new();
 
     {
-        let page = bpm.fetch_page(2).unwrap();
-        page.data_mut()[0] = 43;
+        let page = bpm.fetch_page(page_id)?;
+        let mut slotted = SlottedPage::init(page.data_mut())?;
+        for name in ["alice", "bob", "carol"] {
+            let slot_id = slotted.insert(name.as_bytes())?;
+            rids.push(Rid::new(page_id, slot_id));
+        }
+        slotted.delete(rids[1].slot_id)?;
     }
-    bpm.unpin_page(2, true);
+    bpm.unpin_page(page_id, true);
 
-    {
-        bpm.fetch_page(3).unwrap();
+    // Two other pages fill the pool and force page 0 out to disk.
+    for other in 1..=2 {
+        bpm.fetch_page(other)?;
+        bpm.unpin_page(other, false);
     }
-    bpm.unpin_page(3, false);
 
-    {
-        let page = bpm.fetch_page(2).unwrap();
-        println!("{}", page.data()[0]);
+    let page = bpm.fetch_page(page_id)?;
+    let slotted = SlottedPage::new(page.data())?;
+    for rid in &rids {
+        match slotted.get(rid.slot_id) {
+            Ok(tuple) => println!("{rid} -> {}", String::from_utf8_lossy(tuple)),
+            Err(err) => println!("{rid} -> {err}"),
+        }
     }
-    bpm.unpin_page(2, false);
+    bpm.unpin_page(page_id, false);
 
-    let page = bpm.fetch_page(1).unwrap();
-    println!("{}", page.data()[0]);
+    Ok(())
 }

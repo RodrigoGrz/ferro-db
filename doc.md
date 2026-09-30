@@ -154,3 +154,135 @@ aplica política inteligente de cache (LRU-K)
 prepara a integração com disco
 
 👉 Isso já representa o núcleo de um banco de dados real.
+
+---
+
+# 📦 Slotted Pages, RID e Checksum
+
+## 📄 Header comum (todas as páginas)
+
+Toda página começa com 16 bytes que o buffer pool entende, independente do tipo da página (`PageHeader`, ver "Page Serialization" abaixo):
+
+| Bytes | Campo | Uso |
+|---|---|---|
+| `0..8` | LSN (`u64`) | reservado para o WAL / recovery |
+| `8..12` | checksum (`u32`) | CRC32 da página com este campo zerado |
+| `12` | page_type (`u8`) | `0` Free (nunca formatada), `1` Slotted |
+| `13` | version (`u8`) | `PAGE_FORMAT_VERSION` (hoje `1`) |
+| `14..16` | reservado | zerado |
+
+- **Escrita:** antes de gravar no disco, o buffer pool calcula o CRC32 e grava no header (`checksum::stamp_page`).
+- **Leitura:** ao buscar do disco, o buffer pool recalcula o CRC32. Se não bater → `BufferPoolError::ChecksumMismatch`. Depois valida o header: tipo desconhecido ou versão diferente → `BufferPoolError::Page(..)`. Nos dois casos nenhum frame é ocupado.
+- Página **toda zerada** é aceita sem checksum: é uma página nova (`PageType::Free`), que nunca foi escrita.
+
+## 🧱 Layout da Slotted Page (8 KB por padrão)
+
+```
+ 0        8        12   13   14    16       18        20        24
+ ┌────────┬────────┬────┬────┬─────┬────────┬─────────┬─────────┬─────────────────┐
+ │  LSN   │checksum│type│ver │rsv  │slot_cnt│free_end │reserved │ slot[0] ...     │ → cresce →
+ │  u64   │  u32   │ u8 │ u8 │ 2 B │  u16   │  u16    │ 4 bytes │(off u16,len u16)│
+ ├────────┴────────┴────┴────┴─────┴────────┴─────────┴─────────┴─────────────────┤
+ │                     espaço livre contíguo                            │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │              ... tupla 1 | tupla 0                                   │ ← cresce ←
+ └──────────────────────────────────────────────────────────────────────┘
+```
+
+- O array de slots cresce para a direita; as tuplas crescem da direita para a esquerda.
+- O fim do array de slots não é gravado: `24 + slot_count * 4`.
+- `offset == 0` marca um **slot deletado** (tombstone). Tupla vazia (`len == 0`) é válida.
+- Maior tupla em 8 KB: `8192 - 24 - 4 = 8164` bytes.
+- Offsets são `u16`, então a página pode ter no máximo 65535 bytes.
+
+## 🔑 RID (Record ID)
+
+`Rid { page_id: u32, slot_id: u16 }` é o endereço físico de uma tupla. Serializado em 6 bytes (little-endian), vai ser a "chave de valor" guardada nas folhas da B+Tree.
+
+A regra mais importante do design: **o `slot_id` de uma tupla nunca muda** enquanto ela existir, então o RID continua válido mesmo quando os bytes são movidos.
+
+## ⚙️ Operações
+
+- **insert:** reusa o primeiro slot deletado (se houver) ou cria um novo (+4 bytes). Se o espaço contíguo não basta mas o total basta, compacta antes. Se nem o total basta → `PageFull`.
+- **delete:** só marca o slot como tombstone. Os bytes viram um "buraco" (compactação lazy).
+- **update:**
+  - tamanho menor ou igual → sobrescreve no lugar;
+  - maior → usa o espaço livre + o espaço da versão antiga, compactando se preciso, **mantendo o slot_id**;
+  - não cabe → `PageFull` e a página fica intacta. (Forwarding pointer para outra página fica para o Heap File.)
+- **compact:** empurra as tuplas vivas para o fim da página e atualiza só os offsets dos slots.
+
+## 🧠 Decisões de design
+
+✔️ **View zero-copy:** `SlottedPage<B>` trabalha direto sobre os bytes do `Page`. `SlottedPage<&[u8]>` só lê; `SlottedPage<&mut [u8]>` também escreve.
+
+✔️ **Compactação lazy:** delete é barato (OLTP tem muita escrita); o custo de mover bytes só aparece quando um insert/update precisa.
+
+✔️ **Falhar sem efeito colateral:** toda operação checa o espaço antes de alterar qualquer byte.
+
+⚠️ **Reuso de slot:** um insert reaproveita slots deletados. Quando existirem índices e MVCC, o slot só poderá ser reaproveitado depois que o índice for limpo (como o VACUUM do PostgreSQL), senão um RID antigo passaria a apontar para outra tupla.
+
+## 🧪 Testes
+
+- Unitários em cada módulo (`slotted_page`, `checksum`, `rid`, `page`, `buffer_pool`...).
+- `random_operations_should_match_model`: 10 000 operações aleatórias comparadas com um `HashMap` e validação das invariantes a cada passo.
+- Integração em `tests/slotted_page_integration.rs`: tuplas sobrevivem a eviction e a reabrir o arquivo, e corrupção no disco é detectada pelo checksum.
+
+---
+
+# 🧬 Page Serialization
+
+## 📌 Visão geral
+
+Toda conversão struct ⇄ bytes passa pelo módulo `serialization`: layout fixo, **little-endian**, sem padding e sem depender da representação em memória do Rust (nada de `transmute`/`repr(C)` sobre os bytes). Em cima dele, o `PageHeader` dá a toda página um **tipo** e uma **versão de formato**, como o `pd_pagesize_version` do PostgreSQL ou o byte de tipo das páginas de B-tree do SQLite.
+
+## 🧰 Codec (`src/serialization.rs`)
+
+- `ByteReader` / `ByteWriter`: cursores com `read_u8/u16/u32/u64`, `read_bytes`, `read_array::<N>`, `skip`, `write_u8/u16/u32/u64`, `write_bytes`, `write_zeros`.
+- **Nunca entram em pânico:** faltou byte → `UnexpectedEof { needed, remaining }`; não cabe → `BufferOverflow { needed, remaining }`.
+- **Atômicos por chamada:** um erro não avança o cursor nem escreve parte dos bytes.
+- Traits `Encode` (com `ENCODED_SIZE`) e `Decode` para estruturas de tamanho fixo. Implementadas por `Rid` (6 B) e `PageHeader` (16 B). O `decode` lê o bloco inteiro de uma vez, então também é atômico.
+- Helpers `get_u16/put_u16/get_u32/put_u32/get_u64/put_u64` (`pub(crate)`) para acesso por offset em código já validado (slots da slotted page, LSN, checksum), sem pagar `Result` no hot path.
+
+## 🏷️ `PageHeader` e `PageType`
+
+```rust
+pub enum PageType { Free = 0, Slotted = 1 }
+
+pub struct PageHeader { pub lsn: u64, pub checksum: u32, pub page_type: PageType, pub version: u8 }
+```
+
+- `PageHeader::read(page)`: decodifica e valida. Tipo desconhecido → `PageError::Serialization(InvalidValue { field: "page_type", .. })`; página formatada com versão ≠ `PAGE_FORMAT_VERSION` → `PageError::UnsupportedVersion`. Página `Free` não tem versão checada.
+- `PageHeader::format(page, page_type)`: grava tipo, versão atual e zera o reservado, **mantendo LSN e checksum**.
+- `SlottedPage::init` chama `format(.., Slotted)`; `SlottedPage::new` recusa página `Free` (`Uninitialized`) e header inválido (`SlottedPageError::InvalidHeader`).
+
+## 🧠 Decisões de design
+
+✔️ **Header comum de 16 B** (e não tipo/versão no reservado da slotted page): todo tipo de página futuro (B+Tree, FSM) herda tipo e versão de graça. A slotted page continua com `HEADER_SIZE = 24`, então a maior tupla segue 8164 B.
+
+✔️ **Checksum continua em `8..12`:** a lógica do CRC não mudou.
+
+✔️ **`page_type` e `version` em `u8`:** 256 valores bastam e sobram 2 bytes reservados.
+
+✔️ **Versão global única:** se o layout de qualquer tipo mudar, sobe `PAGE_FORMAT_VERSION`.
+
+✔️ **Validação no `fetch_page`:** página com header inválido nunca entra no pool, mesma política do checksum.
+
+✔️ **Tipo desconhecido como `InvalidValue` do codec:** `Decode` só tem um tipo de erro (`SerializationError`), então o tipo inválido chega como `PageError::Serialization(..)`, sem um variant `UnknownPageType` duplicado.
+
+✔️ **`match` exaustivo em `PageType`:** quando surgir um tipo novo (B+Tree), o compilador obriga `SlottedPage::new` a tratá-lo.
+
+✔️ **Sem dependências** (`serde`/`bincode`): formato 100% controlado e documentado.
+
+⚠️ **Formato em disco mudou:** arquivos criados com o header de 12 B não abrem mais (a página vira tipo desconhecido ou versão errada). Apague o `data.db` antigo; não há migração.
+
+## 🧪 Testes
+
+- Unitários em `serialization`: cada largura, limites (buffer vazio, exato, 1 byte a menos, `usize::MAX`), atomicidade dos erros e duas sequências aleatórias (1 000 casos cada) de campos tipados escritos e relidos.
+- Unitários em `page`, `rid`, `slotted_page` e `buffer_pool` para header, tipos, versões e rejeição sem ocupar frame.
+- Integração em `tests/page_serialization_integration.rs`: header e LSN sobrevivem a eviction e a reabrir o arquivo, tipo desconhecido/versão futura em disco são recusados, o pool continua usável e corrupção no byte de tipo é pega primeiro pelo checksum.
+
+## 📌 Próximos passos
+
+- Heap File: várias páginas por tabela e alocação de páginas novas
+- Free space map: achar rápido uma página com espaço
+- Formato da tupla (colunas, NULL bitmap) junto com o sistema de tipos, com prefixo de tamanho para campos variáveis no codec

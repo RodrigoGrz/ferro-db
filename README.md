@@ -16,10 +16,10 @@ The goal is to understand how a relational database works internally by implemen
 - [x] Page
 - [x] Buffer Pool Manager
 - [x] LRU-K Replacement
-- [ ] Page Serialization
-- [ ] Slotted Pages
+- [x] Page Serialization
+- [x] Slotted Pages
 - [ ] Tuple Storage
-- [ ] RID
+- [x] RID
 - [ ] Heap File
 - [ ] Free Space Management
 

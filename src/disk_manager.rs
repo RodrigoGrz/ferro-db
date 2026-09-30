@@ -63,6 +63,7 @@ impl DiskManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         Ok(Self { file, page_size })
