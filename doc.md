@@ -357,3 +357,107 @@ Exemplo — layout `[Fixed(4), Variable, Fixed(1)]`, valores `(42, "ab", NULL)`:
 - Free space map: achar rápido uma página com espaço
 - Data Types / Type System: converter valores SQL ⇄ campos da tupla
 - Schema: gerar o `TupleLayout` a partir das colunas da tabela
+
+---
+
+# 🔢 Data Types — Inteiros e NULL
+
+## 📌 Visão geral
+
+A camada `src/types/` transforma campos da tupla (`Option<&[u8]>`) em valores SQL e implementa a semântica deles: parsing de texto, casts, aritmética, comparação e `NULL`. Por enquanto só existem os inteiros do padrão SQL: `SMALLINT`, `INTEGER` e `BIGINT`. Ela depende só de `storage` (para o `ColumnLayout`), e `storage` não conhece `types`.
+
+## 🗂️ Organização
+
+| Arquivo | Responsabilidade |
+|---|---|
+| `data_type.rs` | `DataType`: nome SQL, largura, `ColumnLayout`, promoção |
+| `value.rs` | `Value`: `NULL`, encode/decode, parse, `Display`, cast, operadores, comparação |
+| `integer.rs` | semântica dos inteiros em `i64` + estreitamento para o tipo (privado) |
+| `error.rs` | `TypeError` com mensagem e `SQLSTATE` do PostgreSQL |
+
+## 🧱 Tipos e bytes
+
+```rust
+pub enum DataType { SmallInt, Integer, BigInt }
+pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
+```
+
+| Tipo | Rust | `ColumnLayout` | Campo na tupla | `-2` |
+|---|---|---|---|---|
+| `SMALLINT` | `i16` | `Fixed(2)` | complemento de 2, LE | `FE FF` |
+| `INTEGER` | `i32` | `Fixed(4)` | complemento de 2, LE | `FE FF FF FF` |
+| `BIGINT` | `i64` | `Fixed(8)` | complemento de 2, LE | `FE FF FF FF FF FF FF FF` |
+| `NULL` | — | o da coluna | `None`: bit no NULL bitmap, parte fixa zerada | — |
+
+`Value::decode(ty, field)` recusa campo com largura diferente de `ty.width()` (`InvalidEncoding`).
+
+## ⚙️ Operações
+
+- **Texto** (`Value::parse`, como `int4in`): espaços em volta (inclusive `\t\n\r\v\f`), sinal opcional e dígitos ASCII. Vazio, só sinal, `1.0`, `0x10`, `1_000`, o texto `'NULL'` → `22P02`. Não cabe no tipo → `22003`. Acumula em negativo (como `pg_strtoint64`), então `-9223372036854775808` funciona.
+- **`Display`**: decimal, e `NULL` como `"NULL"`.
+- **Cast**: alargar nunca falha; estreitar com range check → `OutOfRange` (`22003`). `CAST(NULL AS T)` é `NULL`.
+- **Aritmética** (`add`, `sub`, `mul`, `div`, `rem`, `neg`):
+  - resultado no tipo **mais largo** dos operandos; `SMALLINT + SMALLINT` é `SMALLINT` e estoura em 32767, como no PostgreSQL;
+  - overflow → `OutOfRange` (`22003`), nunca wrap-around; inclui `-MIN` e `MIN / -1`;
+  - `/` trunca em direção a zero (`7 / -2 = -3`); `%` tem o sinal do dividendo (`-7 % 2 = -1`);
+  - `x / 0` e `x % 0` → `DivisionByZero` (`22012`); `MIN % -1 = 0`.
+- **NULL** nas operações: qualquer operando `NULL` → `NULL`, antes de qualquer checagem (`NULL / 0` é `NULL`).
+- **Comparação**:
+  - `compare` → `Option<Ordering>`; `None` é `UNKNOWN` sempre que um lado é `NULL` (inclusive `NULL = NULL`). Compara pelo valor, independente da largura (`INTEGER 5 = BIGINT 5`).
+  - `is_distinct_from` → `IS DISTINCT FROM`: `NULL` igual a `NULL`, nunca `UNKNOWN`.
+  - `sort_cmp` → ordem total para `ORDER BY`/índices, com `NULL` depois de todos os valores (`NULLS LAST` do `ASC` no PostgreSQL).
+
+## 🚨 Erros
+
+| `TypeError` | SQLSTATE | Mensagem |
+|---|---|---|
+| `OutOfRange` | `22003` | `integer out of range` |
+| `TextOutOfRange` | `22003` | `value "99999" is out of range for type smallint` |
+| `InvalidTextRepresentation` | `22P02` | `invalid input syntax for type integer: "abc"` |
+| `DivisionByZero` | `22012` | `division by zero` |
+| `InvalidEncoding` | `XX001` | `integer field must be 4 bytes, got 2` |
+
+## 🧠 Decisões de design
+
+✔️ **Três inteiros juntos**: mesma lógica, e promoção/cast só fazem sentido com mais de uma largura.
+
+✔️ **`Value` como enum com payload nativo** (não bytes + tipo, como o BusTub): sem alocação por valor, e o `match` exaustivo obriga cada tipo novo a ser tratado.
+
+✔️ **Tudo em `i64`, depois estreita**: `i32 × i32` sempre cabe em `i64`, e no `BIGINT` o `checked_*` pega o overflow. Uma implementação só cobre as três larguras, sem macro nem 3×3 combinações.
+
+✔️ **`NULL` sem tipo** (`Value::Null`, não `Null(DataType)`): o tipo de uma expressão vem do schema, decidido pelo planner; o literal `NULL` nem tem tipo até o Type System resolver pelo contexto.
+
+✔️ **`NULL` = `None` no campo**: reusa o NULL bitmap do Tuple Storage sem mudar o formato em disco.
+
+✔️ **`compare` e `sort_cmp` separados**: comparar precisa de `UNKNOWN`, ordenar precisa de ordem total. Misturar os dois é bug clássico.
+
+⚠️ **`PartialEq` do Rust é estrutural**: `Null == Null` e `SmallInt(1) != BigInt(1)`. Serve para testes; filtros e joins devem usar `compare`/`is_distinct_from`.
+
+⚠️ **Little-endian não é ordenável por bytes**: a B+Tree precisa comparar com `sort_cmp` ou usar um encoding próprio (big-endian com bit de sinal invertido).
+
+## 🧪 Testes
+
+- Unitários em `data_type`, `error` e `value`: limites (`MIN`, `-1`, `0`, `1`, `MAX`, `MIN-1`, `MAX+1`) em cada largura, cada erro com seu SQLSTATE e `NULL` em cada posição.
+- `random_operations_should_match_the_i128_model`: 10 000 operações com valores aleatórios (viés para os extremos, ~10% `NULL`) comparadas com uma referência em `Option<i128>`; checado com mutação (remover o caso `MIN % -1` faz o teste falhar).
+- `random_values_should_round_trip_through_bytes_and_text` e `sort_cmp_should_be_a_total_order` (reflexiva, antissimétrica, transitiva).
+- Integração em `tests/types_integer.rs`: linhas `[SMALLINT, INTEGER, BIGINT]` com extremos e `NULL` sobrevivem a eviction e a reabrir o arquivo; linha toda `NULL` só liga o bitmap; campo lido com o tipo errado → `InvalidEncoding`.
+
+## 📌 Próximos passos
+
+- Boolean: `eq/lt/...` devolvendo `Value::Boolean` e a lógica de três valores de `AND`/`OR`/`NOT`
+- Type System: coerção implícita × explícita e resolução de operadores entre famílias de tipos
+- Float, String, Date/Time, UUID
+- Schema: gerar o `TupleLayout` a partir dos `DataType` das colunas
+
+---
+
+# 📏 Desvios do padrão SQL
+
+| Assunto | Padrão (ISO/IEC 9075) | ferroDB |
+|---|---|---|
+| Literais inteiros | só decimais | idem; o PostgreSQL 16 aceita `1_000`, `0x1F`, `0o17`, `0b101`, o ferroDB ainda não |
+| Divisão inteira | arredondamento definido pela implementação | trunca em direção a zero (PostgreSQL) |
+| Tipo do resultado de `a op b` | definido pela implementação | o mais largo dos operandos (PostgreSQL) |
+| Posição do `NULL` no `ORDER BY` | definida pela implementação | depois dos valores no `ASC` (PostgreSQL) |
+| `MOD(a, b)` | função | por enquanto só a semântica, como operador `%`; a função entra com o parser |
+| Exibição de `NULL` | não definida | `"NULL"` no `Display` (o `psql` mostra vazio) |

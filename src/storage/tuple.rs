@@ -159,7 +159,7 @@ pub struct TupleLayout {
 }
 
 impl TupleLayout {
-    /// Same limit as PostgreSQL's `MaxHeapAttributeNumber`.
+    /// Far above any real schema, and keeps the NULL bitmap at most 200 bytes.
     pub const MAX_COLUMNS: usize = 1600;
 
     pub fn new(columns: Vec<ColumnLayout>) -> Result<Self, TupleError> {

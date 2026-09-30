@@ -25,11 +25,11 @@ The goal is to understand how a relational database works internally by implemen
 
 ## Data Types
 
-- [ ] Integer
+- [x] Integer
 - [ ] Float
 - [ ] Boolean
 - [ ] String
-- [ ] NULL
+- [x] NULL
 - [ ] Date/Time
 - [ ] UUID
 - [ ] Type System
