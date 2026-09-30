@@ -3,11 +3,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ferro_db::buffer_pool::{BufferPoolError, BufferPoolManager};
 use ferro_db::config::PAGE_SIZE;
-use ferro_db::page::COMMON_HEADER_SIZE;
-use ferro_db::rid::Rid;
-use ferro_db::slotted_page::{HEADER_SIZE, SlottedPage, SlottedPageError};
+use ferro_db::storage::buffer_pool::{BufferPoolError, BufferPoolManager};
+use ferro_db::storage::page::COMMON_HEADER_SIZE;
+use ferro_db::storage::rid::Rid;
+use ferro_db::storage::slotted_page::{HEADER_SIZE, SlottedPage, SlottedPageError};
 
 struct TempDb(PathBuf);
 

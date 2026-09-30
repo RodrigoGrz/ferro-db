@@ -1,9 +1,3 @@
-pub mod buffer_pool;
-pub mod checksum;
 pub mod config;
-pub mod disk_manager;
-pub mod page;
-pub mod replacer;
-pub mod rid;
 pub mod serialization;
-pub mod slotted_page;
+pub mod storage;

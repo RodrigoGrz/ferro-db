@@ -225,7 +225,7 @@ A regra mais importante do design: **o `slot_id` de uma tupla nunca muda** enqua
 
 - Unitários em cada módulo (`slotted_page`, `checksum`, `rid`, `page`, `buffer_pool`...).
 - `random_operations_should_match_model`: 10 000 operações aleatórias comparadas com um `HashMap` e validação das invariantes a cada passo.
-- Integração em `tests/slotted_page_integration.rs`: tuplas sobrevivem a eviction e a reabrir o arquivo, e corrupção no disco é detectada pelo checksum.
+- Integração em `tests/storage_slotted_page.rs`: tuplas sobrevivem a eviction e a reabrir o arquivo, e corrupção no disco é detectada pelo checksum.
 
 ---
 
@@ -279,10 +279,81 @@ pub struct PageHeader { pub lsn: u64, pub checksum: u32, pub page_type: PageType
 
 - Unitários em `serialization`: cada largura, limites (buffer vazio, exato, 1 byte a menos, `usize::MAX`), atomicidade dos erros e duas sequências aleatórias (1 000 casos cada) de campos tipados escritos e relidos.
 - Unitários em `page`, `rid`, `slotted_page` e `buffer_pool` para header, tipos, versões e rejeição sem ocupar frame.
-- Integração em `tests/page_serialization_integration.rs`: header e LSN sobrevivem a eviction e a reabrir o arquivo, tipo desconhecido/versão futura em disco são recusados, o pool continua usável e corrupção no byte de tipo é pega primeiro pelo checksum.
+- Integração em `tests/storage_page_serialization.rs`: header e LSN sobrevivem a eviction e a reabrir o arquivo, tipo desconhecido/versão futura em disco são recusados, o pool continua usável e corrupção no byte de tipo é pega primeiro pelo checksum.
+
+
+---
+
+# 🧾 Tuple Storage
+
+## 📌 Visão geral
+
+Define como uma linha com N colunas vira os bytes guardados num slot da `SlottedPage` e como é lida de volta (`src/storage/tuple.rs`). O formato **não conhece tipos SQL**: cada campo é `&[u8]` e a coluna só diz a largura física (`Fixed(n)` ou `Variable`). A camada `types` vai converter valor ⇄ bytes em cima disso, respeitando a regra de dependência só para baixo (`storage` não importa de ninguém).
+
+Referência: CMU 15-445 ("Database Storage II") e o `HeapTupleHeaderData` do PostgreSQL — header com NULL bitmap, colunas fixas inline e colunas variáveis apontando para uma área de dados.
+
+## 🗂️ Organização
+
+Desde esta atividade os módulos de storage ficam em `src/storage/` (`buffer_pool`, `checksum`, `disk_manager`, `page`, `replacer`, `rid`, `slotted_page`, `tuple`). `config` e `serialization` continuam na raiz de `src/` porque são compartilhados por todas as camadas. Testes de integração seguem `tests/<camada>_<componente>.rs`.
+
+O `src/storage/mod.rs` reexporta os tipos principais da camada (`storage::TupleLayout`, `storage::SlottedPage`, `storage::BufferPoolManager`...).
+
+## 🧱 Layout (little-endian, sem alinhamento)
+
+| Offset | Tamanho | Campo |
+|---|---|---|
+| `0` | 2 | `column_count: u16` (tem que bater com o layout) |
+| `2` | `ceil(n/8)` | NULL bitmap: bit `i % 8` do byte `i / 8` = 1 → coluna `i` é `NULL` |
+| `2 + ceil(n/8)` | Σ larguras | parte fixa, na ordem das colunas: `Fixed(w)` → `w` bytes; `Variable` → `(offset u16, len u16)` |
+| `data_start` | resto | bytes das colunas variáveis, na ordem das colunas |
+
+Exemplo — layout `[Fixed(4), Variable, Fixed(1)]`, valores `(42, "ab", NULL)`:
+
+```
+00: 03 00             column_count = 3
+02: 04                bitmap: coluna 2 é NULL (bit 2)
+03: 2A 00 00 00       col 0 = 42
+07: 0C 00 02 00       col 1 → offset 12, len 2
+0B: 00                col 2 = NULL (zerado)
+0C: 61 62             "ab"
+```
+
+## ⚙️ Operações
+
+- **`TupleLayout::new(columns)`**: calcula os offsets da parte fixa uma vez por tabela. Erros: mais de 1600 colunas (`TooManyColumns`, mesmo limite do PostgreSQL), `Fixed(0)` (`ZeroWidthColumn`) e parte fixa maior que uma página (`TupleTooLarge`).
+- **`layout.encode(&[Option<&[u8]>])`**: `None` = `NULL`. Valida tudo antes de alocar: número de campos (`ColumnCountMismatch`), largura das fixas (`FixedWidthMismatch`) e tamanho total ≤ 65535 (`TupleTooLarge`). Escreve em sequência com o `ByteWriter`.
+- **`TupleRef::new(&layout, bytes)`**: view zero-copy. Como os bytes vêm do disco, valida **uma vez** e só aceita a forma canônica que o `encode` produz: `column_count` certo, tamanho mínimo, sem bits de padding no bitmap, coluna fixa `NULL` zerada, campos variáveis contíguos e na ordem das colunas (`NULL` variável com `len == 0`) e nenhum byte sobrando. Assim cada linha tem uma única representação em bytes. Depois disso `field(i)`, `is_null(i)` e `fields()` só falham com `ColumnOutOfRange`.
+
+## 🧠 Decisões de design
+
+✔️ **Formato agnóstico em `storage`**: dá para fazer antes de Data Types e mantém as camadas independentes.
+
+✔️ **Coluna fixa `NULL` continua ocupando espaço** (o PostgreSQL omite): offsets constantes → acesso O(1) sem percorrer o bitmap.
+
+✔️ **Slot `(offset, len)` por coluna variável**: acesso direto a qualquer coluna e validação simples; 2 B a mais que guardar só o fim.
+
+✔️ **`column_count` gravado na tupla**: detecta leitura com o layout errado e prepara `ADD COLUMN` sem reescrever a tabela (como o `t_infomask2` do PostgreSQL).
+
+✔️ **Sem alinhamento**: `from_le_bytes` não exige alinhamento; tuplas menores.
+
+✔️ **`Some(&[])` ≠ `None`**: string vazia e `NULL` são diferentes, como no padrão SQL.
+
+✔️ **`encode` devolve `Vec<u8>`**: a `SlottedPage` continua recebendo `&[u8]` e cuidando do espaço; tupla e página não se conhecem.
+
+✔️ **Dois limites de tamanho**: o formato aceita até 65535 B (`MAX_TUPLE_SIZE`, offsets `u16`), mas a página é mais restrita — `SlottedPage::max_tuple_size` (8164 B em 8 KB) é checado no `insert`/`update`, que devolve `SlottedPageError::TupleTooLarge`.
+
+⚠️ **Formato da tupla não tem versão própria**: é conteúdo do slot, então `PAGE_FORMAT_VERSION` não mudou. Se o layout da tupla mudar, vai precisar de versão.
+
+## 🧪 Testes
+
+- Unitários em `tuple`: offsets do layout (0, 1, 8, 9, 1600, 1601 colunas; `Fixed(0)`; parte fixa no limite e acima), bytes exatos do `encode`, vazio × `NULL`, cada erro e cada motivo de `Corrupted`.
+- `random_tuples_should_round_trip`: 1 000 layouts e linhas aleatórias comparadas com a entrada.
+- `random_corruption_should_never_panic`: 5 000 tuplas com bits trocados ou truncadas; `TupleRef::new` nunca entra em pânico e, se aceitar, todo `field` funciona (checado com teste de mutação).
+- Integração em `tests/storage_tuple.rs`: tuplas numa slotted page sobrevivem a eviction e a reabrir o arquivo, update com campo maior mantém o `slot_id`, página cheia → `PageFull` com todas as linhas legíveis, tupla maior que a página → `TupleTooLarge` da slotted page, layout errado → `ColumnCountMismatch`.
 
 ## 📌 Próximos passos
 
-- Heap File: várias páginas por tabela e alocação de páginas novas
+- Heap File: várias páginas por tabela, alocação de páginas e forwarding pointer quando um update não cabe
 - Free space map: achar rápido uma página com espaço
-- Formato da tupla (colunas, NULL bitmap) junto com o sistema de tipos, com prefixo de tamanho para campos variáveis no codec
+- Data Types / Type System: converter valores SQL ⇄ campos da tupla
+- Schema: gerar o `TupleLayout` a partir das colunas da tabela

@@ -1,9 +1,9 @@
 use std::error::Error;
 
-use ferro_db::buffer_pool::BufferPoolManager;
 use ferro_db::config::PAGE_SIZE;
-use ferro_db::rid::Rid;
-use ferro_db::slotted_page::SlottedPage;
+use ferro_db::storage::buffer_pool::BufferPoolManager;
+use ferro_db::storage::rid::Rid;
+use ferro_db::storage::slotted_page::SlottedPage;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut bpm = BufferPoolManager::new(2, PAGE_SIZE, "data.db")?;

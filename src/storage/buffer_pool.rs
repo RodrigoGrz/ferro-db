@@ -3,10 +3,10 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::checksum;
-use crate::disk_manager::{DiskError, DiskManager};
-use crate::page::{COMMON_HEADER_SIZE, Page, PageError, PageHeader};
-use crate::replacer::LRUKReplacer;
+use crate::storage::checksum;
+use crate::storage::disk_manager::{DiskError, DiskManager};
+use crate::storage::page::{COMMON_HEADER_SIZE, Page, PageError, PageHeader};
+use crate::storage::replacer::LRUKReplacer;
 
 const LRU_K: usize = 2;
 
@@ -223,12 +223,12 @@ fn path_to_str(path: &Path) -> Result<&str, BufferPoolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk_manager::DiskManager;
-    use crate::page::{
+    use crate::serialization::SerializationError;
+    use crate::storage::disk_manager::DiskManager;
+    use crate::storage::page::{
         CHECKSUM_OFFSET, LSN_OFFSET, PAGE_FORMAT_VERSION, PAGE_TYPE_OFFSET, PageType,
         VERSION_OFFSET,
     };
-    use crate::serialization::SerializationError;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};

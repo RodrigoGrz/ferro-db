@@ -17,8 +17,8 @@
 use std::fmt;
 
 use crate::config::MAX_PAGE_SIZE;
-use crate::page::{COMMON_HEADER_SIZE, PageError, PageHeader, PageType};
 use crate::serialization::{get_u16, put_u16};
+use crate::storage::page::{COMMON_HEADER_SIZE, PageError, PageHeader, PageType};
 
 const SLOT_COUNT_OFFSET: usize = COMMON_HEADER_SIZE;
 const FREE_SPACE_END_OFFSET: usize = SLOT_COUNT_OFFSET + 2;
@@ -383,8 +383,8 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<B> {
 mod tests {
     use super::*;
     use crate::config::PAGE_SIZE;
-    use crate::page::{PAGE_FORMAT_VERSION, PAGE_TYPE_OFFSET, VERSION_OFFSET};
     use crate::serialization::SerializationError;
+    use crate::storage::page::{PAGE_FORMAT_VERSION, PAGE_TYPE_OFFSET, VERSION_OFFSET};
     use std::collections::HashMap;
 
     /// Small page where capacity math is easy to follow: 64 - 24 = 40 usable bytes.

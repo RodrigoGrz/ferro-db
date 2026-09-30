@@ -3,14 +3,14 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ferro_db::buffer_pool::{BufferPoolError, BufferPoolManager};
-use ferro_db::checksum;
 use ferro_db::config::PAGE_SIZE;
-use ferro_db::page::{
+use ferro_db::serialization::SerializationError;
+use ferro_db::storage::buffer_pool::{BufferPoolError, BufferPoolManager};
+use ferro_db::storage::checksum;
+use ferro_db::storage::page::{
     PAGE_FORMAT_VERSION, PAGE_TYPE_OFFSET, PageError, PageHeader, PageType, VERSION_OFFSET,
 };
-use ferro_db::serialization::SerializationError;
-use ferro_db::slotted_page::SlottedPage;
+use ferro_db::storage::slotted_page::SlottedPage;
 
 struct TempDb(PathBuf);
 

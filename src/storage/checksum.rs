@@ -1,5 +1,5 @@
-use crate::page::{CHECKSUM_OFFSET, CHECKSUM_SIZE};
 use crate::serialization::{get_u32, put_u32};
+use crate::storage::page::{CHECKSUM_OFFSET, CHECKSUM_SIZE};
 
 const POLYNOMIAL: u32 = 0xEDB8_8320;
 const CHECKSUM_END: usize = CHECKSUM_OFFSET + CHECKSUM_SIZE;

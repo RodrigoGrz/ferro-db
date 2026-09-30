@@ -18,7 +18,7 @@ The goal is to understand how a relational database works internally by implemen
 - [x] LRU-K Replacement
 - [x] Page Serialization
 - [x] Slotted Pages
-- [ ] Tuple Storage
+- [x] Tuple Storage
 - [x] RID
 - [ ] Heap File
 - [ ] Free Space Management
