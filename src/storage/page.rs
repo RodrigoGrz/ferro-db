@@ -19,6 +19,10 @@ pub const COMMON_HEADER_SIZE: usize = HEADER_RESERVED_OFFSET + HEADER_RESERVED_S
 
 pub const PAGE_FORMAT_VERSION: u8 = 1;
 
+/// Page 0 is reserved for the database header (the future catalog root). It is never
+/// allocated, so a page link of 0 means "no page".
+pub const RESERVED_PAGE_ID: u32 = 0;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PageError {
     InvalidPageSize,
@@ -226,6 +230,10 @@ impl Page {
 
     pub fn mark_clean(&mut self) {
         self.is_dirty = false;
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.is_dirty = true;
     }
 
     pub fn lsn(&self) -> u64 {

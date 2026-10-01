@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::storage::checksum;
 use crate::storage::disk_manager::{DiskError, DiskManager};
-use crate::storage::page::{COMMON_HEADER_SIZE, Page, PageError, PageHeader};
+use crate::storage::page::{COMMON_HEADER_SIZE, Page, PageError, PageHeader, RESERVED_PAGE_ID};
 use crate::storage::replacer::LRUKReplacer;
 
 const LRU_K: usize = 2;
@@ -15,6 +15,7 @@ pub enum BufferPoolError {
     InvalidPoolSize,
     InvalidPageSize,
     NoAvailableFrame,
+    PageIdOverflow,
     ChecksumMismatch { page_id: u32 },
     Disk(DiskError),
     Page(PageError),
@@ -30,6 +31,7 @@ impl fmt::Display for BufferPoolError {
                 write!(f, "page size must be at least {COMMON_HEADER_SIZE} bytes")
             }
             BufferPoolError::NoAvailableFrame => write!(f, "no available frame"),
+            BufferPoolError::PageIdOverflow => write!(f, "no page ids left"),
             BufferPoolError::ChecksumMismatch { page_id } => {
                 write!(f, "checksum mismatch on page {page_id}")
             }
@@ -68,6 +70,12 @@ pub struct BufferPoolManager {
     free_list: Vec<usize>,
     replacer: LRUKReplacer,
     disk_manager: DiskManager,
+    page_size: usize,
+    /// `u64` so that handing out `u32::MAX` does not overflow the counter.
+    next_page_id: u64,
+    /// Page id -> fetches that still succeed before one fails (fault injection in tests).
+    #[cfg(test)]
+    fetch_failures: HashMap<u32, usize>,
 }
 
 impl BufferPoolManager {
@@ -100,10 +108,60 @@ impl BufferPoolManager {
             free_list,
             replacer,
             disk_manager,
+            page_size,
+            next_page_id: u64::from(RESERVED_PAGE_ID) + 1,
+            #[cfg(test)]
+            fetch_failures: HashMap::new(),
         })
     }
 
+    /// Makes the fetch of `page_id` after `successes` more fetches fail once with
+    /// `NoAvailableFrame`, to test what callers do when a page access fails midway.
+    #[cfg(test)]
+    pub(crate) fn fail_fetch_after(&mut self, page_id: u32, successes: usize) {
+        self.fetch_failures.insert(page_id, successes);
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Allocates the next page id and returns the page pinned, zeroed and already dirty,
+    /// so the id reaches the disk even if the caller unpins it clean and is never handed
+    /// out twice.
+    pub fn new_page(&mut self) -> Result<(u32, &mut Page), BufferPoolError> {
+        let candidate = self.first_unused_page_id()?;
+        let page_id = u32::try_from(candidate).map_err(|_| BufferPoolError::PageIdOverflow)?;
+
+        let frame_id = self.install_page(page_id, vec![0; self.page_size])?;
+        self.next_page_id = candidate + 1;
+        let page = &mut self.pages[frame_id];
+        page.mark_dirty();
+        Ok((page_id, page))
+    }
+
+    /// Pages created with `fetch_page` past the end of the file are not on disk yet,
+    /// so the page table is checked too.
+    fn first_unused_page_id(&mut self) -> Result<u64, BufferPoolError> {
+        let after_disk = self.disk_manager.num_pages()?;
+        let after_memory = self
+            .page_table
+            .keys()
+            .max()
+            .map_or(0, |&page_id| u64::from(page_id) + 1);
+        Ok(self.next_page_id.max(after_disk).max(after_memory))
+    }
+
     pub fn fetch_page(&mut self, page_id: u32) -> Result<&mut Page, BufferPoolError> {
+        #[cfg(test)]
+        if let Some(successes) = self.fetch_failures.get_mut(&page_id) {
+            if *successes == 0 {
+                self.fetch_failures.remove(&page_id);
+                return Err(BufferPoolError::NoAvailableFrame);
+            }
+            *successes -= 1;
+        }
+
         if let Some(&frame_id) = self.page_table.get(&page_id) {
             self.pages[frame_id].pin();
             self.replacer.record_access(frame_id);
@@ -117,6 +175,12 @@ impl BufferPoolManager {
         }
         PageHeader::read(&data)?;
 
+        let frame_id = self.install_page(page_id, data)?;
+        Ok(&mut self.pages[frame_id])
+    }
+
+    /// Puts `data` in a free frame (or evicts a victim, writing it if dirty) and pins it.
+    fn install_page(&mut self, page_id: u32, data: Vec<u8>) -> Result<usize, BufferPoolError> {
         let (frame_id, from_free_list) = if let Some(&id) = self.free_list.last() {
             (id, true)
         } else if let Some(id) = self.replacer.select_victim() {
@@ -149,7 +213,7 @@ impl BufferPoolManager {
         self.replacer.record_access(frame_id);
         self.replacer.pin(frame_id);
 
-        Ok(&mut self.pages[frame_id])
+        Ok(frame_id)
     }
 
     pub fn unpin_page(&mut self, page_id: u32, is_dirty: bool) -> bool {
@@ -750,5 +814,93 @@ mod tests {
         pool.reopen(1);
         let page = pool.bpm().fetch_page(1).unwrap();
         assert_eq!(page.data()[DATA_BYTE], 2);
+    }
+
+    fn allocate(pool: &mut TestPool) -> u32 {
+        let (page_id, _) = pool.bpm().new_page().unwrap();
+        assert!(pool.bpm().unpin_page(page_id, false));
+        page_id
+    }
+
+    #[test]
+    fn new_page_should_skip_the_reserved_page_in_a_new_file() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+
+        assert_eq!(allocate(&mut pool), 1);
+    }
+
+    #[test]
+    fn new_page_should_hand_out_increasing_ids() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+
+        let ids: Vec<u32> = (0..3).map(|_| allocate(&mut pool)).collect();
+
+        assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[test]
+    fn new_page_should_return_a_zeroed_pinned_dirty_page() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+        write_value(&mut pool, 1, 7);
+        pool.bpm().flush_page(1).unwrap();
+
+        let (page_id, page) = pool.bpm().new_page().unwrap();
+
+        assert_eq!(page_id, 2);
+        assert_eq!(page.page_id(), Some(2));
+        assert_eq!(page.pin_count(), 1);
+        assert!(page.is_dirty());
+        assert!(page.data().iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn new_page_should_continue_after_the_pages_on_disk() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+        write_value(&mut pool, 3, 1);
+        pool.reopen(2);
+
+        assert_eq!(allocate(&mut pool), 4);
+    }
+
+    #[test]
+    fn new_page_should_skip_pages_in_memory_not_yet_written() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+        allocate(&mut pool);
+        write_value(&mut pool, 5, 1);
+
+        assert_eq!(allocate(&mut pool), 6);
+    }
+
+    #[test]
+    fn new_page_unpinned_clean_should_still_reach_the_disk() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+        let page_id = allocate(&mut pool);
+
+        pool.reopen(2);
+
+        assert_eq!(allocate(&mut pool), page_id + 1);
+    }
+
+    #[test]
+    fn new_page_with_every_frame_pinned_should_fail_without_consuming_an_id() {
+        let mut pool = TestPool::new(1, TEST_PAGE_SIZE);
+        let (first, _) = pool.bpm().new_page().unwrap();
+
+        let err = pool.bpm().new_page().unwrap_err();
+        pool.bpm().unpin_page(first, false);
+
+        assert!(matches!(err, BufferPoolError::NoAvailableFrame));
+        assert_eq!(allocate(&mut pool), first + 1);
+    }
+
+    #[test]
+    fn new_page_past_the_last_page_id_should_fail() {
+        let mut pool = TestPool::new(1, TEST_PAGE_SIZE);
+        pool.bpm().next_page_id = u64::from(u32::MAX) + 1;
+
+        let err = pool.bpm().new_page().unwrap_err();
+
+        assert!(matches!(err, BufferPoolError::PageIdOverflow));
+        assert_eq!(err.to_string(), "no page ids left");
     }
 }

@@ -4,7 +4,7 @@
 //! [0..16)  common header   LSN, checksum, page type = Slotted, version (see `page`)
 //! [16..18) slot_count      u16
 //! [18..20) free_space_end  u16  start of the tuple area
-//! [20..24) reserved        zeroed
+//! [20..24) next_page_id    u32  next page of the heap file, 0 = none (page 0 is reserved)
 //! [24..)   slot array      (offset u16, len u16) per slot, grows forward
 //! ...      free space
 //! [free_space_end..page_size) tuples, grow backward
@@ -15,15 +15,16 @@
 //! so a `Rid` stays valid for as long as its tuple lives.
 
 use std::fmt;
+use std::num::NonZeroU32;
 
 use crate::config::MAX_PAGE_SIZE;
-use crate::serialization::{get_u16, put_u16};
+use crate::serialization::{get_u16, get_u32, put_u16, put_u32};
 use crate::storage::page::{COMMON_HEADER_SIZE, PageError, PageHeader, PageType};
 
 const SLOT_COUNT_OFFSET: usize = COMMON_HEADER_SIZE;
 const FREE_SPACE_END_OFFSET: usize = SLOT_COUNT_OFFSET + 2;
-const RESERVED_OFFSET: usize = FREE_SPACE_END_OFFSET + 2;
-pub const HEADER_SIZE: usize = 24;
+const NEXT_PAGE_ID_OFFSET: usize = FREE_SPACE_END_OFFSET + 2;
+pub const HEADER_SIZE: usize = NEXT_PAGE_ID_OFFSET + 4;
 pub const SLOT_SIZE: usize = 4;
 
 const TOMBSTONE: u16 = 0;
@@ -92,7 +93,7 @@ pub struct SlottedPage<B> {
     data: B,
 }
 
-fn check_page_size(size: usize) -> Result<(), SlottedPageError> {
+pub fn check_page_size(size: usize) -> Result<(), SlottedPageError> {
     if size < HEADER_SIZE {
         return Err(SlottedPageError::PageTooSmall { size });
     }
@@ -146,6 +147,10 @@ impl<B: AsRef<[u8]>> SlottedPage<B> {
 
     pub fn max_tuple_size(&self) -> usize {
         self.page_size().saturating_sub(HEADER_SIZE + SLOT_SIZE)
+    }
+
+    pub fn next_page_id(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(get_u32(self.bytes(), NEXT_PAGE_ID_OFFSET))
     }
 
     pub fn can_insert(&self, len: usize) -> bool {
@@ -257,7 +262,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<B> {
         PageHeader::format(bytes, PageType::Slotted)?;
         put_u16(bytes, SLOT_COUNT_OFFSET, 0);
         put_u16(bytes, FREE_SPACE_END_OFFSET, size as u16);
-        bytes[RESERVED_OFFSET..HEADER_SIZE].fill(0);
+        put_u32(bytes, NEXT_PAGE_ID_OFFSET, 0);
 
         Ok(Self { data })
     }
@@ -320,6 +325,14 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<B> {
         }
         self.place(slot_id, tuple);
         Ok(())
+    }
+
+    pub fn set_next_page_id(&mut self, next: Option<NonZeroU32>) {
+        put_u32(
+            self.bytes_mut(),
+            NEXT_PAGE_ID_OFFSET,
+            next.map_or(0, NonZeroU32::get),
+        );
     }
 
     /// Packs live tuples at the end of the page, keeping every slot id.
@@ -435,28 +448,59 @@ mod tests {
         assert_eq!(page.free_space_end(), PAGE_SIZE);
         assert_eq!(page.contiguous_free_space(), PAGE_SIZE - HEADER_SIZE);
         assert_eq!(page.total_free_space(), PAGE_SIZE - HEADER_SIZE);
-        assert!(
-            page.data[RESERVED_OFFSET..HEADER_SIZE]
-                .iter()
-                .all(|&b| b == 0)
-        );
+        assert_eq!(page.next_page_id(), None);
         assert_eq!(page.iter().count(), 0);
     }
 
     #[test]
-    fn init_should_preserve_lsn_and_checksum() {
+    fn init_should_preserve_lsn_and_checksum_and_clear_the_next_page() {
         let mut data = vec![0; SMALL];
         data[..PAGE_TYPE_OFFSET].fill(0xAB);
-        data[RESERVED_OFFSET..HEADER_SIZE].fill(0xFF);
+        data[NEXT_PAGE_ID_OFFSET..HEADER_SIZE].fill(0xFF);
 
         let page = SlottedPage::init(data).unwrap();
 
         assert!(page.data[..PAGE_TYPE_OFFSET].iter().all(|&b| b == 0xAB));
-        assert!(
-            page.data[RESERVED_OFFSET..HEADER_SIZE]
-                .iter()
-                .all(|&b| b == 0)
-        );
+        assert_eq!(page.next_page_id(), None);
+    }
+
+    fn page_id(value: u32) -> Option<NonZeroU32> {
+        NonZeroU32::new(value)
+    }
+
+    #[test]
+    fn next_page_id_should_round_trip() {
+        let mut page = empty(SMALL);
+
+        for next in [page_id(1), page_id(u32::MAX), None] {
+            page.set_next_page_id(next);
+
+            assert_eq!(page.next_page_id(), next);
+        }
+    }
+
+    #[test]
+    fn next_page_id_should_be_stored_little_endian_after_free_space_end() {
+        let mut page = empty(SMALL);
+
+        page.set_next_page_id(page_id(0x0403_0201));
+
+        assert_eq!(page.data[20..24], [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn set_next_page_id_should_not_touch_slots_or_tuples() {
+        let mut page = empty(SMALL);
+        page.insert(b"abc").unwrap();
+        let before = snapshot(&page);
+
+        page.set_next_page_id(page_id(9));
+
+        let after = snapshot(&page);
+        assert_eq!(before[..NEXT_PAGE_ID_OFFSET], after[..NEXT_PAGE_ID_OFFSET]);
+        assert_eq!(before[HEADER_SIZE..], after[HEADER_SIZE..]);
+        assert_eq!(page.get(0).unwrap(), b"abc");
+        assert_invariants(&page);
     }
 
     #[test]
@@ -672,9 +716,9 @@ mod tests {
     }
 
     #[test]
-    fn new_should_ignore_non_zero_reserved_bytes() {
+    fn new_should_accept_any_next_page_id() {
         let mut page = empty(SMALL);
-        page.data[RESERVED_OFFSET..HEADER_SIZE].fill(0xFF);
+        page.data[NEXT_PAGE_ID_OFFSET..HEADER_SIZE].fill(0xFF);
 
         assert!(SlottedPage::new(page.data).is_ok());
     }

@@ -180,8 +180,8 @@ Toda página começa com 16 bytes que o buffer pool entende, independente do tip
 ```
  0        8        12   13   14    16       18        20        24
  ┌────────┬────────┬────┬────┬─────┬────────┬─────────┬─────────┬─────────────────┐
- │  LSN   │checksum│type│ver │rsv  │slot_cnt│free_end │reserved │ slot[0] ...     │ → cresce →
- │  u64   │  u32   │ u8 │ u8 │ 2 B │  u16   │  u16    │ 4 bytes │(off u16,len u16)│
+ │  LSN   │checksum│type│ver │rsv  │slot_cnt│free_end │next_pg  │ slot[0] ...     │ → cresce →
+ │  u64   │  u32   │ u8 │ u8 │ 2 B │  u16   │  u16    │  u32    │(off u16,len u16)│
  ├────────┴────────┴────┴────┴─────┴────────┴─────────┴─────────┴─────────────────┤
  │                     espaço livre contíguo                            │
  ├──────────────────────────────────────────────────────────────────────┤
@@ -194,6 +194,7 @@ Toda página começa com 16 bytes que o buffer pool entende, independente do tip
 - `offset == 0` marca um **slot deletado** (tombstone). Tupla vazia (`len == 0`) é válida.
 - Maior tupla em 8 KB: `8192 - 24 - 4 = 8164` bytes.
 - Offsets são `u16`, então a página pode ter no máximo 65535 bytes.
+- `next_pg` (bytes `20..24`, antes reservado) é a próxima página do Heap File; `0` = fim da lista. Páginas antigas já tinham `0` ali, então o formato não mudou de versão.
 
 ## 🔑 RID (Record ID)
 
@@ -208,7 +209,7 @@ A regra mais importante do design: **o `slot_id` de uma tupla nunca muda** enqua
 - **update:**
   - tamanho menor ou igual → sobrescreve no lugar;
   - maior → usa o espaço livre + o espaço da versão antiga, compactando se preciso, **mantendo o slot_id**;
-  - não cabe → `PageFull` e a página fica intacta. (Forwarding pointer para outra página fica para o Heap File.)
+  - não cabe → `PageFull` e a página fica intacta. Quem move a tupla para outra página é o Heap File, que devolve um `Rid` novo (ver "Heap File").
 - **compact:** empurra as tuplas vivas para o fim da página e atualiza só os offsets dos slots.
 
 ## 🧠 Decisões de design
@@ -353,10 +354,84 @@ Exemplo — layout `[Fixed(4), Variable, Fixed(1)]`, valores `(42, "ab", NULL)`:
 
 ## 📌 Próximos passos
 
-- Heap File: várias páginas por tabela, alocação de páginas e forwarding pointer quando um update não cabe
+- ~~Heap File~~ e ~~conversão de inteiros ⇄ campos~~: feitos (ver seções abaixo)
 - Free space map: achar rápido uma página com espaço
-- Data Types / Type System: converter valores SQL ⇄ campos da tupla
 - Schema: gerar o `TupleLayout` a partir das colunas da tabela
+
+---
+
+# 🗃️ Heap File
+
+## 📌 Visão geral
+
+O `HeapFile` (`src/storage/heap_file.rs`) guarda as tuplas de uma tabela, sem ordem, numa **lista ligada de slotted pages**. O banco inteiro é um arquivo só, então as páginas de uma tabela ficam espalhadas e cada uma aponta para a próxima pelo campo `next_page_id` do header da slotted page.
+
+```
+first_page_id
+     │
+     ▼
+ ┌────────┐  next  ┌────────┐  next  ┌────────┐  next = 0
+ │ pág. 1 │ ─────▶ │ pág. 4 │ ─────▶ │ pág. 7 │ ─────▶ fim
+ └────────┘        └────────┘        └────────┘
+                                     ▲ inserts vão aqui
+```
+
+O heap é identificado pela primeira página. Quem vai guardar o `first_page_id` de cada tabela é o catálogo (por enquanto os testes guardam na mão).
+
+## 🧱 Alocação de páginas
+
+- `BufferPoolManager::new_page()` devolve o próximo id livre, com a página zerada, pinada e **já dirty**: o id chega ao disco mesmo que quem pediu não escreva nada, então nunca é entregue duas vezes.
+- O próximo id é `max(contador, páginas no disco, maior id no page_table + 1)`, recalculado a cada chamada: respeita páginas criadas com `fetch_page` além do fim do arquivo que ainda não foram gravadas.
+- **Página 0 é reservada** (`RESERVED_PAGE_ID`) para o header do banco / raiz do catálogo. Por isso `0` pode significar "sem próxima página".
+- Ids acabaram → `BufferPoolError::PageIdOverflow` (o contador é `u64` para não estourar ao entregar `u32::MAX`).
+
+## ⚙️ Operações
+
+- **create:** confere se o tamanho de página do pool serve para slotted pages (`UnsupportedPageSize`, sem gastar id) e aloca e formata a primeira página. Heap vazio tem sempre 1 página.
+- **open:** percorre a lista no disco e guarda os ids em memória. Rejeita ciclo (`CorruptedChain`), página que não é slotted (`Page { .. }`, ex.: ponteiro para além do fim do arquivo) e começar na página 0.
+- **insert:** tenta só a **última página**. Se está cheia, primeiro segue o `next_page_id` dela: se outro handle do mesmo heap já acrescentou páginas, adota-as e tenta de novo na última de verdade. Só então aloca outra, grava a tupla nela e liga a anterior a ela — nunca sobrescreve um `next_page_id` existente (isso deixaria órfã a página de outro handle). Tupla que não caberia nem numa página vazia → `TupleTooLarge` sem alocar nada.
+- **get:** confere que o `Rid` é de uma página deste heap (`PageNotInHeap`) e copia os bytes. Slot inexistente ou deletado → `TupleNotFound`.
+- **update:** cabe na página → mesmo `Rid`. Não cabe → insere a nova versão (pode alocar página), **depois** apaga a antiga e devolve o `Rid` novo. Se o insert falhar, a versão antiga continua lá; se o delete da antiga falhar, a nova é apagada antes de devolver o erro, para não ficarem duas versões vivas.
+- **delete:** tombstone no slot; o espaço volta para a página, mas só é reaproveitado por inserts quando ela é a última (ver Free Space Management).
+- **scan:** `Iterator` de `(Rid, Vec<u8>)` na ordem página → slot. Cada página é pinada uma vez: as tuplas vivas são copiadas e a página é liberada antes de entregar a primeira.
+
+## 🧠 Decisões de design
+
+✔️ **Lista ligada no campo reservado** (como o `TableHeap` do BusTub): não muda o formato da página. Um diretório de páginas anteciparia o Free Space Management e criaria outra estrutura para manter em sincronia agora.
+
+✔️ **`update` que não cabe muda o `Rid`** em vez de deixar um forwarding pointer. O forwarding pointer exigiria distinguir stub de tupla, evitar que o scan devolva a tupla movida duas vezes e tratar cadeias de forward. Com MVCC toda atualização vai gerar uma versão nova com endereço novo de qualquer forma; os índices atualizam o `Rid` quando ele muda. A mudança está na assinatura: `update(..) -> Result<Rid, _>`.
+
+✔️ **`Option<NonZeroU32>` no `next_page_id`:** o tipo já diz que 0 não é uma próxima página válida.
+
+✔️ **O `HeapFile` não guarda o buffer pool:** cada método recebe `&mut BufferPoolManager`. Várias tabelas dividem o mesmo pool sem `Rc<RefCell<_>>`.
+
+✔️ **Pin sempre devolvido:** todo acesso passa por `read_page`/`write_page`, que fazem unpin em qualquer caminho (inclusive erro) e só marcam dirty se a escrita deu certo.
+
+✔️ **Lista de páginas em memória:** permite validar se um `Rid` é deste heap e dispensa reler os ponteiros a cada scan. Custa 4 B por página e um `open` que lê todas as páginas.
+
+⚠️ **Inserts só na última página:** espaço liberado em páginas antigas fica ocioso até o Free Space Management.
+
+⚠️ **Página órfã:** um erro de I/O entre alocar a página nova e gravar o ponteiro na anterior deixa uma página inalcançável (espaço perdido, nenhum dado corrompido). Resolver isso é papel do WAL.
+
+⚠️ **`update` que move não é atômico:** o desfazer em caso de erro é de melhor esforço (se o segundo delete também falhar, as duas versões ficam). Atomicidade de verdade vem com o WAL.
+
+⚠️ **Vários handles do mesmo heap:** o `insert` não perde dados, mas `get`/`scan` de um handle só enxergam as páginas que outro acrescentou depois do próximo `insert` dele ou de um novo `open`. O catálogo deve manter um handle por tabela.
+
+⚠️ **`get`/`scan` copiam os bytes:** sem um guard de pin no buffer pool, devolver `&[u8]` exigiria manter a página pinada entre chamadas.
+
+## 🧪 Testes
+
+- Unitários em `buffer_pool` (`new_page`: página 0 pulada, ids crescentes, continua depois do disco e de páginas em memória, dirty mesmo com unpin limpo, `NoAvailableFrame` não consome id, `PageIdOverflow`) e em `slotted_page` (`next_page_id`).
+- Unitários em `heap_file`: cada operação, limites (tupla vazia, máxima, máxima + 1), cada variante de erro, update que move (inclusive alocando outra página), scan com deletes e depois de mover, scan abandonado no meio, lista com ciclo / ponteiro para si mesma / para além do arquivo / página 0, insert por um handle desatualizado, tamanho de página não suportado, insert sem frame livre. Todo teste confere que nenhuma página ficou pinada.
+- Falhas no meio de uma operação usam um gancho de teste do buffer pool (`fail_fetch_after`, só em `#[cfg(test)]`): `update` cujo delete falha não deixa duas versões, e o scan para depois de um erro de página.
+- `random_operations_should_match_model`: 5 000 operações com pool de 3 frames contra um `HashMap<Rid, Vec<u8>>`, conferindo o scan sem duplicatas a cada 500 passos e reabrindo no fim; checado com mutação (esquecer a página nova, ou não marcar dirty, faz o teste falhar).
+- Integração em `tests/storage_heap_file.rs`: eviction, reabrir o arquivo, dois heaps no mesmo arquivo, páginas novas depois de reabrir não reaproveitam páginas do heap, corrupção numa página do meio detectada pelo checksum no `open`.
+
+## 📌 Próximos passos
+
+- Free Space Management: achar uma página com espaço sem percorrer a lista e reaproveitar o espaço de deletes
+- Schema / Table Heap: linhas tipadas (`Value`) em cima do heap
+- Catálogo na página 0: guardar o `first_page_id` de cada tabela
 
 ---
 
