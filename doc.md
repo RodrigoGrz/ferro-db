@@ -373,7 +373,7 @@ first_page_id
  ┌────────┐  next  ┌────────┐  next  ┌────────┐  next = 0
  │ pág. 1 │ ─────▶ │ pág. 4 │ ─────▶ │ pág. 7 │ ─────▶ fim
  └────────┘        └────────┘        └────────┘
-                                     ▲ inserts vão aqui
+                                     ▲ páginas novas entram aqui
 ```
 
 O heap é identificado pela primeira página. Quem vai guardar o `first_page_id` de cada tabela é o catálogo (por enquanto os testes guardam na mão).
@@ -389,10 +389,10 @@ O heap é identificado pela primeira página. Quem vai guardar o `first_page_id`
 
 - **create:** confere se o tamanho de página do pool serve para slotted pages (`UnsupportedPageSize`, sem gastar id) e aloca e formata a primeira página. Heap vazio tem sempre 1 página.
 - **open:** percorre a lista no disco e guarda os ids em memória. Rejeita ciclo (`CorruptedChain`), página que não é slotted (`Page { .. }`, ex.: ponteiro para além do fim do arquivo) e começar na página 0.
-- **insert:** tenta só a **última página**. Se está cheia, primeiro segue o `next_page_id` dela: se outro handle do mesmo heap já acrescentou páginas, adota-as e tenta de novo na última de verdade. Só então aloca outra, grava a tupla nela e liga a anterior a ela — nunca sobrescreve um `next_page_id` existente (isso deixaria órfã a página de outro handle). Tupla que não caberia nem numa página vazia → `TupleTooLarge` sem alocar nada.
+- **insert:** tupla maior que uma página vazia → `TupleTooLarge` sem ler nem alocar nada. Senão pergunta ao **mapa de espaço livre** qual a primeira página (na ordem da lista) que aceita a tupla e insere nela (ver Free Space Management). Se nenhuma página conhecida cabe, segue o `next_page_id` da última: se outro handle do mesmo heap já acrescentou páginas, adota-as e tenta de novo. Só então aloca outra, grava a tupla nela e liga a anterior a ela — nunca sobrescreve um `next_page_id` existente (isso deixaria órfã a página de outro handle).
 - **get:** confere que o `Rid` é de uma página deste heap (`PageNotInHeap`) e copia os bytes. Slot inexistente ou deletado → `TupleNotFound`.
 - **update:** cabe na página → mesmo `Rid`. Não cabe → insere a nova versão (pode alocar página), **depois** apaga a antiga e devolve o `Rid` novo. Se o insert falhar, a versão antiga continua lá; se o delete da antiga falhar, a nova é apagada antes de devolver o erro, para não ficarem duas versões vivas.
-- **delete:** tombstone no slot; o espaço volta para a página, mas só é reaproveitado por inserts quando ela é a última (ver Free Space Management).
+- **delete:** tombstone no slot; o espaço volta para a página e o mapa de espaço livre registra, então o próximo insert que couber nela reaproveita o buraco.
 - **scan:** `Iterator` de `(Rid, Vec<u8>)` na ordem página → slot. Cada página é pinada uma vez: as tuplas vivas são copiadas e a página é liberada antes de entregar a primeira.
 
 ## 🧠 Decisões de design
@@ -407,9 +407,7 @@ O heap é identificado pela primeira página. Quem vai guardar o `first_page_id`
 
 ✔️ **Pin sempre devolvido:** todo acesso passa por `read_page`/`write_page`, que fazem unpin em qualquer caminho (inclusive erro) e só marcam dirty se a escrita deu certo.
 
-✔️ **Lista de páginas em memória:** permite validar se um `Rid` é deste heap e dispensa reler os ponteiros a cada scan. Custa 4 B por página e um `open` que lê todas as páginas.
-
-⚠️ **Inserts só na última página:** espaço liberado em páginas antigas fica ocioso até o Free Space Management.
+✔️ **Lista de páginas em memória:** permite validar se um `Rid` é deste heap e dispensa reler os ponteiros a cada scan. Um `HashMap` de page id → posição deixa essa checagem (e a detecção de ciclo no `open`) O(1). Custa alguns bytes por página e um `open` que lê todas as páginas.
 
 ⚠️ **Página órfã:** um erro de I/O entre alocar a página nova e gravar o ponteiro na anterior deixa uma página inalcançável (espaço perdido, nenhum dado corrompido). Resolver isso é papel do WAL.
 
@@ -424,14 +422,90 @@ O heap é identificado pela primeira página. Quem vai guardar o `first_page_id`
 - Unitários em `buffer_pool` (`new_page`: página 0 pulada, ids crescentes, continua depois do disco e de páginas em memória, dirty mesmo com unpin limpo, `NoAvailableFrame` não consome id, `PageIdOverflow`) e em `slotted_page` (`next_page_id`).
 - Unitários em `heap_file`: cada operação, limites (tupla vazia, máxima, máxima + 1), cada variante de erro, update que move (inclusive alocando outra página), scan com deletes e depois de mover, scan abandonado no meio, lista com ciclo / ponteiro para si mesma / para além do arquivo / página 0, insert por um handle desatualizado, tamanho de página não suportado, insert sem frame livre. Todo teste confere que nenhuma página ficou pinada.
 - Falhas no meio de uma operação usam um gancho de teste do buffer pool (`fail_fetch_after`, só em `#[cfg(test)]`): `update` cujo delete falha não deixa duas versões, e o scan para depois de um erro de página.
-- `random_operations_should_match_model`: 5 000 operações com pool de 3 frames contra um `HashMap<Rid, Vec<u8>>`, conferindo o scan sem duplicatas a cada 500 passos e reabrindo no fim; checado com mutação (esquecer a página nova, ou não marcar dirty, faz o teste falhar).
+- `random_operations_should_match_model`: 5 000 operações com pool de 3 frames contra um `HashMap<Rid, Vec<u8>>`, conferindo o scan sem duplicatas a cada 500 passos, pins e mapa de espaço livre a cada 250 e, por amostragem, que nenhuma página foi alocada enquanto outra cabia (ver Free Space Management); reabre no fim. Checado com mutação (esquecer a página nova, não marcar dirty ou ignorar o mapa faz o teste falhar).
 - Integração em `tests/storage_heap_file.rs`: eviction, reabrir o arquivo, dois heaps no mesmo arquivo, páginas novas depois de reabrir não reaproveitam páginas do heap, corrupção numa página do meio detectada pelo checksum no `open`.
 
 ## 📌 Próximos passos
 
-- Free Space Management: achar uma página com espaço sem percorrer a lista e reaproveitar o espaço de deletes
 - Schema / Table Heap: linhas tipadas (`Value`) em cima do heap
 - Catálogo na página 0: guardar o `first_page_id` de cada tabela
+
+---
+
+# 🧭 Free Space Management
+
+## 📌 Visão geral
+
+O `HeapFile` sabe quanto cabe em **cada** página dele e insere na **primeira página da lista onde a tupla cabe**. Assim reaproveita o espaço de deletes e de updates em páginas antigas, inclusive páginas que ficaram vazias; uma página nova só é alocada quando nenhuma página conhecida aceita a tupla.
+
+O mapa de espaço livre (`FreeSpaceMap`, `src/storage/free_space_map.rs`) fica **em memória**: o `open` já lê todas as páginas para montar a lista, e o mapa sai da mesma leitura. O formato em disco não mudou.
+
+## 🧱 O valor guardado
+
+Para cada página, na mesma posição de `page_ids`, um `u16` que é um **limite exclusivo**: cabem tuplas de `0..valor` bytes.
+
+| Página | `largest_insertable()` | Valor no mapa |
+|---|---|---|
+| vazia (8 KB) | `Some(8164)` | 8165 |
+| sobram só os 4 B de um slot novo | `Some(0)` (cabe tupla vazia) | 1 |
+| cheia | `None` (nem tupla vazia cabe) | 0 |
+
+`SlottedPage::largest_insertable()` desconta os 4 B do slot novo, a não ser que exista um slot deletado para reaproveitar, e nunca passa de `max_tuple_size`. Vale `can_insert(n) ⇔ largest_insertable() >= Some(n)`.
+
+Guardar só "a maior tupla que cabe" não funciona: `0` significaria tanto "cabe uma tupla vazia" quanto "não cabe nada", e um insert de tupla vazia encontraria a página cheia de novo para sempre. O limite exclusivo separa os dois casos.
+
+## 🌳 Árvore de máximos
+
+```
+                 tree[1] = 80                 raiz: maior valor de todas
+          ┌──────────┴──────────┐
+     tree[2] = 50          tree[3] = 80
+      ┌─────┴─────┐         ┌─────┴─────┐
+   10 (pág 0)  50 (pág 1) 20 (pág 2)  80 (pág 3)    folhas, na ordem da lista
+```
+
+- `find(len)`: desce da raiz indo para a **esquerda** sempre que o filho esquerdo tem valor `> len` → devolve a primeira página que cabe em O(log n). Ex.: `find(30)` → página 1.
+- `set(i, valor)`: muda a folha e recalcula os ancestrais, O(log n).
+- `push(valor)`: página nova no fim; quando as folhas acabam, dobra a capacidade (reconstrução O(n), amortizada).
+- Folhas além do número de páginas valem 0 (= cheia), então nunca são escolhidas.
+
+## ⚙️ Como o heap usa o mapa
+
+- **insert**: tupla > `max_tuple_size` → `TupleTooLarge` sem ler página. Senão `find(len)` → tenta a página. Se ela não aceitar (mapa desatualizado), grava o valor real (que agora não aceita `len`) e procura de novo; cada página falha no máximo uma vez, então o laço termina. Sem página no mapa → adota páginas acrescentadas por outro handle → só então aloca.
+- **delete / update / insert**: a escrita devolve o novo valor da página, lido com ela ainda pinada, e o mapa só é atualizado **se a escrita deu certo**. Uma tentativa que não muda a página (insert que encontra a página cheia, update que não cabe no lugar) não a marca como dirty, então não custa uma escrita em disco.
+- **open**: cada página lida para seguir a lista entra no mapa com o valor real.
+
+## 🧠 Decisões de design
+
+✔️ **Em memória, refeito no `open`**: montar é grátis (o `open` já lê tudo), sem mudança de formato e sem mapa desatualizado depois de um crash. Um mapa persistente só compensaria quando o `open` parar de percorrer a lista.
+
+✔️ **Valor exato** (não categorias de 1 byte): em memória o byte a mais não pesa e, para um handle, o mapa nunca promete espaço que a página não tem.
+
+✔️ **Primeira página que cabe** (first-fit na ordem da lista): enche o começo do heap e é o que a árvore responde barato. A ordem física dos inserts muda, mas o heap não tem ordem.
+
+✔️ **Página vazia continua no heap**: a própria tabela reaproveita pelo mapa, sem desligar páginas da lista nem mexer na página 0.
+
+✔️ **`FreeSpaceMap` é `pub(crate)`**: detalhe interno do heap.
+
+⚠️ **Vários handles**: o mapa de cada handle é uma **dica**. Valor alto demais vira uma tentativa que falha e corrige o mapa; valor baixo demais só faz perder aquela página até o próximo `open`. Nenhum dado é perdido.
+
+⚠️ **Página esvaziada não volta a aceitar a tupla máxima**: os slots deletados ficam no array (os `slot_id` são estáveis), e cada um além do reaproveitado ainda ocupa 4 B.
+
+⚠️ **Custo por escrita**: `largest_insertable` é O(slots) (soma dos bytes vivos e procura de slot livre), a mesma ordem das operações da slotted page.
+
+## 🧪 Testes
+
+- Unitários em `slotted_page`: `largest_insertable` em página vazia, com tuplas, com slot reaproveitável, com buraco, só com espaço para o slot (`Some(0)`), cheia e do tamanho do header (`None`), e 5 000 estados aleatórios comparados com `can_insert`.
+- Unitários em `free_space_map`: mapa vazio, primeira página que cabe, limites (`find(0)` pulando páginas cheias, `u16::MAX`), `set` para cima e para baixo, erro de índice, folhas de enchimento, crescimento por potências de 2 até 1 000 páginas e 10 000 operações contra uma busca linear.
+- Unitários em `heap_file`: todo teste confere pins **e** mapa exato (`assert_heap_consistent`); reaproveitamento de buracos, first-fit, sem alocação com espaço sobrando, página esvaziada, tupla vazia em página cheia e em página com espaço só para o slot, tupla grande sem ler página, escrita que falha não muda o mapa, mapa desatualizado entre dois handles (checado com mutação: sem corrigir o mapa no erro, o insert não termina).
+- `random_operations_should_match_model` do heap: confere o mapa contra as páginas a cada 250 passos e, por amostragem, que nenhuma página foi alocada enquanto outra aceitava a tupla (checado com mutação: ignorar o mapa falha no passo 0).
+- Integração em `tests/storage_heap_file.rs`: espaço liberado antes de reabrir o arquivo é reaproveitado, reaproveitamento com pool de 2 frames (eviction), heap esvaziado volta a encher sem crescer.
+
+## 📌 Próximos passos
+
+- Schema / Table Heap: linhas tipadas (`Value`) em cima do heap
+- Catálogo na página 0: guardar o `first_page_id` de cada tabela (e, se o `open` deixar de percorrer a lista, um mapa de espaço livre persistente)
+- `VACUUM`: compactar o heap e devolver páginas vazias
 
 ---
 

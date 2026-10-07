@@ -162,3 +162,62 @@ fn corruption_of_a_middle_page_should_be_detected_on_open() {
             if page_id == middle_page_id
     ));
 }
+
+#[test]
+fn space_freed_before_reopening_should_be_reused() {
+    let db = TempDb::new();
+    let (first_page_id, rids, pages) = {
+        let mut bpm = db.open(4);
+        let mut heap = HeapFile::create(&mut bpm).unwrap();
+        let rids = insert_rows(&mut heap, &mut bpm, 9);
+        heap.delete(&mut bpm, rids[1]).unwrap();
+        (heap.first_page_id(), rids, heap.page_count())
+    };
+
+    let mut bpm = db.open(4);
+    let mut heap = HeapFile::open(&mut bpm, first_page_id).unwrap();
+    let rid = heap.insert(&mut bpm, &row(100)).unwrap();
+
+    assert_eq!(rid.page_id, rids[1].page_id);
+    assert_eq!(heap.page_count(), pages);
+    assert_eq!(heap.get(&mut bpm, rid).unwrap(), row(100));
+}
+
+#[test]
+fn space_should_be_reused_under_eviction() {
+    let db = TempDb::new();
+    let mut bpm = db.open(2);
+    let mut heap = HeapFile::create(&mut bpm).unwrap();
+    let rids = insert_rows(&mut heap, &mut bpm, 18);
+    let pages = heap.page_count();
+
+    heap.delete(&mut bpm, rids[0]).unwrap();
+    heap.delete(&mut bpm, rids[10]).unwrap();
+    let reused: Vec<u32> = (0..2)
+        .map(|i| heap.insert(&mut bpm, &row(200 + i)).unwrap().page_id)
+        .collect();
+
+    assert_eq!(reused, vec![rids[0].page_id, rids[10].page_id]);
+    assert_eq!(heap.page_count(), pages);
+    assert_eq!(scan_all(&heap, &mut bpm).len(), 18);
+}
+
+#[test]
+fn emptied_heap_should_refill_without_growing() {
+    let db = TempDb::new();
+    let (first_page_id, pages) = {
+        let mut bpm = db.open(4);
+        let mut heap = HeapFile::create(&mut bpm).unwrap();
+        for rid in insert_rows(&mut heap, &mut bpm, 9) {
+            heap.delete(&mut bpm, rid).unwrap();
+        }
+        (heap.first_page_id(), heap.page_count())
+    };
+
+    let mut bpm = db.open(4);
+    let mut heap = HeapFile::open(&mut bpm, first_page_id).unwrap();
+    insert_rows(&mut heap, &mut bpm, 9);
+
+    assert_eq!(heap.page_count(), pages);
+    assert_eq!(scan_all(&heap, &mut bpm).len(), 9);
+}

@@ -1,6 +1,10 @@
 //! Heap file: the unordered tuples of one table in a linked list of slotted pages
-//! (`SlottedPage::next_page_id`). Inserts go to the last page; when it is full, a page
-//! from `BufferPoolManager::new_page` is linked after it.
+//! (`SlottedPage::next_page_id`). Inserts go to the first page with room, found through an
+//! in-memory free space map (`FreeSpaceMap`) kept in step with every write; only when no
+//! known page fits is a page from `BufferPoolManager::new_page` linked after the last one.
+//!
+//! With several handles on the same heap, each map is a guide: a page another handle
+//! filled is tried, found full, recorded as such and skipped.
 //!
 //! The heap is identified by its first page. `open` walks the list once and keeps the page
 //! ids in memory, which also tells whether a `Rid` belongs to this heap.
@@ -8,14 +12,17 @@
 //! Every page access goes through `read_page`/`write_page`, which unpin on every path, so a
 //! failed operation never leaks a pin.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::storage::buffer_pool::{BufferPoolError, BufferPoolManager};
+use crate::storage::free_space_map::FreeSpaceMap;
 use crate::storage::page::RESERVED_PAGE_ID;
 use crate::storage::rid::Rid;
-use crate::storage::slotted_page::{SlottedPage, SlottedPageError, check_page_size};
+use crate::storage::slotted_page::{
+    SlottedPage, SlottedPageError, check_page_size, max_tuple_size_for,
+};
 
 #[derive(Debug)]
 pub enum HeapFileError {
@@ -109,18 +116,57 @@ fn read_page<T>(
     result
 }
 
-/// Marks the page dirty only when `write` succeeds: failed operations leave pages untouched.
+/// Marks the page dirty only when `write` succeeds and reports a change: failed operations
+/// leave pages untouched, and attempts that changed nothing cost no page write.
 fn write_page<T>(
     bpm: &mut BufferPoolManager,
     page_id: u32,
-    write: impl FnOnce(&mut SlottedPage<&mut [u8]>) -> Result<T, HeapFileError>,
+    write: impl FnOnce(&mut SlottedPage<&mut [u8]>) -> Result<Written<T>, HeapFileError>,
 ) -> Result<T, HeapFileError> {
     let page = bpm.fetch_page(page_id)?;
     let result = SlottedPage::new(page.data_mut())
         .map_err(|source| page_error(page_id, source))
         .and_then(|mut slotted| write(&mut slotted));
-    bpm.unpin_page(page_id, result.is_ok());
-    result
+    let is_changed = matches!(
+        result,
+        Ok(Written {
+            is_changed: true,
+            ..
+        })
+    );
+    bpm.unpin_page(page_id, is_changed);
+    result.map(|written| written.value)
+}
+
+/// What a `write_page` closure returns. An attempt that did not change the page (e.g. an
+/// insert into a page that turned out full) must not cost a page write.
+struct Written<T> {
+    value: T,
+    is_changed: bool,
+}
+
+impl<T> Written<T> {
+    fn changed(value: T) -> Self {
+        Self {
+            value,
+            is_changed: true,
+        }
+    }
+
+    fn unchanged(value: T) -> Self {
+        Self {
+            value,
+            is_changed: false,
+        }
+    }
+}
+
+/// The page's entry in the free space map: tuples shorter than it fit, 0 = full. Fits `u16`
+/// because pages do; saturating would only overstate the room, which the insert path
+/// corrects on its first miss.
+fn free_space_of<B: AsRef<[u8]>>(page: &SlottedPage<B>) -> u16 {
+    let limit = page.largest_insertable().map_or(0, |largest| largest + 1);
+    u16::try_from(limit).unwrap_or(u16::MAX)
 }
 
 fn allocate_page(bpm: &mut BufferPoolManager) -> Result<u32, HeapFileError> {
@@ -131,15 +177,19 @@ fn allocate_page(bpm: &mut BufferPoolManager) -> Result<u32, HeapFileError> {
     Ok(page_id)
 }
 
-/// `None` when the page has no room for the tuple.
+/// `None` when the page has no room for the tuple. Also returns the page's free space after
+/// the attempt, read while the page is still pinned.
 fn try_insert(
     bpm: &mut BufferPoolManager,
     page_id: u32,
     tuple: &[u8],
-) -> Result<Option<Rid>, HeapFileError> {
+) -> Result<(Option<Rid>, u16), HeapFileError> {
     write_page(bpm, page_id, |page| match page.insert(tuple) {
-        Ok(slot_id) => Ok(Some(Rid::new(page_id, slot_id))),
-        Err(SlottedPageError::PageFull) => Ok(None),
+        Ok(slot_id) => Ok(Written::changed((
+            Some(Rid::new(page_id, slot_id)),
+            free_space_of(page),
+        ))),
+        Err(SlottedPageError::PageFull) => Ok(Written::unchanged((None, free_space_of(page)))),
         Err(source) => Err(page_error(page_id, source)),
     })
 }
@@ -190,6 +240,10 @@ fn live_tuples(page_id: u32, page: &SlottedPage<&[u8]>) -> Vec<(Rid, Vec<u8>)> {
 pub struct HeapFile {
     first_page_id: u32,
     page_ids: Vec<u32>,
+    /// Position of each page in `page_ids`: `Rid` ownership checks and cycle detection.
+    page_index: HashMap<u32, usize>,
+    /// Same index as `page_ids`.
+    free_space: FreeSpaceMap,
 }
 
 impl HeapFile {
@@ -198,10 +252,34 @@ impl HeapFile {
         let size = bpm.page_size();
         check_page_size(size).map_err(|_| HeapFileError::UnsupportedPageSize { size })?;
         let first_page_id = allocate_page(bpm)?;
-        Ok(Self {
+        let mut heap = Self::starting_at(first_page_id);
+        heap.extend_to_tail(bpm)?;
+        Ok(heap)
+    }
+
+    /// One known page whose free space is unknown (0) until it is read.
+    fn starting_at(first_page_id: u32) -> Self {
+        let mut heap = Self {
             first_page_id,
-            page_ids: vec![first_page_id],
-        })
+            page_ids: Vec::new(),
+            page_index: HashMap::new(),
+            free_space: FreeSpaceMap::new(),
+        };
+        heap.push_page(first_page_id, 0);
+        heap
+    }
+
+    fn push_page(&mut self, page_id: u32, free: u16) {
+        self.page_index.insert(page_id, self.page_ids.len());
+        self.page_ids.push(page_id);
+        self.free_space.push(free);
+    }
+
+    /// The map is only a guide for inserts: a lost update makes them retry or skip a page,
+    /// never lose data. Indexes come from `page_ids`, which always has the map's length.
+    fn record_free_space(&mut self, index: usize, free: u16) {
+        let recorded = self.free_space.set(index, free);
+        debug_assert!(recorded.is_ok(), "{recorded:?}");
     }
 
     /// Walks the page list from disk, rejecting cycles and pages that are not slotted.
@@ -213,31 +291,34 @@ impl HeapFile {
             });
         }
 
-        let mut heap = Self {
-            first_page_id,
-            page_ids: vec![first_page_id],
-        };
+        let mut heap = Self::starting_at(first_page_id);
         heap.extend_to_tail(bpm)?;
         Ok(heap)
     }
 
     /// Adopts the pages linked after the last known one: all of them on `open`, or the
-    /// ones another handle of the same heap appended. Returns whether any was added.
+    /// ones another handle of the same heap appended. Every page read on the way (the last
+    /// known one included) gets its free space refreshed. Returns whether any was added.
     fn extend_to_tail(&mut self, bpm: &mut BufferPoolManager) -> Result<bool, HeapFileError> {
         let known_pages = self.page_ids.len();
-        // Built only when there is a next page, so the common case costs one read.
-        let mut visited: Option<HashSet<u32>> = None;
+        let mut index = known_pages.saturating_sub(1);
         let mut current = self.last_page_id();
-        while let Some(next) = read_page(bpm, current, |page| Ok(page.next_page_id()))? {
-            let next = next.get();
-            let visited = visited.get_or_insert_with(|| self.page_ids.iter().copied().collect());
-            if !visited.insert(next) {
+        loop {
+            let (next, free) = read_page(bpm, current, |page| {
+                Ok((page.next_page_id(), free_space_of(page)))
+            })?;
+            self.record_free_space(index, free);
+            let Some(next) = next.map(NonZeroU32::get) else {
+                break;
+            };
+            if self.page_index.contains_key(&next) {
                 return Err(HeapFileError::CorruptedChain {
                     page_id: next,
                     reason: "page list has a cycle",
                 });
             }
-            self.page_ids.push(next);
+            self.push_page(next, 0);
+            index += 1;
             current = next;
         }
         Ok(self.page_ids.len() > known_pages)
@@ -265,11 +346,20 @@ impl HeapFile {
         bpm: &mut BufferPoolManager,
         tuple: &[u8],
     ) -> Result<Rid, HeapFileError> {
+        let max = max_tuple_size_for(bpm.page_size());
+        if tuple.len() > max {
+            return Err(HeapFileError::TupleTooLarge {
+                size: tuple.len(),
+                max,
+            });
+        }
+
         loop {
-            if let Some(rid) = try_insert(bpm, self.last_page_id(), tuple)? {
+            if let Some(rid) = self.insert_where_it_fits(bpm, tuple)? {
                 return Ok(rid);
             }
-            // Linking after a page that already has a next would orphan that page.
+            // Pages appended by another handle may have room, and linking a new page after
+            // a page that already has a next would orphan that page.
             if !self.extend_to_tail(bpm)? {
                 break;
             }
@@ -277,7 +367,8 @@ impl HeapFile {
 
         let last_page_id = self.last_page_id();
         let new_page_id = allocate_page(bpm)?;
-        let rid = try_insert(bpm, new_page_id, tuple)?.ok_or(HeapFileError::Page {
+        let (rid, free) = try_insert(bpm, new_page_id, tuple)?;
+        let rid = rid.ok_or(HeapFileError::Page {
             page_id: new_page_id,
             source: SlottedPageError::PageFull,
         })?;
@@ -285,14 +376,14 @@ impl HeapFile {
         // unreachable page, never a reachable half-written one.
         write_page(bpm, last_page_id, |page| {
             page.set_next_page_id(NonZeroU32::new(new_page_id));
-            Ok(())
+            Ok(Written::changed(()))
         })?;
-        self.page_ids.push(new_page_id);
+        self.push_page(new_page_id, free);
         Ok(rid)
     }
 
     pub fn get(&self, bpm: &mut BufferPoolManager, rid: Rid) -> Result<Vec<u8>, HeapFileError> {
-        self.check_owned(rid.page_id)?;
+        self.index_of(rid.page_id)?;
         read_page(bpm, rid.page_id, |page| {
             page.get(rid.slot_id)
                 .map(<[u8]>::to_vec)
@@ -308,14 +399,17 @@ impl HeapFile {
         rid: Rid,
         tuple: &[u8],
     ) -> Result<Rid, HeapFileError> {
-        self.check_owned(rid.page_id)?;
-        let fits_in_place = write_page(bpm, rid.page_id, |page| {
+        let index = self.index_of(rid.page_id)?;
+        let (fits_in_place, free) = write_page(bpm, rid.page_id, |page| {
             match page.update(rid.slot_id, tuple) {
-                Ok(()) => Ok(true),
-                Err(SlottedPageError::PageFull) => Ok(false),
+                Ok(()) => Ok(Written::changed((true, free_space_of(page)))),
+                Err(SlottedPageError::PageFull) => {
+                    Ok(Written::unchanged((false, free_space_of(page))))
+                }
                 Err(source) => Err(slot_error(rid, source)),
             }
         })?;
+        self.record_free_space(index, free);
         if fits_in_place {
             return Ok(rid);
         }
@@ -331,23 +425,47 @@ impl HeapFile {
     }
 
     pub fn delete(&mut self, bpm: &mut BufferPoolManager, rid: Rid) -> Result<(), HeapFileError> {
-        self.check_owned(rid.page_id)?;
-        write_page(bpm, rid.page_id, |page| {
+        let index = self.index_of(rid.page_id)?;
+        let free = write_page(bpm, rid.page_id, |page| {
             page.delete(rid.slot_id)
-                .map_err(|source| slot_error(rid, source))
-        })
+                .map_err(|source| slot_error(rid, source))?;
+            Ok(Written::changed(free_space_of(page)))
+        })?;
+        self.record_free_space(index, free);
+        Ok(())
+    }
+
+    /// Tries the known pages the map says have room, first one first. A miss means the map
+    /// was stale (another handle wrote the page): the real value is recorded, which is below
+    /// `tuple.len()`, so each page is tried at most once.
+    fn insert_where_it_fits(
+        &mut self,
+        bpm: &mut BufferPoolManager,
+        tuple: &[u8],
+    ) -> Result<Option<Rid>, HeapFileError> {
+        while let Some(index) = self.free_space.find(tuple.len()) {
+            let Some(&page_id) = self.page_ids.get(index) else {
+                break;
+            };
+            let (rid, free) = try_insert(bpm, page_id, tuple)?;
+            self.record_free_space(index, free);
+            if rid.is_some() {
+                return Ok(rid);
+            }
+        }
+        Ok(None)
     }
 
     fn last_page_id(&self) -> u32 {
         self.page_ids.last().copied().unwrap_or(self.first_page_id)
     }
 
-    fn check_owned(&self, page_id: u32) -> Result<(), HeapFileError> {
-        if self.page_ids.contains(&page_id) {
-            Ok(())
-        } else {
-            Err(HeapFileError::PageNotInHeap { page_id })
-        }
+    /// Position of the page in the heap, which is also its index in the free space map.
+    fn index_of(&self, page_id: u32) -> Result<usize, HeapFileError> {
+        self.page_index
+            .get(&page_id)
+            .copied()
+            .ok_or(HeapFileError::PageNotInHeap { page_id })
     }
 }
 
@@ -364,6 +482,8 @@ mod tests {
     /// Small pages fill quickly: the largest tuple is 128 - 24 - 4 = 100 bytes.
     const TEST_PAGE_SIZE: usize = 128;
     const MAX_TUPLE: usize = TEST_PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
+    /// Free space map entry of an empty page: every tuple up to `MAX_TUPLE` fits.
+    const EMPTY_PAGE_LIMIT: u16 = MAX_TUPLE as u16 + 1;
 
     pub(super) struct TestPool {
         path: PathBuf,
@@ -408,13 +528,45 @@ mod tests {
         vec![fill; len]
     }
 
-    /// A pin leak would only surface much later as `NoAvailableFrame`, so check it directly.
-    fn assert_unpinned(bpm: &mut BufferPoolManager, heap: &HeapFile) {
+    /// No page left pinned and the free space map exact. A pin leak would only surface much
+    /// later as `NoAvailableFrame`, and a stale map as a wasted page, so check both directly.
+    fn assert_heap_consistent(bpm: &mut BufferPoolManager, heap: &HeapFile) {
         for &page_id in &heap.page_ids {
             let pin_count = bpm.fetch_page(page_id).unwrap().pin_count();
             bpm.unpin_page(page_id, false);
             assert_eq!(pin_count, 1, "page {page_id} left pinned");
         }
+        assert_free_space_matches_pages(bpm, heap);
+    }
+
+    /// For a single handle the map is exact: every page's entry is what the page accepts.
+    fn assert_free_space_matches_pages(bpm: &mut BufferPoolManager, heap: &HeapFile) {
+        assert_eq!(
+            heap.free_space.len(),
+            heap.page_ids.len(),
+            "map and page list differ"
+        );
+        for (index, &page_id) in heap.page_ids.iter().enumerate() {
+            let actual =
+                free_space_of(&SlottedPage::new(bpm.fetch_page(page_id).unwrap().data()).unwrap());
+            bpm.unpin_page(page_id, false);
+            assert_eq!(
+                heap.free_space.get(index),
+                Some(actual),
+                "page {page_id} (index {index})"
+            );
+        }
+    }
+
+    /// Asks the pages themselves, not the map, so it can judge the map.
+    fn some_page_fits(bpm: &mut BufferPoolManager, heap: &HeapFile, len: usize) -> bool {
+        heap.page_ids.iter().any(|&page_id| {
+            let fits = SlottedPage::new(bpm.fetch_page(page_id).unwrap().data())
+                .unwrap()
+                .can_insert(len);
+            bpm.unpin_page(page_id, false);
+            fits
+        })
     }
 
     fn next_page_of(bpm: &mut BufferPoolManager, page_id: u32) -> Option<u32> {
@@ -441,7 +593,7 @@ mod tests {
         assert_eq!(heap.first_page_id(), 1);
         assert_eq!(heap.page_count(), 1);
         assert_eq!(next_page_of(pool.bpm(), 1), None);
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -453,7 +605,7 @@ mod tests {
 
         assert_eq!(rid, Rid::new(heap.first_page_id(), 0));
         assert_eq!(heap.get(pool.bpm(), rid).unwrap(), b"hello");
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -482,7 +634,7 @@ mod tests {
         assert_eq!(next_page_of(pool.bpm(), rids[1].page_id), None);
         assert_eq!(heap.get(pool.bpm(), rids[0]).unwrap(), tuple(60, 0));
         assert_eq!(heap.get(pool.bpm(), rids[1]).unwrap(), tuple(60, 1));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -524,7 +676,7 @@ mod tests {
         let err = heap.get(pool.bpm(), rid).unwrap_err();
 
         assert!(matches!(err, HeapFileError::TupleNotFound { rid: r } if r == rid));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -545,6 +697,226 @@ mod tests {
     }
 
     #[test]
+    fn create_should_record_the_free_space_of_the_first_page() {
+        let mut pool = TestPool::new(4);
+
+        let heap = HeapFile::create(pool.bpm()).unwrap();
+
+        assert_eq!(heap.free_space.get(0), Some(EMPTY_PAGE_LIMIT));
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn open_should_rebuild_the_free_space_of_every_page() {
+        let mut pool = TestPool::new(4);
+        let first_page_id = {
+            let mut heap = HeapFile::create(pool.bpm()).unwrap();
+            let rids = fill_pages(&mut heap, pool.bpm(), 3);
+            heap.insert(pool.bpm(), &tuple(10, 9)).unwrap();
+            heap.delete(pool.bpm(), rids[1]).unwrap();
+            heap.first_page_id()
+        };
+
+        let heap = HeapFile::open(pool.bpm(), first_page_id).unwrap();
+
+        assert_eq!(heap.page_count(), 3);
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+        assert_eq!(heap.free_space.get(1), Some(EMPTY_PAGE_LIMIT));
+    }
+
+    #[test]
+    fn free_space_should_follow_inserts_across_pages() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+
+        heap.insert(pool.bpm(), &tuple(30, 1)).unwrap();
+        fill_pages(&mut heap, pool.bpm(), 2);
+
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn free_space_should_follow_deletes() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rids = fill_pages(&mut heap, pool.bpm(), 3);
+
+        heap.delete(pool.bpm(), rids[0]).unwrap();
+
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+        assert_eq!(heap.free_space.get(0), Some(EMPTY_PAGE_LIMIT));
+    }
+
+    #[test]
+    fn free_space_should_follow_updates_in_place() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rid = heap.insert(pool.bpm(), &tuple(20, 1)).unwrap();
+
+        heap.update(pool.bpm(), rid, &tuple(50, 2)).unwrap();
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+
+        heap.update(pool.bpm(), rid, &tuple(5, 3)).unwrap();
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn free_space_should_follow_updates_that_move() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let first = heap.insert(pool.bpm(), &tuple(40, 1)).unwrap();
+        heap.insert(pool.bpm(), &tuple(40, 2)).unwrap();
+
+        // 80 bytes do not fit next to the other 40: the tuple moves to a new page.
+        let moved = heap.update(pool.bpm(), first, &tuple(80, 9)).unwrap();
+
+        assert_ne!(moved.page_id, first.page_id);
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn update_that_moves_should_give_room_back_to_the_old_page_and_take_it_from_the_new() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let first = heap.insert(pool.bpm(), &tuple(40, 1)).unwrap();
+        heap.insert(pool.bpm(), &tuple(40, 2)).unwrap();
+        let old_page_before = heap.free_space.get(0).unwrap();
+
+        let moved = heap.update(pool.bpm(), first, &tuple(80, 9)).unwrap();
+
+        let new_index = heap.index_of(moved.page_id).unwrap();
+        assert!(heap.free_space.get(0).unwrap() > old_page_before);
+        assert!(heap.free_space.get(new_index).unwrap() < EMPTY_PAGE_LIMIT);
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn failed_write_should_not_change_the_free_space() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rid = heap.insert(pool.bpm(), &tuple(20, 1)).unwrap();
+        let before = heap.free_space.get(0);
+        pool.bpm().fail_fetch_after(rid.page_id, 0);
+
+        assert!(heap.delete(pool.bpm(), rid).is_err());
+
+        assert_eq!(heap.free_space.get(0), before);
+        assert_free_space_matches_pages(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn insert_should_reuse_space_freed_in_an_earlier_page() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rids = fill_pages(&mut heap, pool.bpm(), 3);
+        heap.delete(pool.bpm(), rids[0]).unwrap();
+
+        let rid = heap.insert(pool.bpm(), &tuple(60, 9)).unwrap();
+
+        assert_eq!(rid.page_id, rids[0].page_id);
+        assert_eq!(heap.page_count(), 3);
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn insert_should_pick_the_first_page_with_room() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rids = fill_pages(&mut heap, pool.bpm(), 3);
+        heap.delete(pool.bpm(), rids[1]).unwrap();
+
+        // Every page has 36 bytes left except the second one, which is empty.
+        let small = heap.insert(pool.bpm(), &tuple(30, 1)).unwrap();
+        let large = heap.insert(pool.bpm(), &tuple(50, 2)).unwrap();
+
+        assert_eq!(small.page_id, rids[0].page_id);
+        assert_eq!(large.page_id, rids[1].page_id);
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn insert_should_not_allocate_while_a_page_has_room() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rids = fill_pages(&mut heap, pool.bpm(), 4);
+        heap.delete(pool.bpm(), rids[0]).unwrap();
+        heap.delete(pool.bpm(), rids[2]).unwrap();
+
+        let reused: Vec<u32> = (0..2)
+            .map(|i| heap.insert(pool.bpm(), &tuple(60, i)).unwrap().page_id)
+            .collect();
+
+        assert_eq!(reused, vec![rids[0].page_id, rids[2].page_id]);
+        assert_eq!(heap.page_count(), 4);
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn emptied_page_should_be_reused() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let first = heap.insert(pool.bpm(), &tuple(40, 1)).unwrap();
+        let second = heap.insert(pool.bpm(), &tuple(40, 2)).unwrap();
+        fill_pages(&mut heap, pool.bpm(), 1);
+        heap.delete(pool.bpm(), first).unwrap();
+        heap.delete(pool.bpm(), second).unwrap();
+
+        // The two deleted slots stay (slot ids are stable): one is reused, the other still
+        // takes 4 bytes, so the emptied page fits up to MAX_TUPLE - SLOT_SIZE.
+        let rid = heap
+            .insert(pool.bpm(), &tuple(MAX_TUPLE - SLOT_SIZE, 3))
+            .unwrap();
+
+        assert_eq!(rid.page_id, first.page_id);
+        assert_eq!(heap.page_count(), 2);
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn empty_tuple_should_skip_a_page_where_nothing_fits() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let full = heap.insert(pool.bpm(), &tuple(MAX_TUPLE, 1)).unwrap();
+
+        let rid = heap.insert(pool.bpm(), b"").unwrap();
+
+        assert_ne!(rid.page_id, full.page_id);
+        assert_eq!(heap.free_space.get(0), Some(0));
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn empty_tuple_should_use_a_page_with_room_only_for_its_slot() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let almost_full = heap
+            .insert(pool.bpm(), &tuple(MAX_TUPLE - SLOT_SIZE, 1))
+            .unwrap();
+
+        let rid = heap.insert(pool.bpm(), b"").unwrap();
+
+        assert_eq!(rid.page_id, almost_full.page_id);
+        assert_eq!(heap.page_count(), 1);
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn oversized_tuple_should_fail_without_reading_pages() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        pool.bpm().fail_fetch_after(heap.first_page_id(), 0);
+
+        let err = heap
+            .insert(pool.bpm(), &tuple(MAX_TUPLE + 1, 1))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            HeapFileError::TupleTooLarge { size, max } if size == MAX_TUPLE + 1 && max == MAX_TUPLE
+        ));
+    }
+
+    #[test]
     fn open_should_rebuild_the_page_list() {
         let mut pool = TestPool::new(4);
         let mut heap = HeapFile::create(pool.bpm()).unwrap();
@@ -556,7 +928,7 @@ mod tests {
         for (i, rid) in rids.into_iter().enumerate() {
             assert_eq!(reopened.get(pool.bpm(), rid).unwrap(), tuple(60, i as u8));
         }
-        assert_unpinned(pool.bpm(), &reopened);
+        assert_heap_consistent(pool.bpm(), &reopened);
     }
 
     #[test]
@@ -646,7 +1018,7 @@ mod tests {
 
         assert!(is_not_found(&heap.get(pool.bpm(), rid).unwrap_err(), rid));
         assert_eq!(heap.get(pool.bpm(), kept).unwrap(), b"stay");
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -659,7 +1031,7 @@ mod tests {
         let err = heap.delete(pool.bpm(), rid).unwrap_err();
 
         assert!(is_not_found(&err, rid));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -685,7 +1057,7 @@ mod tests {
             assert_eq!(heap.get(pool.bpm(), rid).unwrap(), tuple(len, 2));
         }
         assert_eq!(heap.page_count(), 1);
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -701,7 +1073,7 @@ mod tests {
         assert_eq!(heap.get(pool.bpm(), moved).unwrap(), tuple(60, 3));
         assert!(is_not_found(&heap.get(pool.bpm(), rid).unwrap_err(), rid));
         assert_eq!(heap.get(pool.bpm(), neighbour).unwrap(), tuple(40, 2));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -733,7 +1105,7 @@ mod tests {
         assert!(matches!(err, HeapFileError::TupleTooLarge { .. }));
         assert_eq!(heap.get(pool.bpm(), rid).unwrap(), b"old");
         assert_eq!(heap.page_count(), 1);
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -750,7 +1122,7 @@ mod tests {
             foreign,
             HeapFileError::PageNotInHeap { page_id: 0 }
         ));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     fn scan_all(heap: &HeapFile, bpm: &mut BufferPoolManager) -> Vec<(Rid, Vec<u8>)> {
@@ -779,7 +1151,7 @@ mod tests {
 
         assert!(heap.page_count() > 2);
         assert_eq!(scanned, rids.into_iter().zip(tuples).collect::<Vec<_>>());
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -825,7 +1197,7 @@ mod tests {
         let first = heap.scan(pool.bpm()).next();
 
         assert!(matches!(first, Some(Ok(_))));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     fn set_next_page(bpm: &mut BufferPoolManager, page_id: u32, next: u32) {
@@ -854,7 +1226,7 @@ mod tests {
         let err = HeapFile::open(pool.bpm(), heap.first_page_id()).unwrap_err();
 
         assert!(is_cycle(&err, heap.first_page_id()));
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -945,7 +1317,17 @@ mod tests {
             match (rng.below(10), live.is_empty()) {
                 (0..=3, _) | (_, true) => {
                     let tuple = rng.tuple();
+                    let pages_before = heap.page_count();
+                    // Reading every page through a 3-frame pool is slow: sample the check.
+                    let had_room = step % 25 == 0 && some_page_fits(pool.bpm(), &heap, tuple.len());
                     let rid = heap.insert(pool.bpm(), &tuple).unwrap();
+                    if had_room {
+                        assert_eq!(
+                            heap.page_count(),
+                            pages_before,
+                            "step {step}: allocated while a page had room"
+                        );
+                    }
                     assert!(
                         model.insert(rid, tuple).is_none(),
                         "{rid:?} handed out twice"
@@ -976,9 +1358,11 @@ mod tests {
             {
                 assert!(is_not_found(&heap.get(pool.bpm(), gone).unwrap_err(), gone));
             }
+            if step % 250 == 0 {
+                assert_heap_consistent(pool.bpm(), &heap);
+            }
             if step % 500 == 0 {
                 assert_scan_matches(&heap, pool.bpm(), &model);
-                assert_unpinned(pool.bpm(), &heap);
             }
         }
 
@@ -1006,6 +1390,53 @@ mod tests {
         assert!(scanned.contains(&fresh_rid), "{fresh_rid:?} was orphaned");
         assert!(scanned.contains(&stale_rid));
         assert_eq!(stale.page_ids, reopened.page_ids);
+    }
+
+    #[test]
+    fn stale_map_should_skip_a_page_another_handle_filled() {
+        let mut pool = TestPool::new(4);
+        let mut fresh = HeapFile::create(pool.bpm()).unwrap();
+        let rids = fill_pages(&mut fresh, pool.bpm(), 2);
+        let mut stale = HeapFile::open(pool.bpm(), fresh.first_page_id()).unwrap();
+        // Leaves 2 bytes on the first page, but `stale` still thinks 32 fit there.
+        fresh.insert(pool.bpm(), &tuple(30, 1)).unwrap();
+
+        let rid = stale.insert(pool.bpm(), &tuple(30, 2)).unwrap();
+
+        assert_eq!(rid.page_id, rids[1].page_id);
+        assert_eq!(stale.page_count(), 2);
+        assert_heap_consistent(pool.bpm(), &stale);
+    }
+
+    #[test]
+    fn missed_insert_attempt_should_not_dirty_the_page() {
+        let mut pool = TestPool::new(4);
+        let mut fresh = HeapFile::create(pool.bpm()).unwrap();
+        let rids = fill_pages(&mut fresh, pool.bpm(), 2);
+        let mut stale = HeapFile::open(pool.bpm(), fresh.first_page_id()).unwrap();
+        fresh.insert(pool.bpm(), &tuple(30, 1)).unwrap();
+        pool.bpm().flush_page(rids[0].page_id).unwrap();
+
+        stale.insert(pool.bpm(), &tuple(30, 2)).unwrap();
+
+        let is_dirty = pool.bpm().fetch_page(rids[0].page_id).unwrap().is_dirty();
+        pool.bpm().unpin_page(rids[0].page_id, false);
+        assert!(!is_dirty, "a full page was rewritten without changes");
+    }
+
+    #[test]
+    fn stale_handle_should_use_room_in_pages_another_handle_appended() {
+        let mut pool = TestPool::new(4);
+        let mut fresh = HeapFile::create(pool.bpm()).unwrap();
+        fresh.insert(pool.bpm(), &tuple(MAX_TUPLE, 1)).unwrap();
+        let mut stale = HeapFile::open(pool.bpm(), fresh.first_page_id()).unwrap();
+        let appended = fresh.insert(pool.bpm(), &tuple(60, 2)).unwrap();
+
+        let rid = stale.insert(pool.bpm(), &tuple(30, 3)).unwrap();
+
+        assert_eq!(rid.page_id, appended.page_id);
+        assert_eq!(stale.page_count(), 2);
+        assert_heap_consistent(pool.bpm(), &stale);
     }
 
     #[test]
@@ -1044,7 +1475,7 @@ mod tests {
             .map(|(_, tuple)| tuple)
             .collect();
         assert_eq!(tuples, [tuple(30, 1), tuple(30, 2), tuple(60, 3)]);
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -1062,7 +1493,7 @@ mod tests {
         ));
         assert_eq!(heap.page_count(), 1);
         assert!(scan_all(&heap, pool.bpm()).is_empty());
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 
     #[test]
@@ -1085,6 +1516,6 @@ mod tests {
             )))
         ));
         assert!(after_error.is_none());
-        assert_unpinned(pool.bpm(), &heap);
+        assert_heap_consistent(pool.bpm(), &heap);
     }
 }

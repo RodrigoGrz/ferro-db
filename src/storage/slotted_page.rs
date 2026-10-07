@@ -103,6 +103,12 @@ pub fn check_page_size(size: usize) -> Result<(), SlottedPageError> {
     Ok(())
 }
 
+/// Largest tuple an empty page of `page_size` bytes holds: everything but the header
+/// and one slot.
+pub fn max_tuple_size_for(page_size: usize) -> usize {
+    page_size.saturating_sub(HEADER_SIZE + SLOT_SIZE)
+}
+
 fn slot_position(slot_id: u16) -> usize {
     HEADER_SIZE + slot_id as usize * SLOT_SIZE
 }
@@ -146,11 +152,21 @@ impl<B: AsRef<[u8]>> SlottedPage<B> {
     }
 
     pub fn max_tuple_size(&self) -> usize {
-        self.page_size().saturating_sub(HEADER_SIZE + SLOT_SIZE)
+        max_tuple_size_for(self.page_size())
     }
 
     pub fn next_page_id(&self) -> Option<NonZeroU32> {
         NonZeroU32::new(get_u32(self.bytes(), NEXT_PAGE_ID_OFFSET))
+    }
+
+    /// Largest tuple `insert` accepts right now: free space minus a new slot, unless a
+    /// deleted slot can be reused; never above `max_tuple_size`. `None` when not even an
+    /// empty tuple fits, which `Some(0)` would hide.
+    pub fn largest_insertable(&self) -> Option<usize> {
+        let new_slot_cost = self.insert_cost(0);
+        self.total_free_space()
+            .checked_sub(new_slot_cost)
+            .map(|room| room.min(self.max_tuple_size()))
     }
 
     pub fn can_insert(&self, len: usize) -> bool {
@@ -1398,6 +1414,118 @@ mod tests {
                     page.insert(&tuple(len, 7)).is_ok(),
                     "len {len}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn max_tuple_size_for_should_match_an_empty_page() {
+        for size in [HEADER_SIZE, HEADER_SIZE + SLOT_SIZE, SMALL, PAGE_SIZE] {
+            assert_eq!(
+                max_tuple_size_for(size),
+                empty(size).max_tuple_size(),
+                "page of {size} bytes"
+            );
+        }
+        assert_eq!(max_tuple_size_for(PAGE_SIZE), 8164);
+        assert_eq!(max_tuple_size_for(0), 0);
+    }
+
+    #[test]
+    fn largest_insertable_of_empty_page_should_be_max_tuple_size() {
+        let page = empty(SMALL);
+
+        assert_eq!(page.largest_insertable(), Some(page.max_tuple_size()));
+        assert_eq!(page.largest_insertable(), Some(36));
+    }
+
+    #[test]
+    fn largest_insertable_should_discount_tuple_and_new_slot() {
+        let mut page = empty(SMALL);
+
+        page.insert(&tuple(6, 1)).unwrap();
+
+        assert_eq!(
+            page.largest_insertable(),
+            Some(SMALL - HEADER_SIZE - 2 * SLOT_SIZE - 6)
+        );
+    }
+
+    #[test]
+    fn largest_insertable_should_not_charge_a_slot_when_one_can_be_reused() {
+        let mut page = empty(SMALL);
+        page.insert(&tuple(6, 1)).unwrap();
+        page.insert(&tuple(6, 2)).unwrap();
+
+        page.delete(0).unwrap();
+
+        assert_eq!(
+            page.largest_insertable(),
+            Some(SMALL - HEADER_SIZE - 2 * SLOT_SIZE - 6)
+        );
+    }
+
+    #[test]
+    fn largest_insertable_should_count_holes_left_by_deletes() {
+        let mut page = empty(SMALL);
+        page.insert(&tuple(10, 1)).unwrap();
+        page.insert(&tuple(10, 2)).unwrap();
+        let before = page.largest_insertable().unwrap();
+
+        page.delete(1).unwrap();
+
+        assert_eq!(page.largest_insertable(), Some(before + 10 + SLOT_SIZE));
+    }
+
+    #[test]
+    fn largest_insertable_of_page_with_room_only_for_a_slot_should_be_zero() {
+        let mut page = empty(SMALL);
+
+        // Leaves exactly the 4 bytes of a new slot: only an empty tuple still fits.
+        page.insert(&tuple(page.max_tuple_size() - SLOT_SIZE, 1))
+            .unwrap();
+
+        assert_eq!(page.largest_insertable(), Some(0));
+        assert!(page.can_insert(0));
+    }
+
+    #[test]
+    fn largest_insertable_of_full_page_should_be_none() {
+        let mut page = empty(SMALL);
+
+        page.insert(&tuple(page.max_tuple_size(), 1)).unwrap();
+
+        assert_eq!(page.largest_insertable(), None);
+        assert!(!page.can_insert(0));
+    }
+
+    #[test]
+    fn largest_insertable_of_header_sized_page_should_be_none() {
+        let page = empty(HEADER_SIZE);
+
+        assert_eq!(page.largest_insertable(), None);
+    }
+
+    #[test]
+    fn largest_insertable_should_agree_with_can_insert_on_random_pages() {
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        let mut page = empty(SMALL * 4);
+
+        for step in 0..5_000 {
+            let live: Vec<u16> = page.iter().map(|(slot_id, _)| slot_id).collect();
+            if !live.is_empty() && rng.below(3) == 0 {
+                page.delete(live[rng.below(live.len())]).unwrap();
+            } else {
+                let len = rng.below(40);
+                let _ = page.insert(&rng.bytes(len));
+            }
+
+            match page.largest_insertable() {
+                Some(largest) => {
+                    assert!(page.can_insert(largest), "step {step}");
+                    assert!(!page.can_insert(largest + 1), "step {step}");
+                }
+                None => assert!(!page.can_insert(0), "step {step}"),
             }
         }
     }

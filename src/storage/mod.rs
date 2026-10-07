@@ -1,6 +1,7 @@
 pub mod buffer_pool;
 pub mod checksum;
 pub mod disk_manager;
+pub(crate) mod free_space_map;
 pub mod heap_file;
 pub mod page;
 pub mod replacer;
