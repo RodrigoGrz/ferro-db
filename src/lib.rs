@@ -1,4 +1,5 @@
 pub mod config;
 pub mod serialization;
 pub mod storage;
+pub mod table;
 pub mod types;

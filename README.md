@@ -36,7 +36,7 @@ The goal is to understand how a relational database works internally by implemen
 
 ## Tables
 
-- [ ] Schema
+- [x] Schema
 - [ ] Table Metadata
 - [ ] INSERT
 - [ ] SELECT

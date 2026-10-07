@@ -596,7 +596,94 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
 - Boolean: `eq/lt/...` devolvendo `Value::Boolean` e a lógica de três valores de `AND`/`OR`/`NOT`
 - Type System: coerção implícita × explícita e resolução de operadores entre famílias de tipos
 - Float, String, Date/Time, UUID
-- Schema: gerar o `TupleLayout` a partir dos `DataType` das colunas
+- ~~Schema: gerar o `TupleLayout` a partir dos `DataType` das colunas~~: feito (ver "Schema")
+
+---
+
+# 📋 Schema
+
+## 📌 Visão geral
+
+A camada `src/table/` começa com o `Schema` (`schema.rs`): a lista ordenada de colunas de uma tabela e a conversão **linha de `Value` ⇄ bytes da tupla**. É a ponte entre `types` (valores) e `storage` (bytes). Dependências: `table` → `types` → `storage`, sempre para baixo.
+
+```rust
+pub struct Column { pub name: String, pub data_type: DataType, pub nullable: bool }
+Column::new("age", SmallInt)        // aceita NULL
+Column::not_null("id", Integer)     // NOT NULL
+
+let schema = Schema::new(vec![Column::not_null("id", Integer), Column::new("age", SmallInt)])?;
+let tuple  = schema.encode_row(&[Value::Integer(1), Value::Null])?;   // → HeapFile::insert
+let row    = schema.decode_row(&tuple)?;                              // ← HeapFile::get / scan
+let age    = schema.decode_column(&tuple, 1)?;                        // só uma coluna
+let some   = schema.decode_columns(&tuple, &[1, 0])?;                 // várias, validando a tupla uma vez
+```
+
+O `Schema` é imutável e guarda o `TupleLayout` já calculado (`DataType::layout()` de cada coluna), então os offsets dos campos são calculados uma vez por tabela, não por linha.
+
+## ✅ Validação do schema (`Schema::new`)
+
+- De 1 a 1600 colunas (`TupleLayout::MAX_COLUMNS`).
+- Nome não vazio, com até 63 bytes UTF-8 (`MAX_COLUMN_NAME_LEN`), e único na tabela.
+- Nomes comparados **byte a byte**: `id` e `ID` são colunas diferentes. Maiúsculas/minúsculas e aspas são regra do SQL e serão resolvidas pelo parser antes de chegar aqui.
+
+## ⚙️ Linha ⇄ tupla
+
+- **`encode_row`** aplica a *atribuição* do SQL, coluna a coluna, e só monta a tupla se todas passarem (o primeiro erro, na ordem das colunas, é o devolvido):
+  - quantidade de valores ≠ colunas → `ColumnCountMismatch`;
+  - `NULL` em coluna `NOT NULL` → `NullViolation`;
+  - o valor é convertido para o tipo da coluna com `Value::cast`: `SMALLINT` numa coluna `BIGINT` é aceito; `70000` numa coluna `SMALLINT` → `Type { column: "age", OutOfRange }`.
+- **`decode_row` / `decode_column` / `decode_columns`** leem bytes vindos do disco e não confiam neles: tupla truncada/corrompida ou de outro schema → `Tuple(..)`; `NULL` gravado numa coluna `NOT NULL` → `NullViolation`. Os valores voltam **no tipo da coluna** (um `SmallInt` gravado numa coluna `INTEGER` volta `Integer`).
+  - Todo campo é lido com `TupleRef::field`, que devolve erro: um campo que a tupla não consegue produzir nunca é confundido com `NULL`.
+  - `decode_columns` devolve as colunas pedidas na ordem pedida (repetições permitidas), confere os índices **antes** de ler a tupla e valida a tupla uma vez só.
+- A largura de cada campo vem do próprio schema, então `Type { .. InvalidEncoding }` não acontece na leitura; o erro de tipo só aparece no `encode_row` (valor que não cabe).
+
+## 🚨 Erros
+
+| `SchemaError` | SQLSTATE | Exemplo de mensagem |
+|---|---|---|
+| `NoColumns` | `42P16` | `a table must have at least one column` |
+| `TooManyColumns` | `54011` | `tables can have at most 1600 columns, got 1601` |
+| `EmptyColumnName` | `42602` | `column 2 has an empty name` |
+| `ColumnNameTooLong` | `42622` | `column name "aaa…" is longer than 63 bytes` (a mensagem mostra só os primeiros 63 bytes) |
+| `DuplicateColumn` | `42701` | `column "id" specified more than once` |
+| `ColumnCountMismatch` | `42601` | `row has 2 values but the table has 3 columns` |
+| `NullViolation` | `23502` | `null value in column "id" violates not-null constraint` |
+| `ColumnOutOfRange` | `XX000` | `column 5 does not exist (table has 3)` (erro de programação) |
+| `Type` | o do `TypeError` (ex.: `22003`) | `column "age": smallint out of range` |
+| `Tuple` | `XX001` | `stored row does not match the schema: expected 3 columns, got 2` |
+
+## 🧠 Decisões de design
+
+✔️ **`NOT NULL` já no schema**, como flag da coluna checado no `encode_row`: é uma linha de código e evita mudar o formato do schema quando o catálogo existir. O item **NOT NULL** de Constraints só é marcado quando o DDL (`CREATE TABLE ... NOT NULL`) existir.
+
+✔️ **Atribuição com cast** em vez de exigir o tipo exato: é a semântica do padrão para `INSERT`/`UPDATE` e o `Value::cast` já faz o range check.
+
+✔️ **Linha como `Vec<Value>`**: um `struct Row` não teria invariante própria além do que o `Schema` valida.
+
+✔️ **Limite de 63 bytes no nome**: cabe com folga num prefixo de 1 byte quando o catálogo gravar o schema. 128 caracteres (o padrão) podem passar de 255 bytes em UTF-8.
+
+✔️ **Pelo menos uma coluna**, como no padrão. Uma tabela sem colunas complicaria catálogo e executor sem utilidade aqui.
+
+✔️ **`decode_column` / `decode_columns`**: o `TupleRef` acessa um campo em O(1); projeção e filtro vão ler poucas colunas por linha, e `decode_columns` evita validar a mesma tupla uma vez por coluna.
+
+✔️ **Mensagem com o nome truncado**: `ColumnNameTooLong` guarda o nome inteiro, mas o `Display` mostra só o prefixo que caberia (cortado numa fronteira de caractere) seguido de `…`, para um nome gigante não virar uma mensagem gigante.
+
+⚠️ **Linha maior que a página**: um schema válido pode ter linhas que não cabem numa página (ex.: 1600 colunas `BIGINT` ≈ 13 KB > 8 KB). O `Schema` não conhece o tamanho de página; o `HeapFile` recusa com `TupleTooLarge` (coberto por teste de integração) e o `min_row_size()` fica disponível para o `CREATE TABLE` validar antes.
+
+⚠️ **`NullViolation` com dois sentidos**: valor do usuário no `encode_row` ou dado inconsistente no disco no `decode_*` (mesma variante, mensagem com o nome da coluna).
+
+## 🧪 Testes
+
+- Unitários em `schema.rs`: `Column`, cada regra do `Schema::new` com limites (1600/1601 colunas, nome com 63/64 bytes inclusive multibyte, `id` × `ID`), cada `SchemaError` com mensagem, SQLSTATE e `source()`, `encode_row` (cast de largura, não cabe, `NULL` permitido e proibido, aridade, primeiro erro vence), `decode_row`/`decode_column`/`decode_columns` (round-trip com limites e `NULL`, tipos das colunas, ordem pedida com repetição, lista vazia, fora do intervalo antes de ler a tupla, truncada, de outro schema, `NULL` no disco em `NOT NULL`), mensagem de nome longo truncada (ASCII e multibyte).
+- `random_rows_should_follow_the_assignment_rules`: 2 000 schemas e linhas aleatórios comparados com as regras calculadas à mão (sem `Value::cast`), lendo de volta com `decode_row`, `decode_column` e `decode_columns` em ordem invertida; checado com mutação (desligar o `NOT NULL` ou o cast faz o teste falhar).
+- `random_corruption_should_never_panic`: 2 000 tuplas válidas com bits trocados ou truncadas.
+- Integração em `tests/table_schema.rs`: 1 000 linhas tipadas num `HeapFile` sobrevivem a eviction e a reabrir o arquivo, `decode_column` projeta uma coluna das linhas guardadas, linhas recusadas pelo schema nunca chegam ao heap, linha de um schema mais largo que a página é recusada pelo heap com `TupleTooLarge`.
+
+## 📌 Próximos passos
+
+- Table Metadata: gravar o schema e o `first_page_id` de cada tabela no catálogo da página 0
+- Table Heap: `insert(row)` / `scan()` de linhas tipadas juntando `Schema` + `HeapFile`
+- Validar `min_row_size()` contra o tamanho de página no `CREATE TABLE`
 
 ---
 
@@ -610,3 +697,6 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
 | Posição do `NULL` no `ORDER BY` | definida pela implementação | depois dos valores no `ASC` (PostgreSQL) |
 | `MOD(a, b)` | função | por enquanto só a semântica, como operador `%`; a função entra com o parser |
 | Exibição de `NULL` | não definida | `"NULL"` no `Display` (o `psql` mostra vazio) |
+| Tabela sem colunas | `CREATE TABLE` exige ao menos uma coluna | idem (`NoColumns`); o PostgreSQL aceita tabela sem colunas |
+| Tamanho do nome de coluna | definido pela implementação, em caracteres | até 63 **bytes** UTF-8; nome maior é recusado (`42622`), o PostgreSQL trunca em silêncio |
+| Nomes de coluna iguais | comparação depois da normalização do identificador | o schema compara bytes exatos; a normalização (maiúsculas/aspas) fica para o parser |
