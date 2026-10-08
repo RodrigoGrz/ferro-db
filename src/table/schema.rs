@@ -145,7 +145,7 @@ impl From<TupleError> for SchemaError {
 
 /// Longest prefix of `text` within `max_bytes` that ends on a character boundary, so an
 /// oversized name never turns into an oversized error message.
-fn prefix_within(text: &str, max_bytes: usize) -> &str {
+pub(crate) fn prefix_within(text: &str, max_bytes: usize) -> &str {
     let end = (0..=max_bytes.min(text.len()))
         .rev()
         .find(|&end| text.is_char_boundary(end))

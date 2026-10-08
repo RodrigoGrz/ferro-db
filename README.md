@@ -37,7 +37,7 @@ The goal is to understand how a relational database works internally by implemen
 ## Tables
 
 - [x] Schema
-- [ ] Table Metadata
+- [x] Table Metadata
 - [ ] INSERT
 - [ ] SELECT
 - [ ] UPDATE
@@ -137,9 +137,9 @@ The goal is to understand how a relational database works internally by implemen
 
 ## Catalog
 
-- [ ] Database Catalog
-- [ ] Table Metadata
-- [ ] Column Metadata
+- [x] Database Catalog
+- [x] Table Metadata
+- [x] Column Metadata
 - [ ] Index Metadata
 - [ ] Constraint Metadata
 
@@ -168,3 +168,5 @@ cargo test
 ```bash
 cargo run
 ```
+
+The demo opens (or creates) `data.db`, creates an `accounts` table on the first run and adds one row per run, printing the catalog and the rows. Run it a few times to see the data persist. If an older `data.db` is rejected as "not a ferroDB database", delete it and run again.

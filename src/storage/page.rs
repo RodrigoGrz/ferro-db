@@ -43,6 +43,8 @@ pub enum PageType {
     /// Never formatted: an all-zero page read past the end of the file.
     Free = 0,
     Slotted = 1,
+    /// Page 0: the database header that points to the catalog.
+    DatabaseHeader = 2,
 }
 
 impl TryFrom<u8> for PageType {
@@ -52,6 +54,7 @@ impl TryFrom<u8> for PageType {
         match value {
             0 => Ok(PageType::Free),
             1 => Ok(PageType::Slotted),
+            2 => Ok(PageType::DatabaseHeader),
             _ => Err(SerializationError::InvalidValue {
                 field: "page_type",
                 value: value.into(),
@@ -404,14 +407,14 @@ mod tests {
 
     #[test]
     fn page_type_should_round_trip_through_u8() {
-        for page_type in [PageType::Free, PageType::Slotted] {
+        for page_type in [PageType::Free, PageType::Slotted, PageType::DatabaseHeader] {
             assert_eq!(PageType::try_from(page_type as u8).unwrap(), page_type);
         }
     }
 
     #[test]
     fn page_type_from_unknown_byte_should_fail() {
-        for value in [2, u8::MAX] {
+        for value in [3, u8::MAX] {
             let err = PageType::try_from(value).unwrap_err();
 
             assert_eq!(

@@ -40,6 +40,7 @@ pub enum SlottedPageError {
     InvalidSlot { slot_id: u16 },
     SlotDeleted { slot_id: u16 },
     InvalidHeader(PageError),
+    WrongPageType { found: PageType },
 }
 
 impl fmt::Display for SlottedPageError {
@@ -66,6 +67,9 @@ impl fmt::Display for SlottedPageError {
             SlottedPageError::InvalidSlot { slot_id } => write!(f, "slot {slot_id} does not exist"),
             SlottedPageError::SlotDeleted { slot_id } => write!(f, "slot {slot_id} is deleted"),
             SlottedPageError::InvalidHeader(err) => write!(f, "{err}"),
+            SlottedPageError::WrongPageType { found } => {
+                write!(f, "expected a slotted page, found {found:?}")
+            }
         }
     }
 }
@@ -120,6 +124,9 @@ impl<B: AsRef<[u8]>> SlottedPage<B> {
         match PageHeader::read(data.as_ref())?.page_type {
             PageType::Free => return Err(SlottedPageError::Uninitialized),
             PageType::Slotted => {}
+            found @ PageType::DatabaseHeader => {
+                return Err(SlottedPageError::WrongPageType { found });
+            }
         }
         let page = Self { data };
         page.validate()?;
@@ -539,6 +546,25 @@ mod tests {
         assert_eq!(get_u16(&page.data, 18), (SMALL - 3) as u16);
         assert_eq!(get_u16(&page.data, HEADER_SIZE), (SMALL - 3) as u16);
         assert_eq!(get_u16(&page.data, HEADER_SIZE + 2), 3);
+    }
+
+    #[test]
+    fn new_on_a_page_of_another_type_should_fail() {
+        let mut page = empty(SMALL);
+        page.data[PAGE_TYPE_OFFSET] = PageType::DatabaseHeader as u8;
+
+        let err = SlottedPage::new(page.data).unwrap_err();
+
+        assert_eq!(
+            err,
+            SlottedPageError::WrongPageType {
+                found: PageType::DatabaseHeader
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "expected a slotted page, found DatabaseHeader"
+        );
     }
 
     #[test]

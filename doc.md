@@ -167,13 +167,14 @@ Toda página começa com 16 bytes que o buffer pool entende, independente do tip
 |---|---|---|
 | `0..8` | LSN (`u64`) | reservado para o WAL / recovery |
 | `8..12` | checksum (`u32`) | CRC32 da página com este campo zerado |
-| `12` | page_type (`u8`) | `0` Free (nunca formatada), `1` Slotted |
+| `12` | page_type (`u8`) | `0` Free (nunca formatada), `1` Slotted, `2` DatabaseHeader (só a página 0, ver "Catálogo") |
 | `13` | version (`u8`) | `PAGE_FORMAT_VERSION` (hoje `1`) |
 | `14..16` | reservado | zerado |
 
 - **Escrita:** antes de gravar no disco, o buffer pool calcula o CRC32 e grava no header (`checksum::stamp_page`).
 - **Leitura:** ao buscar do disco, o buffer pool recalcula o CRC32. Se não bater → `BufferPoolError::ChecksumMismatch`. Depois valida o header: tipo desconhecido ou versão diferente → `BufferPoolError::Page(..)`. Nos dois casos nenhum frame é ocupado.
 - Página **toda zerada** é aceita sem checksum: é uma página nova (`PageType::Free`), que nunca foi escrita.
+- `SlottedPage::new` recusa página de outro tipo formatado (`DatabaseHeader`) com `SlottedPageError::WrongPageType`; o `match` em `PageType` é exaustivo, então todo tipo novo obriga essa decisão.
 
 ## 🧱 Layout da Slotted Page (8 KB por padrão)
 
@@ -382,7 +383,7 @@ O heap é identificado pela primeira página. Quem vai guardar o `first_page_id`
 
 - `BufferPoolManager::new_page()` devolve o próximo id livre, com a página zerada, pinada e **já dirty**: o id chega ao disco mesmo que quem pediu não escreva nada, então nunca é entregue duas vezes.
 - O próximo id é `max(contador, páginas no disco, maior id no page_table + 1)`, recalculado a cada chamada: respeita páginas criadas com `fetch_page` além do fim do arquivo que ainda não foram gravadas.
-- **Página 0 é reservada** (`RESERVED_PAGE_ID`) para o header do banco / raiz do catálogo. Por isso `0` pode significar "sem próxima página".
+- **Página 0 é reservada** (`RESERVED_PAGE_ID`) para o header do banco, que aponta para o catálogo (ver "Catálogo"). Por isso `0` pode significar "sem próxima página".
 - Ids acabaram → `BufferPoolError::PageIdOverflow` (o contador é `u64` para não estourar ao entregar `u32::MAX`).
 
 ## ⚙️ Operações
@@ -428,7 +429,7 @@ O heap é identificado pela primeira página. Quem vai guardar o `first_page_id`
 ## 📌 Próximos passos
 
 - Schema / Table Heap: linhas tipadas (`Value`) em cima do heap
-- Catálogo na página 0: guardar o `first_page_id` de cada tabela
+- ~~Catálogo na página 0~~: feito (ver "Catálogo")
 
 ---
 
@@ -504,7 +505,7 @@ Guardar só "a maior tupla que cabe" não funciona: `0` significaria tanto "cabe
 ## 📌 Próximos passos
 
 - Schema / Table Heap: linhas tipadas (`Value`) em cima do heap
-- Catálogo na página 0: guardar o `first_page_id` de cada tabela (e, se o `open` deixar de percorrer a lista, um mapa de espaço livre persistente)
+- ~~Catálogo na página 0~~: feito (ver "Catálogo"); um mapa de espaço livre persistente só se o `open` deixar de percorrer a lista
 - `VACUUM`: compactar o heap e devolver páginas vazias
 
 ---
@@ -681,9 +682,133 @@ O `Schema` é imutável e guarda o `TupleLayout` já calculado (`DataType::layou
 
 ## 📌 Próximos passos
 
-- Table Metadata: gravar o schema e o `first_page_id` de cada tabela no catálogo da página 0
+- ~~Table Metadata~~ e ~~validar `min_row_size()` no `CREATE TABLE`~~: feitos (ver "Catálogo")
 - Table Heap: `insert(row)` / `scan()` de linhas tipadas juntando `Schema` + `HeapFile`
-- Validar `min_row_size()` contra o tamanho de página no `CREATE TABLE`
+
+---
+
+# 🗂️ Catálogo
+
+## 📌 Visão geral
+
+O catálogo (`src/catalog/`) é o dicionário de dados: quais tabelas existem, onde estão os dados delas e quais colunas elas têm. Ele resolve dois problemas de todo banco:
+
+- **Bootstrap:** o catálogo também mora no disco, e alguém precisa saber onde. A **página 0** (reservada desde o Heap File) vira o **header do banco** e aponta para ele.
+- **Tamanho variável:** como no PostgreSQL (`pg_class` + `pg_attribute`), tabelas e colunas ficam em **dois heaps separados**, uma entrada por tabela e uma por coluna. Uma entrada única com todas as colunas passaria de 100 KB com 1600 colunas e não caberia numa página.
+
+```
+página 0 (DatabaseHeader)
+  ├── tables_first_page_id  ──▶ heap de tabelas   (TableRecord: id, first_page_id, nome)
+  └── columns_first_page_id ──▶ heap de colunas   (ColumnRecord: tabela, posição, tipo, NOT NULL, nome)
+                                                        │
+                    TableRecord.first_page_id ──────────┴──▶ HeapFile com as linhas da tabela
+```
+
+As entradas usam **formato próprio** (`ByteWriter`/`ByteReader`): o catálogo ainda não é uma tabela comum lida com `Schema`/`Value` porque o tipo String não existe. Quando existir, o catálogo pode virar tabelas do sistema sem mudar a API.
+
+```rust
+let mut catalog = Catalog::open(&mut bpm)?;                    // cria o banco ou carrega o existente
+let table = catalog.create_table(&mut bpm, "accounts", schema)?; // TableInfo { id, name, schema, first_page_id }
+let table = catalog.table("accounts")?;                         // UndefinedTable se não existir
+let mut heap = HeapFile::open(&mut bpm, table.first_page_id)?;  // os dados da tabela
+```
+
+## 🧱 Layout
+
+**Página 0 (`DatabaseHeader`, `catalog/header.rs`):**
+
+| Bytes | Campo |
+|---|---|
+| `0..16` | header comum, `page_type = DatabaseHeader (2)` |
+| `16..24` | magic `b"ferroDB\0"` |
+| `24..28` | `tables_first_page_id` (`u32` LE) |
+| `28..32` | `columns_first_page_id` (`u32` LE) |
+| `32..` | zerado |
+
+O checksum pega bytes trocados; o magic recusa um arquivo cuja página 0 é válida mas não é de um banco ferroDB.
+
+**Entradas (`catalog/records.rs`, little-endian):**
+
+| Entrada | Campos |
+|---|---|
+| `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · nome |
+| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT) · `flags u8` (bit 0 = nullable) · `name_len u8` · nome |
+
+Nomes têm de 1 a 63 bytes UTF-8. A leitura recusa tipo ou flag desconhecidos (o `0` é inválido de propósito, para uma entrada zerada nunca decodificar), nome com tamanho fora do limite ou que não é UTF-8, e bytes faltando ou sobrando. Uma entrada tem no máximo 74 bytes.
+
+## ⚙️ Operações
+
+- **`open`:**
+  - página 0 `Free` → banco novo: cria os dois heaps e grava o header **por último** (até lá, o próximo `open` começa de novo);
+  - página 0 `DatabaseHeader` → confere o magic, abre os dois heaps, decodifica todas as entradas e monta cada `Schema` pela ordem de `position`;
+  - página 0 de outro tipo ou magic errado → `NotADatabase`.
+- **Carga e validação:** colunas numeradas `0..n` sem buraco nem repetição, `Schema::new` válido (`CorruptedSchema`), nomes e ids de tabela únicos (`Corrupted`). Colunas de um `table_id` sem `TableRecord` são **órfãs** (sobra de um `create_table` que falhou) e são ignoradas; o próximo id é `1 + maior id visto nas tabelas e nas colunas`, para um id órfão nunca ser reusado.
+- **`create_table`**, nesta ordem:
+  1. valida o nome (vazio, mais de 63 bytes, repetido) e se a linha cabe numa página (`schema.min_row_size() <= max_tuple_size_for(page_size)`, senão `RowTooWide`);
+  2. **consome o id** da tabela;
+  3. cria o `HeapFile` dos dados;
+  4. grava uma `ColumnRecord` por coluna;
+  5. grava a `TableRecord` **por último**: é ela que faz a tabela existir no próximo `open`;
+  6. só então acrescenta a tabela ao catálogo em memória.
+
+  Se o passo 4 ou 5 falhar, as colunas já gravadas são apagadas (melhor esforço), a tabela não aparece e o mesmo nome pode ser criado de novo, mas **com outro id**: o id consumido no passo 2 nunca volta. Se o desfazer também falhar, as colunas que sobraram ficam órfãs com esse id, e nenhuma tabela nova as herda. Por isso a numeração pode ter buracos, como as sequências do PostgreSQL.
+- **`table(name)` / `tables()`:** consultas em memória, sem I/O. `tables()` está em ordem de criação. Nomes comparados byte a byte (`users` ≠ `USERS`), como as colunas.
+
+## 🚨 Erros
+
+| `CatalogError` | SQLSTATE | Exemplo de mensagem |
+|---|---|---|
+| `NotADatabase` | `XX001` | `not a ferroDB database: wrong magic number` |
+| `EmptyTableName` | `42602` | `a table name cannot be empty` |
+| `TableNameTooLong` | `42622` | `table name "aaa…" is longer than 63 bytes` |
+| `DuplicateTable` | `42P07` | `table "users" already exists` |
+| `UndefinedTable` | `42P01` | `table "users" does not exist` |
+| `RowTooWide` | `54000` | `rows of table "wide" need 9000 bytes, more than the 8164 that fit a page` |
+| `TooManyTables` | `54000` | `no table ids left` |
+| `Corrupted` | `XX001` | `catalog is corrupted: unknown column type` |
+| `CorruptedSchema` | `XX001` | `catalog is corrupted: table "t": a table must have at least one column` |
+| `Heap` / `BufferPool` | `XX000` / `58030` | mensagem do erro embrulhado |
+
+## 🧠 Decisões de design
+
+✔️ **Formato próprio agora (opção B)**, sem esperar a String para fazer o catálogo como tabelas comuns. A API (`TableInfo`, `create_table`) não muda quando isso acontecer.
+
+✔️ **Dois heaps**, como `pg_class`/`pg_attribute`: nenhuma entrada cresce com o número de colunas.
+
+✔️ **`PageType::DatabaseHeader`** em vez de uma página slotted com uma tupla especial: o `match` exaustivo obriga cada leitor de página a decidir o que fazer com ela. O `PAGE_FORMAT_VERSION` não mudou, porque nenhuma página existente mudou de formato.
+
+✔️ **`TableRecord` por último** como "ponto de commit", órfãs ignoradas e ids nunca reusados (consumidos antes de gravar na mesma sessão; `1 + maior id visto` ao carregar): sem WAL, é o que garante que uma falha **dentro do processo**, mesmo com o desfazer falhando, nunca deixa uma tabela meio criada visível nem corrompe a próxima.
+
+✔️ **Catálogo inteiro em memória**, carregado no `open`: dezenas de bytes por coluna, e as consultas não fazem I/O.
+
+✔️ **`TableId(u32)` newtype**: não se confunde com id de página. O contador interno é `u64`, para um id `u32::MAX` gravado ainda carregar; criar a próxima tabela dá `TooManyTables`.
+
+✔️ **O catálogo não guarda handles `HeapFile` das tabelas**, só o `first_page_id`: o `open` não lê as páginas de dados. Os handles (um por tabela, ver Heap File) ficam para o Table Heap/executor.
+
+⚠️ **Crash no meio de um `create_table` ou da criação do banco:** o buffer pool grava páginas em qualquer ordem, então depois de um crash real o "`TableRecord` por último" não é garantido; podem sobrar colunas órfãs (ignoradas) ou, no pior caso, uma `TableRecord` sem colunas (`CorruptedSchema` no `open`). A solução completa é o WAL.
+
+⚠️ **Páginas órfãs:** o heap de dados de um `create_table` que falhou e os heaps de uma criação de banco interrompida ficam sem dono até um `VACUUM`.
+
+⚠️ **Formato provisório:** quando o catálogo virar tabelas do sistema, bancos antigos não abrem (sem migração; os bancos de teste são descartáveis).
+
+## ▶️ Demo (`cargo run`)
+
+`src/main.rs` abre ou cria `data.db`, cria a tabela `accounts (id INTEGER NOT NULL, age SMALLINT, balance BIGINT)` na primeira execução, insere uma linha por execução e lista as tabelas e as linhas. Rodar várias vezes mostra os dados sobrevivendo. Um `data.db` da demo antiga (slotted page na página 0) dá `NotADatabase` com o aviso para apagar o arquivo.
+
+## 🧪 Testes
+
+- `header.rs`: bytes documentados, ida e volta, LSN preservado e reservado zerado, página nunca escrita → `None`, página slotted ou magic errado → `NotADatabase`, página pequena demais.
+- `records.rs`: bytes documentados, ida e volta (nome de 1 e 63 bytes, multibyte, cada tipo, nullable ou não), cada motivo de corrupção (truncada em cada tamanho, bytes sobrando, tipo `0`/`4`, flag desconhecida, nome com 0/64 bytes, UTF-8 inválido), 2 000 entradas aleatórias de ida e volta e 2 000 corrompidas sem panic.
+- `catalog.rs`: criação do banco e reabertura vazia, página 0 que não é header, `create_table` (busca, ordem e ids, nome inválido/repetido, `id` × `ID`, `RowTooWide` no limite exato, heap de dados que aceita linhas do schema, `TooManyTables`, inclusive com o id `u32::MAX` vindo do disco), carga (todas as tabelas de volta, ids continuam, 1 000 colunas em várias páginas com eviction, órfãs ignoradas sem reusar id, colunas com buraco ou repetidas, schema inválido, tabela sem colunas, nome ou id repetido, entrada corrompida), falhas injetadas (no meio do `create_table`, na entrada da tabela e entre colunas: nenhuma tabela visível, nem depois de reabrir; **desfazer que também falha**: o id não é reusado e o banco continua abrindo; gravação do header que falha: o próximo `open` cria o banco do zero) e cada erro com mensagem, SQLSTATE e `source()`.
+- `random_creations_should_match_model_across_reopens`: 300 criações aleatórias (nomes repetidos e inválidos, 1 a 30 colunas) com pool de 3 frames, reabrindo a cada 50 e comparando com um `Vec`.
+- Mutações conferidas: tirar o desfazer das colunas quebra os testes de falha; voltar o próximo id a 1 depois de reabrir quebra o teste de modelo.
+- Integração em `tests/catalog_table_metadata.rs`: tabelas e linhas de duas tabelas sobrevivem a reabrir o arquivo (pool de 2 frames), arquivo com página 0 slotted → `NotADatabase`, página do heap de colunas corrompida no disco → checksum no `open`.
+
+## 📌 Próximos passos
+
+- Table Heap: `insert`/`scan` de linhas tipadas por nome de tabela, com um handle `HeapFile` por tabela
+- String/VARCHAR e, com ela, o catálogo como tabelas do sistema (`INFORMATION_SCHEMA`)
+- `DROP TABLE` e metadados de índice e de constraint
 
 ---
 
@@ -700,3 +825,6 @@ O `Schema` é imutável e guarda o `TupleLayout` já calculado (`DataType::layou
 | Tabela sem colunas | `CREATE TABLE` exige ao menos uma coluna | idem (`NoColumns`); o PostgreSQL aceita tabela sem colunas |
 | Tamanho do nome de coluna | definido pela implementação, em caracteres | até 63 **bytes** UTF-8; nome maior é recusado (`42622`), o PostgreSQL trunca em silêncio |
 | Nomes de coluna iguais | comparação depois da normalização do identificador | o schema compara bytes exatos; a normalização (maiúsculas/aspas) fica para o parser |
+| Esquemas (`CREATE SCHEMA`, `esquema.tabela`) | toda tabela pertence a um esquema | um único espaço de nomes para as tabelas |
+| Catálogo consultável | `INFORMATION_SCHEMA.TABLES` / `.COLUMNS` | ainda não exposto via SQL; o acesso é a API `Catalog` |
+| Tamanho do nome de tabela | definido pela implementação, em caracteres | até 63 **bytes** UTF-8, recusado acima disso (`42622`), como as colunas |
