@@ -1,0 +1,162 @@
+# ferroDB Roadmap
+
+This is the authoritative implementation checklist for ferroDB. The README only shows a summary.
+
+**How to read it**
+
+- `[x]` means the feature exists **and** is covered by tests (the links point to both).
+- `[ ]` means it is not done. A note says when part of it already exists.
+- Sections keep the order in which the project plans to build them. Items marked *(next)* come from the "next steps" recorded in the design notes and are the closest planned work.
+- Status was last verified against the code on 2026-10-16 (`cargo test --all-targets`: 498 tests passing).
+
+When an item is finished, mark it here in the same change that adds the code, and update the design notes (see the [documentation index](doc.md)).
+
+## Storage
+
+- [x] Disk Manager ([`disk_manager.rs`](src/storage/disk_manager.rs), unit tests in the module)
+- [x] Page ([`page.rs`](src/storage/page.rs), [`tests/storage_page_serialization.rs`](tests/storage_page_serialization.rs))
+- [x] Buffer Pool Manager ([`buffer_pool.rs`](src/storage/buffer_pool.rs), unit tests in the module)
+- [x] LRU-K Replacement ([`replacer.rs`](src/storage/replacer.rs), unit tests in the module)
+- [x] Page Serialization: little-endian codec, 16-byte page header, CRC32 checksum ([`serialization.rs`](src/serialization.rs), [`page.rs`](src/storage/page.rs), [`checksum.rs`](src/storage/checksum.rs), [`tests/storage_page_serialization.rs`](tests/storage_page_serialization.rs))
+- [x] Slotted Pages ([`slotted_page.rs`](src/storage/slotted_page.rs), [`tests/storage_slotted_page.rs`](tests/storage_slotted_page.rs))
+- [x] Tuple Storage ([`tuple.rs`](src/storage/tuple.rs), [`tests/storage_tuple.rs`](tests/storage_tuple.rs))
+- [x] RID ([`rid.rs`](src/storage/rid.rs), unit tests in the module)
+- [x] Heap File ([`heap_file.rs`](src/storage/heap_file.rs), [`tests/storage_heap_file.rs`](tests/storage_heap_file.rs))
+- [x] Free Space Management ([`free_space_map.rs`](src/storage/free_space_map.rs), [`tests/storage_heap_file.rs`](tests/storage_heap_file.rs))
+- [ ] `VACUUM`: compact the heap and return empty pages ([storage notes](docs/storage-engine.md#free-space-management)).
+- [ ] Persistent free space map. Only worth it once `HeapFile::open` stops reading every page of the heap.
+
+## Data Types
+
+- [x] Integer: `SMALLINT`, `INTEGER` and `BIGINT`, with parsing, casts, checked arithmetic and comparison ([`src/types/`](src/types/), [`tests/types_integer.rs`](tests/types_integer.rs))
+- [ ] Float
+- [ ] Boolean: `eq`/`lt`/... returning `Value::Boolean` and the three-valued logic of `AND`/`OR`/`NOT`
+- [ ] String
+- [x] NULL: `Value::Null`, the tuple NULL bitmap, SQL `UNKNOWN` comparison and `IS DISTINCT FROM` ([`value.rs`](src/types/value.rs), [`tuple.rs`](src/storage/tuple.rs))
+- [ ] Date/Time
+- [ ] UUID
+- [ ] Type System: implicit vs. explicit coercion and operator resolution across type families
+
+## Tables
+
+- [x] Schema: column definitions and typed row ⇄ tuple conversion ([`schema.rs`](src/table/schema.rs), [`tests/table_schema.rs`](tests/table_schema.rs))
+- [x] Table Metadata: tables persisted in the catalog ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
+- [ ] *(next)* Table Heap: typed `insert(row)` / `scan()` by table name, combining `Schema` and `HeapFile`, with one `HeapFile` handle per table
+- [ ] INSERT. The storage-level `HeapFile::insert` exists; there is no SQL statement.
+- [ ] SELECT
+- [ ] UPDATE. The storage-level `HeapFile::update` exists; there is no SQL statement.
+- [ ] DELETE. The storage-level `HeapFile::delete` exists; there is no SQL statement.
+- [ ] Sequential Scan. `HeapFile::scan` iterates raw tuples; there is no typed table scan or scan operator yet (see also Query Execution).
+- [ ] `DROP TABLE`
+
+## Indexes
+
+- [ ] B+Tree. Note: little-endian integers are not byte-orderable, so keys must be compared with `Value::sort_cmp` or use an order-preserving encoding.
+- [ ] Index Scan
+- [ ] Range Scan
+- [ ] Unique Index
+- [ ] Composite Index
+
+## SQL
+
+- [ ] Lexer
+- [ ] SQL Parser
+- [ ] AST
+- [ ] DDL
+- [ ] DML
+- [ ] Query Validation
+
+## Query Planning
+
+- [ ] Logical Query Plan
+- [ ] Physical Query Plan
+
+## Query Execution
+
+- [ ] Sequential Scan
+- [ ] Index Scan
+- [ ] Filter
+- [ ] Projection
+- [ ] Sort
+- [ ] Limit
+- [ ] Aggregation
+- [ ] GROUP BY
+- [ ] JOIN
+- [ ] Hash Join
+- [ ] Nested Loop Join
+
+## Transactions
+
+- [ ] Transaction Manager
+- [ ] BEGIN
+- [ ] COMMIT
+- [ ] ROLLBACK
+- [ ] Isolation Levels
+- [ ] Lock Manager
+- [ ] Concurrency Control
+- [ ] Deadlock Detection
+
+## Recovery
+
+- [ ] WAL. Several components document failure cases that only a WAL can make atomic (see [Limitations](docs/architecture.md#limitations)).
+- [ ] LSN. The field exists in every page header (bytes `0..8`) and is preserved, but nothing assigns it yet.
+- [ ] Checkpoints
+- [ ] Redo
+- [ ] Undo
+- [ ] Crash Recovery
+
+## Query Optimization
+
+Logical and physical plans are tracked under [Query Planning](#query-planning).
+
+- [ ] Cost Model
+- [ ] Statistics
+- [ ] Cardinality Estimation
+- [ ] Index Selection
+- [ ] Join Ordering
+
+## Constraints
+
+- [ ] PRIMARY KEY
+- [ ] UNIQUE
+- [ ] NOT NULL. The `Schema` already enforces a per-column `NOT NULL` flag; the item is marked when DDL (`CREATE TABLE ... NOT NULL`) exists.
+- [ ] FOREIGN KEY
+- [ ] CHECK
+- [ ] DEFAULT
+
+## Connectivity
+
+- [ ] CLI. `cargo run` is a fixed demo, not an interactive client.
+- [ ] Client Protocol
+- [ ] TCP Server
+- [ ] Prepared Statements
+- [ ] Connection Pooling
+
+## Security
+
+- [ ] Authentication
+- [ ] Users
+- [ ] Roles
+- [ ] Permissions
+
+## Catalog
+
+- [x] Database Catalog: page 0 database header, persistent catalog loaded on open ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
+- [x] Table Metadata ([`records.rs`](src/catalog/records.rs))
+- [x] Column Metadata ([`records.rs`](src/catalog/records.rs))
+- [ ] Index Metadata
+- [ ] Constraint Metadata
+- [ ] *(next)* String/VARCHAR-backed system tables, so the catalog can be stored as regular tables (`INFORMATION_SCHEMA`)
+
+## Reliability
+
+- [x] Unit Tests: 459 tests, in every module
+- [x] Integration Tests: 39 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
+- [ ] Concurrency Tests
+- [ ] Crash Recovery Tests
+- [ ] Fuzz Tests. Randomized model-based and corruption tests exist (for example `random_corruption_should_never_panic`), but there is no coverage-guided fuzzing harness.
+- [ ] Benchmarks
+
+## Goal
+
+Build a fully working educational database and connect real applications to it.

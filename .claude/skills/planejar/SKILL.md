@@ -1,6 +1,6 @@
 ---
 name: planejar
-description: Cria o plano de desenvolvimento de uma atividade do ferroDB (ex. um item do checklist do README como Heap File, B+Tree, Lexer). Use quando o usuário pedir para planejar, desenhar ou quebrar em etapas uma nova funcionalidade antes de implementar.
+description: Cria o plano de desenvolvimento de uma atividade do ferroDB (ex. um item do checklist do ROADMAP.md como Heap File, B+Tree, Lexer). Use quando o usuário pedir para planejar, desenhar ou quebrar em etapas uma nova funcionalidade antes de implementar.
 argument-hint: <atividade, ex. "Heap File">
 ---
 
@@ -12,22 +12,22 @@ Objetivo: produzir um plano concreto e revisável **antes** de escrever qualquer
 
 ## 1. Entender o contexto
 
-1. Leia `README.md` (checklist de features) e `doc.md` (decisões de design já tomadas).
+1. Leia `ROADMAP.md` (checklist de features) e as notas de design em `docs/` (índice em `doc.md`; decisões em `docs/decisions/`).
 2. Leia os módulos de `src/` que a atividade toca ou dos quais depende (ex.: Heap File depende de `buffer_pool`, `slotted_page`, `rid`, `page`).
 3. Identifique invariantes existentes que não podem quebrar. Exemplos atuais:
-   - header comum de 12 bytes (LSN + checksum) em toda página;
+   - header comum de 16 bytes (LSN, checksum, tipo e versão) em toda página;
    - `slot_id` de uma tupla nunca muda enquanto ela existir;
    - operações falham **sem efeito colateral** (checam antes de escrever);
    - formato em disco é little-endian;
    - offsets `u16` → página ≤ `MAX_PAGE_SIZE`.
-4. Identifique em qual seção do `README.md` a atividade está: é ela que define a pasta do código (ver seção 2).
+4. Identifique em qual seção do `ROADMAP.md` a atividade está: é ela que define a pasta do código (ver seção 2).
 5. Se algo essencial estiver ambíguo (escopo, formato em disco, API pública), pergunte ao usuário antes de fechar o plano. Para o resto, escolha um padrão razoável e registre como decisão.
 
 ## 2. Organização do projeto
 
-O código é dividido em uma pasta por seção do `README.md`, cada uma um módulo Rust (`src/<camada>/mod.rs`) com um arquivo por componente:
+O código é dividido em uma pasta por seção do `ROADMAP.md`, cada uma um módulo Rust (`src/<camada>/mod.rs`) com um arquivo por componente:
 
-| Seção do README | Pasta | Exemplos de arquivos |
+| Seção do roadmap | Pasta | Exemplos de arquivos |
 |---|---|---|
 | Storage | `src/storage/` | `disk_manager.rs`, `page.rs`, `buffer_pool.rs`, `replacer.rs`, `slotted_page.rs`, `rid.rs`, `checksum.rs`, `heap_file.rs` |
 | Data Types | `src/types/` | `value.rs`, `integer.rs`, `string.rs` |
@@ -49,7 +49,7 @@ Regras:
 - Cada `mod.rs` só declara os submódulos e reexporta o que é API da camada; lógica fica nos arquivos dos componentes.
 - **Dependência só para baixo**: camadas de cima usam as de baixo (`execution` → `table` → `storage`), nunca o contrário. `storage` não importa de nenhuma outra camada.
 - Testes de integração em `tests/<camada>_<componente>.rs` (ex.: `tests/storage_slotted_page.rs`).
-- Seção nova no README → pasta nova, seguindo o mesmo padrão (nome em inglês, snake_case).
+- Seção nova no roadmap → pasta nova, seguindo o mesmo padrão (nome em inglês, snake_case).
 - Se algum arquivo que a atividade toca ainda estiver fora da sua pasta, a **primeira etapa** do plano é movê-lo (só mover e ajustar `use`, sem mudar comportamento, com `cargo test` verde).
 
 ## 3. Escrever o plano
@@ -60,7 +60,7 @@ Salve em `.claude/plans/<slug-da-atividade>.md` com as seções abaixo e mostre 
 # Plano: <atividade>
 
 ## Objetivo
-O que passa a existir quando terminar (1–3 frases). Qual item do README é marcado.
+O que passa a existir quando terminar (1–3 frases). Qual item do `ROADMAP.md` é marcado.
 
 ## Fora de escopo
 O que fica explicitamente para depois.
@@ -69,7 +69,7 @@ O que fica explicitamente para depois.
 Explicação curta de como a estrutura funciona em bancos reais (referência CMU 15-445 quando fizer sentido) e como vamos simplificar.
 
 ## Design
-- Camada (seção do README) e caminho de cada arquivo novo/alterado (ex.: `src/storage/heap_file.rs`), com a responsabilidade de cada um
+- Camada (seção do roadmap) e caminho de cada arquivo novo/alterado (ex.: `src/storage/heap_file.rs`), com a responsabilidade de cada um
 - Dependências entre camadas (confirmar que só apontam para baixo)
 - Structs, enums e assinaturas públicas (em Rust)
 - Enum de erro do módulo (`<Modulo>Error` com `Display` + `std::error::Error`)
@@ -96,7 +96,7 @@ Lista numerada de passos pequenos, cada um compilável e testável sozinho:
 O que pode dar errado e como vamos detectar.
 
 ## Documentação
-O que atualizar em `doc.md` e `README.md`.
+O que atualizar em `docs/` (e ADR, se houver decisão nova), `ROADMAP.md` e `README.md`.
 ```
 
 ## Regras do plano

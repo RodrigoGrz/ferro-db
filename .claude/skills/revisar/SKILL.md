@@ -31,7 +31,7 @@ Procure ativamente, com cenário concreto de falha:
 - **Efeito colateral em falha**: operação que retorna `Err` depois de já ter alterado bytes/estado.
 - **Invariantes**: `slot_id` estável, checksum carimbado na escrita e verificado na leitura, página zerada tratada como nova, header comum preservado.
 - **Buffer pool**: `pin_count` que não volta a zero, página suja descartada sem flush, frame reutilizado ainda pinado, `page_table` inconsistente com os frames, replacer desatualizado.
-- **Endianness** e layout diferentes do documentado no `//!` do módulo / `doc.md`.
+- **Endianness** e layout diferentes do documentado no `//!` do módulo / `docs/`.
 - `unwrap()`, `expect()`, `panic!`, indexação direta em código de produção.
 
 ## 3. Melhorias
@@ -41,7 +41,7 @@ Procure ativamente, com cenário concreto de falha:
 - API pública maior que o necessário; nomes pouco claros.
 - Erros genéricos demais (variante que não diz o que falhou).
 - Custo desnecessário (cópias de `Vec`, alocações em loop, busca linear onde há índice).
-- Documentação (`doc.md`, README, doc comments) desatualizada em relação ao código.
+- Documentação (`docs/`, `ROADMAP.md`, README, doc comments) desatualizada em relação ao código.
 
 Só aponte melhoria que valha o custo; não liste preferências de estilo que o `cargo fmt`/clippy já resolvem.
 

@@ -58,9 +58,9 @@ Se o plano se mostrar errado ou incompleto, **pare e explique** o desvio antes d
 
 **Onde colocar o código**
 
-Uma pasta por seção do `README.md`, cada uma um módulo (`src/<camada>/mod.rs`):
+Uma pasta por seção do `ROADMAP.md`, cada uma um módulo (`src/<camada>/mod.rs`):
 
-| Seção do README | Pasta |
+| Seção do roadmap | Pasta |
 |---|---|
 | Storage | `src/storage/` |
 | Data Types | `src/types/` |
@@ -103,7 +103,7 @@ Sempre que possível, o comportamento visível ao usuário segue o padrão ISO/I
 - **Sintaxe**: strings com aspas simples, identificadores com aspas duplas; identificador sem aspas não diferencia maiúsculas/minúsculas.
 - **Erros**: associe cada erro visível ao usuário ao `SQLSTATE` do padrão (ex.: `22012` divisão por zero, `22003` valor numérico fora do intervalo, `23505` violação de unique, `42601` erro de sintaxe).
 - **Onde o padrão é omisso ou "implementation-defined"** (ex.: posição de `NULL` no `ORDER BY` sem `NULLS FIRST/LAST`, precisão de `REAL`), use o PostgreSQL como referência.
-- **Desvios**: quando não seguir o padrão (simplificação, feature ainda não suportada), registre no plano e na seção "Desvios do padrão SQL" do `doc.md`, dizendo o que o padrão pede e o que o ferroDB faz.
+- **Desvios**: quando não seguir o padrão (simplificação, feature ainda não suportada), registre no plano e na seção "Deviations from the SQL Standard" de `docs/data-model.md`, dizendo o que o padrão pede e o que o ferroDB faz.
 - **Testes**: o comportamento do padrão vira teste, principalmente os casos com `NULL` e os erros com seu `SQLSTATE`.
 
 Camadas internas (páginas, buffer pool, formato em disco) não são cobertas pelo padrão e seguem as regras da seção 3.
@@ -120,7 +120,7 @@ Camadas internas (páginas, buffer pool, formato em disco) não são cobertas pe
 ## 6. Fechamento
 
 1. Rode a validação completa uma última vez (fmt, clippy, test).
-2. Atualize `doc.md` (seção em PT-BR no estilo das existentes: layout, operações, decisões de design, testes, próximos passos).
-3. Marque o item correspondente no checklist do `README.md`.
+2. Atualize a seção do componente em `docs/storage-engine.md` ou `docs/data-model.md` (em inglês, no estilo das existentes: layout, operações, decisões de design, testes, limitações). Mudou componente ou fluxo de dados → `docs/architecture.md`. Decisão de design importante → ADR em `docs/decisions/`.
+3. Marque o item correspondente no `ROADMAP.md` (com links para o código e os testes) e atualize o status resumido do `README.md` se ele mudou.
 4. Resuma para o usuário: o que foi feito, desvios do plano, pendências.
 5. **Não faça commit** a menos que o usuário peça. Sugira rodar `/revisar` em seguida.

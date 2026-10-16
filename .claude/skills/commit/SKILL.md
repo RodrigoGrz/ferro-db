@@ -1,6 +1,6 @@
 ---
 name: commit
-description: Faz o commit de uma atividade do ferroDB. Só commita com fmt, clippy e testes verdes, inclui apenas os arquivos da atividade, valida o check no README e usa mensagem no padrão tipo/descricao-em-ingles. Não faz push sem aprovação. Use quando o usuário pedir para commitar ou salvar o trabalho no git.
+description: Faz o commit de uma atividade do ferroDB. Só commita com fmt, clippy e testes verdes, inclui apenas os arquivos da atividade, valida o check no ROADMAP.md e usa mensagem no padrão tipo/descricao-em-ingles. Não faz push sem aprovação. Use quando o usuário pedir para commitar ou salvar o trabalho no git.
 argument-hint: [atividade — vazio = a atividade da conversa atual]
 ---
 
@@ -22,18 +22,18 @@ Se o Claude já estiver rodando dentro do Linux, rode os comandos direto.
 
 1. Rode `git status --short` e `git diff` (e leia os arquivos novos não rastreados).
 2. Classifique cada arquivo:
-   - **da atividade**: código, testes, `doc.md` e `README.md` ligados a ela;
+   - **da atividade**: código, testes e documentação ligados a ela (`docs/`, `ROADMAP.md`, `README.md`);
    - **fora da atividade**: qualquer outra mudança. Fica de fora do commit e é listada para o usuário no final.
 3. Nunca inclua: planos de `.claude/plans/` (são locais, estão no `.gitignore`), `data.db` ou outros arquivos `.db` gerados, `target/`, arquivos temporários de teste, segredos.
 4. Se um mesmo arquivo misturar mudanças da atividade com outras, **pare e pergunte** ao usuário o que fazer (`git add -p` é interativo e não funciona aqui).
 5. Adicione ao stage **por caminho**: `git add <arquivo1> <arquivo2> ...`. Nunca use `git add -A`, `git add .` nem `git commit -a`.
 
-## 2. Validar o README
+## 2. Validar o roadmap
 
-1. Veja se a atividade corresponde a um item do checklist do `README.md`.
-2. Se corresponder, o item tem que estar `- [x]` e o `README.md` tem que estar no stage.
+1. Veja se a atividade corresponde a um item do checklist do `ROADMAP.md`.
+2. Se corresponder, o item tem que estar `- [x]` (com links para o código e os testes) e o `ROADMAP.md` tem que estar no stage. Se o status resumido do `README.md` mudou, ele também entra.
 3. Se ainda estiver `- [ ]`, **pare**, avise o usuário e pergunte se é para marcar agora (a atividade pode estar incompleta). Só siga depois da resposta.
-4. Se a atividade não estiver no README (ex.: refactor, fix), siga sem mexer nele.
+4. Se a atividade não estiver no roadmap (ex.: refactor, fix), siga sem mexer nele.
 
 ## 3. Gate: tudo verde
 
@@ -81,7 +81,7 @@ Se ajudar, adicione um corpo curto em inglês, depois de uma linha em branco, co
 
 ## Validação
 fmt ✅ · clippy ✅ · testes ✅ (<N> passaram)
-README: <item marcado | não se aplica>
+Roadmap: <item marcado | não se aplica>
 
 ## Push
 Branch `<branch>` → `<remote>/<branch>`; commits que vão subir:
