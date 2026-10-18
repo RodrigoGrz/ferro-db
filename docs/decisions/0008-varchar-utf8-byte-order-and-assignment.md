@@ -12,7 +12,7 @@ The tuple format already supported variable-width fields (`ColumnLayout::Variabl
 ## Decision
 
 - **Only `VARCHAR(n)`**, `DataType::Varchar(NonZeroU16)`: `1 ≤ n ≤ 65535`, so `VARCHAR(0)` cannot be built. `n` counts characters (Unicode scalar values), not bytes.
-- **UTF-8 on disk**, the field holding the raw bytes. Reading validates UTF-8 and the length again (`CorruptedText`).
+- **UTF-8 on disk**, the field holding the raw bytes. Reading validates UTF-8 and the length again (`CorruptedValue`, named `CorruptedText` until BOOLEAN arrived).
 - **`Value::Text(String)` does not carry `n`.** The limit belongs to the column. Text that did not come from a column (the result of `||` or of a `CAST` from an integer) has the type `VARCHAR(65535)` (`DataType::VARCHAR_MAX`).
 - **Comparison by UTF-8 bytes, without padding** (`'Z' < 'a'`, `'a' < 'a '`), which equals code point order and PostgreSQL's `"C"` collation.
 - **Store assignment separate from `CAST`**, as the standard defines them: `Value::cast` converts integer ⇄ text and cuts text to `n`; `Value::assign`, used by `Schema::encode_row`, stays within a family (`42804` otherwise) and raises `22001` for text longer than `n`, unless the excess is only spaces, which are cut.

@@ -10,7 +10,7 @@ pub(crate) fn narrow(ty: DataType, value: i64) -> Option<Value> {
         DataType::SmallInt => i16::try_from(value).ok().map(Value::SmallInt),
         DataType::Integer => i32::try_from(value).ok().map(Value::Integer),
         DataType::BigInt => Some(Value::BigInt(value)),
-        DataType::Varchar(_) => None,
+        DataType::Varchar(_) | DataType::Boolean => None,
     }
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn parse(ty: DataType, text: &str) -> Result<Value, TypeError> {
 }
 
 /// C's `isspace` set, allowed around numbers; Rust's ASCII whitespace lacks `\v`.
-fn is_c_space(c: char) -> bool {
+pub(super) fn is_c_space(c: char) -> bool {
     c.is_ascii_whitespace() || c == '\x0B'
 }
 

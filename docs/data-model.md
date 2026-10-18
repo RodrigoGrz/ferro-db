@@ -6,6 +6,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 
 - [Data Types: Integers and NULL](#data-types-integers-and-null)
 - [Data Types: VARCHAR](#data-types-varchar)
+- [Data Types: BOOLEAN](#data-types-boolean)
 - [Schema](#schema)
 - [Catalog](#catalog)
 - [Deviations from the SQL Standard](#deviations-from-the-sql-standard)
@@ -14,7 +15,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 
 ## Data Types: Integers and NULL
 
-The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text is in [Data Types: VARCHAR](#data-types-varchar). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
+The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text and booleans are in [Data Types: VARCHAR](#data-types-varchar) and [Data Types: BOOLEAN](#data-types-boolean). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
 
 | File | Responsibility |
 |---|---|
@@ -22,13 +23,14 @@ The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and 
 | `value.rs` | `Value`: `NULL`, encode/decode, parse, `Display`, cast and assignment, operators, comparison |
 | `integer.rs` | integer semantics in `i64` + narrowing to the target type (private) |
 | `text.rs` | `VARCHAR(n)` semantics: length in characters, truncation, trailing-space rule, UTF-8 validation (private) |
+| `boolean.rs` | `BOOLEAN` semantics: the 1-byte format, text input, integer conversion, Kleene's `AND`/`OR` (private) |
 | `error.rs` | `TypeError` with message and PostgreSQL-compatible `SQLSTATE` |
 
 ### Types and bytes
 
 ```rust
-pub enum DataType { SmallInt, Integer, BigInt, Varchar(NonZeroU16) }
-pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String) }
+pub enum DataType { SmallInt, Integer, BigInt, Varchar(NonZeroU16), Boolean }
+pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String), Boolean(bool) }
 ```
 
 | Type | Rust | `ColumnLayout` | Field in the tuple | `-2` |
@@ -53,8 +55,9 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String) }
 - **NULL in operations:** any `NULL` operand → `NULL`, before any other check (`NULL / 0` is `NULL`).
 - **Comparison:**
   - `compare` → `Result<Option<Ordering>, TypeError>`; `Ok(None)` is `UNKNOWN` whenever one side is `NULL` (including `NULL = NULL`). Compares by value regardless of width (`INTEGER 5 = BIGINT 5`). Comparing an integer with text → `UndefinedOperator` (`42883`).
+  - `sql_eq` / `sql_lt` / ... → the same comparison as a SQL value (`Boolean` or `Null`); see [BOOLEAN](#comparison-as-sql-values).
   - `is_distinct_from` → `Result<bool, TypeError>`, `IS DISTINCT FROM`: `NULL` equals `NULL`, never `UNKNOWN`.
-  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: integers sort before text, an order that only exists to make the function total (a column never mixes families).
+  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: integers sort before text and text before booleans, an order that only exists to make the function total (a column never mixes families).
 
 ### Errors
 
@@ -66,7 +69,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String) }
 | `DivisionByZero` | `22012` | `division by zero` |
 | `InvalidEncoding` | `XX001` | `integer field must be 4 bytes, got 2` |
 
-The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedText`) are listed in the [VARCHAR section](#errors-1).
+The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), and `NotBoolean` in the [BOOLEAN section](#errors-2).
 
 ### Design decisions
 
@@ -76,7 +79,7 @@ The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `Corr
 - **Untyped `NULL`** (`Value::Null`, not `Null(DataType)`): an expression's type comes from the schema, decided by the planner; the `NULL` literal has no type until the type system resolves it from context.
 - **`NULL` = `None` in the field:** reuses the tuple NULL bitmap without changing the on-disk format.
 - **`compare` and `sort_cmp` are separate:** comparison needs `UNKNOWN`, ordering needs a total order. Mixing the two is a classic bug.
-- ⚠️ **Rust's `PartialEq` is structural:** `Null == Null` and `SmallInt(1) != BigInt(1)`. It is meant for tests; filters and joins must use `compare` / `is_distinct_from`.
+- ⚠️ **Rust's `PartialEq` is structural:** `Null == Null` and `SmallInt(1) != BigInt(1)`. It is meant for tests; filters and joins must use `sql_eq` / `compare` / `is_distinct_from`.
 - ⚠️ **Little-endian is not byte-orderable:** a B+Tree must compare with `sort_cmp` or use its own encoding (big-endian with the sign bit flipped).
 
 ### Tests
@@ -108,7 +111,7 @@ Value::Text(String)                  // the limit n belongs to the column, not t
 | empty text `''` | `Variable` | `Some(&[])`: an empty field, **not** `NULL` |
 | `NULL` | `Variable` | `None`: bit in the NULL bitmap |
 
-`Value::decode(VARCHAR(n), field)` validates what comes from disk: invalid UTF-8 or more than `n` characters → `CorruptedText` (`XX001`). Writes go through assignment, so either means corruption or the wrong schema.
+`Value::decode(VARCHAR(n), field)` validates what comes from disk: invalid UTF-8 or more than `n` characters → `CorruptedValue` (`XX001`). Writes go through assignment, so either means corruption or the wrong schema.
 
 ### Cast and assignment
 
@@ -141,7 +144,7 @@ The standard has two different rules, and ferroDB keeps them apart: `Value::cast
 | `StringTooLong` | `22001` | `value too long for type varchar(5)` |
 | `UndefinedOperator` | `42883` | `operator does not exist: varchar + integer` / `operator does not exist: - varchar` |
 | `DatatypeMismatch` | `42804` | `cannot assign a value of type varchar to a column of type integer` |
-| `CorruptedText` | `XX001` | `stored varchar(3) value is corrupted: text is not valid UTF-8` |
+| `CorruptedValue` | `XX001` | `stored varchar(3) value is corrupted: text is not valid UTF-8` |
 
 Length messages show the full type (`varchar(5)`); operator and assignment messages show only the type name, so a loose text value never appears as `varchar(65535)`.
 
@@ -159,8 +162,91 @@ See [ADR 0008](decisions/0008-varchar-utf8-byte-order-and-assignment.md). Also:
 
 - Unit in `value.rs`, `error.rs` and `data_type.rs`: round trip of empty, ASCII, accented and 4-byte characters and of exactly `n` characters; invalid UTF-8 (lone byte, truncated sequence, surrogate) and text longer than the column on decode; `parse` at `n` and `n + 1`, excess of spaces, tabs and U+00A0; every cell of the cast/assign matrix, including `NULL`; `concat` with empty, `NULL`, integers and at the 65,535-character limit; arithmetic with text; byte-order comparison cases; `IS DISTINCT FROM`; mixed `sort_cmp`; every new error with message and SQLSTATE.
 - `random_text_operations_should_match_the_char_model`: 10,000 random strings (ASCII, multibyte, tabs, trailing spaces) with random `n`, checked against a `Vec<char>` model for `assign`, `parse`, `cast`, `concat`, `compare` (code point order) and `is_distinct_from`, plus round trips through bytes and text. `sort_cmp_should_be_a_total_order` now mixes text with integers.
-- `schema.rs`: text columns round trip, trailing spaces cut, `22001`, `42804` in both directions, a row of 80,000 bytes of text → `RowTooLarge` (`54000`), invalid UTF-8 and text longer than the reading schema's column → `Type { .., CorruptedText }`; the random assignment and corruption tests include `VARCHAR` columns. Mutation-checked by hand: making the trailing-space rule look for another character breaks the random schema test.
+- `schema.rs`: text columns round trip, trailing spaces cut, `22001`, `42804` in both directions, a row of 80,000 bytes of text → `RowTooLarge` (`54000`), invalid UTF-8 and text longer than the reading schema's column → `Type { .., CorruptedValue }`; the random assignment and corruption tests include `VARCHAR` columns. Mutation-checked by hand: making the trailing-space rule look for another character breaks the random schema test.
 - Integration in [`tests/types_string.rs`](../tests/types_string.rs): a catalog table `(id INTEGER NOT NULL, name VARCHAR(40) NOT NULL, bio VARCHAR(4000))` with empty text, `NULL`, accents, emoji and 3,000-byte values spread over many pages survives eviction with a 2-frame pool and reopening the file; `VARCHAR(1)` and `VARCHAR(65535)` come back from the catalog; a value that fits `VARCHAR(8000)` but not a page → `TupleTooLarge`.
+
+## Data Types: BOOLEAN
+
+`BOOLEAN` holds `TRUE`, `FALSE` or `NULL`. The standard makes `UNKNOWN` the null value of this type, so there is no separate `Unknown` variant: the result of `1 < NULL` and a `NULL` stored in a boolean column are the same `Value::Null`.
+
+```rust
+DataType::Boolean
+Value::Boolean(bool)
+```
+
+`src/types/boolean.rs` (private) holds the byte format, the text input, the integer conversion and Kleene's logic; `value.rs` exposes them.
+
+### Bytes and text
+
+| | |
+|---|---|
+| Field in the tuple | `Fixed(1)`: `0x00` = FALSE, `0x01` = TRUE |
+| Any other byte on read | `CorruptedValue` (`XX001`, `boolean byte must be 0 or 1`): one value never has two encodings |
+| Width other than 1 | `InvalidEncoding` (as integers) |
+| `Display` | `TRUE` / `FALSE` |
+| `Value::parse` | surrounding whitespace (the integers' set), then **only** `true` / `false` in any case (`TRUE`, `True`, `tRuE`) or `1` / `0`. Anything else (`t`, `yes`, `on`, `01`, `+1`, `2`, `unknown`, `NULL`, empty) → `InvalidTextRepresentation` (`22P02`). Never yields `NULL` |
+
+### Cast and assignment
+
+| From → to | integer | `VARCHAR(n)` | `BOOLEAN` |
+|---|---|---|---|
+| integer | (integers) | (VARCHAR) | `cast`: `0` → FALSE, `1` → TRUE, any other value → `OutOfRange` (`22003`, `boolean out of range`); `assign`: `42804` |
+| text | (VARCHAR) | (VARCHAR) | `cast`: the `parse` rules; `assign`: `42804` |
+| boolean | `cast`: FALSE → `0`, TRUE → `1`, in every width; `assign`: `42804` | `cast`: `'TRUE'` / `'FALSE'`, cut to `n` like integer → text; `assign`: `42804` | identity |
+| `NULL` | `NULL` | `NULL` | `NULL` |
+
+Every pair of types now has a `CAST`. Accepting only `0` and `1` makes integer ⇄ boolean lossless both ways (`CAST(CAST(b AS INTEGER) AS BOOLEAN) = b`), and `2` is an error instead of a silent TRUE.
+
+### Comparison as SQL values
+
+`sql_eq`, `sql_ne`, `sql_lt`, `sql_le`, `sql_gt` and `sql_ge` (`=`, `<>`, `<`, `<=`, `>`, `>=`) return a `Value`: `Boolean` when both sides are values, `Null` (UNKNOWN) when either side is `NULL`. They are a thin layer over `compare`, and an error across families names the operator actually used (`operator does not exist: integer < varchar`). The `sql_` prefix keeps them apart from Rust's structural `==`.
+
+Booleans order `FALSE < TRUE`. `sort_cmp` stays total: integers, then text, then booleans, then `NULL`.
+
+### Three-valued logic
+
+`and`, `or` and `not` follow Kleene's logic (`N` = `NULL`/UNKNOWN):
+
+| `a` | `b` | `a AND b` | `a OR b` |
+|---|---|---|---|
+| T | T | T | T |
+| T | F | F | T |
+| T | N | N | T |
+| F | F | F | F |
+| F | N | F | N |
+| N | N | N | N |
+
+The table is symmetric; `NOT T = F`, `NOT F = T`, `NOT N = N`.
+
+- `AND` and `OR` are the **only non-strict operators**: a side that alone decides the result wins over `NULL` (`FALSE AND NULL = FALSE`, `TRUE OR NULL = TRUE`).
+- Both operands are type-checked **before** the table: `FALSE AND 1` fails instead of returning FALSE, so the result does not depend on which side is looked at first. A non-boolean operand → `NotBoolean` (`42804`, `argument of AND must be type boolean, not type integer`). An untyped `NULL` is accepted.
+- **Boolean tests** `is_true`, `is_false` and `is_unknown` (`IS TRUE`, `IS FALSE`, `IS UNKNOWN`; `IS NOT X` is `!is_x`) return a Rust `bool` and are never UNKNOWN; exactly one of them holds for each boolean or `NULL`. `is_true` is what a `WHERE` filter will keep. A non-boolean → `NotBoolean`.
+
+### Errors
+
+| `TypeError` | SQLSTATE | Message |
+|---|---|---|
+| `OutOfRange` | `22003` | `boolean out of range` (`CAST(2 AS BOOLEAN)`) |
+| `InvalidTextRepresentation` | `22P02` | `invalid input syntax for type boolean: "yes"` |
+| `NotBoolean` | `42804` | `argument of AND must be type boolean, not type integer` |
+| `CorruptedValue` | `XX001` | `stored boolean value is corrupted: boolean byte must be 0 or 1` |
+| `UndefinedOperator` | `42883` | `operator does not exist: boolean = integer` |
+
+### Design decisions
+
+- **One byte, `0`/`1`, strict on read:** the natural format (also PostgreSQL's). Reading "anything non-zero is TRUE" would give one value two encodings, which breaks byte comparisons and future indexes. Bit-packing several booleans per byte was not worth its complexity.
+- **UNKNOWN = `Value::Null`:** two kinds of null would double every case.
+- **`TypeFamily`** (`pub(crate)`, `DataType::family()`): with three families, "same family" can no longer be `is_text() == is_text()`; assignment and comparison ask `family()`, and its order (integers, text, booleans) is the cross-family order of `sort_cmp`.
+- **`CorruptedValue`** generalizes the former `CorruptedText`: one variant with the type and a reason serves every type whose bytes can be invalid at the right width.
+- **`NotBoolean` instead of `UndefinedOperator`** for logical operators: `UndefinedOperator` reads "type op type", which fits neither `NULL AND 'x'` (the `NULL` has no type) nor the postfix `1 IS TRUE`.
+
+### Tests
+
+- Unit in `data_type.rs`, `error.rs` and `value.rs`: name, width, layout and family; every byte and width on decode; `parse` with mixed case, whitespace and a list of rejected inputs; every cell of the cast/assign matrix including every integer width, `-1`, `2`, `MIN` and `MAX`; `FALSE < TRUE`; the six `sql_*` operators over integers, text and booleans, with `NULL` and with the operator named in the error; the complete `AND` / `OR` / `NOT` tables; a non-boolean operand even when the other side decides; the three `IS` tests; every error with message and SQLSTATE.
+- `random_logic_should_match_the_kleene_order_model`: 10,000 pairs checked against Kleene's logic written as an order (`FALSE < UNKNOWN < TRUE`; `AND` = minimum, `OR` = maximum), plus commutativity, double negation, De Morgan and "exactly one `IS` holds". Mutation-checked by hand: dropping the `UNKNOWN AND FALSE = FALSE` case makes it fail.
+- `random_sql_comparisons_should_agree_with_compare` over mixed families; `booleans_should_round_trip_through_bytes_text_and_integers`; `sort_cmp_should_be_a_total_order` now mixes all three families.
+- `schema.rs` and `catalog`: boolean columns (`Fixed(1)`), round trip, `42804` in both directions, the random assignment and corruption tests with boolean columns and values, catalog code `5` and random creations with `BOOLEAN`.
+- Integration in [`tests/types_boolean.rs`](../tests/types_boolean.rs): a catalog table `(id INTEGER NOT NULL, active BOOLEAN NOT NULL, verified BOOLEAN)` with 2,000 rows survives eviction with a 2-frame pool and reopening the file; a `WHERE active AND verified` filter written with `and` + `is_true`, and `verified IS UNKNOWN`, return the expected rows; a boolean byte `2` written below the schema → `Type { .., CorruptedValue }` (`XX001`).
 
 ---
 
@@ -193,12 +279,12 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 - **`encode_row`** applies SQL *assignment* column by column, and only builds the tuple if every column passes (the first error, in column order, is the one returned):
   - number of values ≠ number of columns → `ColumnCountMismatch`;
   - `NULL` in a `NOT NULL` column → `NullViolation`;
-  - the value is converted to the column type with `Value::assign`: a `SMALLINT` in a `BIGINT` column is accepted; `70000` in a `SMALLINT` column → `Type { column: "age", OutOfRange }`; text longer than a `VARCHAR(n)` column → `Type { .., StringTooLong }` unless the excess is only spaces; a value of the other family (text in an integer column or the reverse) → `Type { .., DatatypeMismatch }`;
+  - the value is converted to the column type with `Value::assign`: a `SMALLINT` in a `BIGINT` column is accepted; `70000` in a `SMALLINT` column → `Type { column: "age", OutOfRange }`; text longer than a `VARCHAR(n)` column → `Type { .., StringTooLong }` unless the excess is only spaces; a value of another family (text in an integer column, a boolean in a text column, ...) → `Type { .., DatatypeMismatch }`;
   - valid values whose tuple exceeds the tuple format's limit (65,535 bytes, reachable only with long text) → `RowTooLarge`, not the `Tuple` error, which means corruption.
 - **`decode_row` / `decode_column` / `decode_columns`** read bytes from disk and do not trust them: truncated or corrupted tuple, or one written with another schema → `Tuple(..)`; `NULL` stored in a `NOT NULL` column → `NullViolation`. Values come back **in the column's type** (a `SmallInt` stored in an `INTEGER` column comes back as `Integer`).
   - Every field is read with `TupleRef::field`, which returns an error: a field the tuple cannot produce is never mistaken for `NULL`.
   - `decode_columns` returns the requested columns in the requested order (repetitions allowed), checks the indexes **before** reading the tuple and validates the tuple only once.
-- Each field's width comes from the schema itself, so `Type { .. InvalidEncoding }` does not happen on read; on read, the only type error is `Type { .. CorruptedText }` for a damaged text field.
+- Each field's width comes from the schema itself, so `Type { .. InvalidEncoding }` does not happen on read; on read, the only type error is `Type { .. CorruptedValue }` for a damaged text field.
 
 ### Errors
 
@@ -280,9 +366,9 @@ The checksum catches flipped bytes; the magic rejects a file whose page 0 is val
 | Entry | Fields |
 |---|---|
 | `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · name |
-| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
+| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
 
-Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Codes `1` to `3` did not change when `VARCHAR` arrived, so older databases still open.
+Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, then `5` BOOLEAN), so older databases still open.
 
 ### Operations
 
@@ -338,7 +424,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 ### Tests
 
 - `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
-- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`5`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
+- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`6`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
 - `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, data heap that accepts the schema's rows, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch) and every error with message, SQLSTATE and `source()`.
 - `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
@@ -369,3 +455,6 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Integer assigned to a text column | not allowed in store assignment | rejected (`42804`); PostgreSQL accepts it through an assignment cast. Only an explicit `CAST` converts |
 | Comparing text with a number | not allowed | `42883`; the error names `=` whatever the comparison operator |
 | Empty string | different from `NULL` | same (Oracle treats `''` as `NULL`; ferroDB does not) |
+| Text to `BOOLEAN` | trim spaces, then the literals `TRUE`, `FALSE` (any case) or `UNKNOWN` (→ `NULL`); otherwise `22018` | `true` / `false` in any case **and `1` / `0`** (decided with the author); `'unknown'` is rejected (`22P02`), since text input never yields `NULL` |
+| `CAST` between integers and `BOOLEAN` | not defined | `0` ⇄ FALSE and `1` ⇄ TRUE in every width (decided with the author); other integers → `22003`. PostgreSQL takes any non-zero `INTEGER` as TRUE |
+| `CAST` of a `BOOLEAN` to a short `VARCHAR(n)` | `22001` when `'TRUE'`/`'FALSE'` does not fit | cut to `n`, like integers (`CAST(TRUE AS VARCHAR(1))` = `'T'`) |

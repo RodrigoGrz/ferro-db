@@ -10,6 +10,16 @@ pub enum DataType {
     BigInt,
     /// At most `n` characters (Unicode scalar values); the type rules out `VARCHAR(0)`.
     Varchar(NonZeroU16),
+    Boolean,
+}
+
+/// Values of one family can be assigned and compared to each other; across families only an
+/// explicit CAST converts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TypeFamily {
+    Integer,
+    Text,
+    Boolean,
 }
 
 impl DataType {
@@ -23,6 +33,7 @@ impl DataType {
             DataType::Integer => "INTEGER",
             DataType::BigInt => "BIGINT",
             DataType::Varchar(_) => "VARCHAR",
+            DataType::Boolean => "BOOLEAN",
         }
     }
 
@@ -32,6 +43,7 @@ impl DataType {
             DataType::Integer => Some(size_of::<i32>()),
             DataType::BigInt => Some(size_of::<i64>()),
             DataType::Varchar(_) => None,
+            DataType::Boolean => Some(size_of::<bool>()),
         }
     }
 
@@ -44,14 +56,23 @@ impl DataType {
     }
 
     pub fn is_integer(self) -> bool {
-        matches!(
-            self,
-            DataType::SmallInt | DataType::Integer | DataType::BigInt
-        )
+        self.family() == TypeFamily::Integer
     }
 
     pub fn is_text(self) -> bool {
-        matches!(self, DataType::Varchar(_))
+        self.family() == TypeFamily::Text
+    }
+
+    pub fn is_boolean(self) -> bool {
+        self.family() == TypeFamily::Boolean
+    }
+
+    pub(crate) fn family(self) -> TypeFamily {
+        match self {
+            DataType::SmallInt | DataType::Integer | DataType::BigInt => TypeFamily::Integer,
+            DataType::Varchar(_) => TypeFamily::Text,
+            DataType::Boolean => TypeFamily::Boolean,
+        }
     }
 
     /// Result type of `a op b` for integers: the wider operand (`SMALLINT + INTEGER -> INTEGER`).
@@ -87,12 +108,15 @@ mod tests {
 
     #[test]
     fn name_should_be_the_sql_keyword() {
-        let names: Vec<_> = [SmallInt, Integer, BigInt, varchar(5)]
+        let names: Vec<_> = [SmallInt, Integer, BigInt, varchar(5), DataType::Boolean]
             .iter()
             .map(|ty| ty.name())
             .collect();
 
-        assert_eq!(names, ["SMALLINT", "INTEGER", "BIGINT", "VARCHAR"]);
+        assert_eq!(
+            names,
+            ["SMALLINT", "INTEGER", "BIGINT", "VARCHAR", "BOOLEAN"]
+        );
     }
 
     #[test]
@@ -100,6 +124,13 @@ mod tests {
         assert_eq!(Integer.to_string(), "INTEGER");
         assert_eq!(varchar(40).to_string(), "VARCHAR(40)");
         assert_eq!(DataType::VARCHAR_MAX.to_string(), "VARCHAR(65535)");
+        assert_eq!(DataType::Boolean.to_string(), "BOOLEAN");
+    }
+
+    #[test]
+    fn boolean_should_be_one_fixed_byte() {
+        assert_eq!(DataType::Boolean.fixed_width(), Some(1));
+        assert_eq!(DataType::Boolean.layout(), ColumnLayout::Fixed(1));
     }
 
     #[test]
@@ -138,6 +169,20 @@ mod tests {
         }
         assert!(varchar(3).is_text());
         assert!(!varchar(3).is_integer());
+        assert!(!varchar(3).is_boolean());
+        assert!(DataType::Boolean.is_boolean());
+        assert!(!DataType::Boolean.is_integer());
+        assert!(!DataType::Boolean.is_text());
+    }
+
+    #[test]
+    fn family_should_group_the_integer_widths_and_every_varchar() {
+        for ty in INTEGERS {
+            assert_eq!(ty.family(), TypeFamily::Integer);
+        }
+        assert_eq!(varchar(1).family(), TypeFamily::Text);
+        assert_eq!(DataType::VARCHAR_MAX.family(), TypeFamily::Text);
+        assert_eq!(DataType::Boolean.family(), TypeFamily::Boolean);
     }
 
     #[test]

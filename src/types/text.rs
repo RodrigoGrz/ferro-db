@@ -50,7 +50,7 @@ pub(crate) fn concat(lhs: &str, rhs: &str) -> Result<Value, TypeError> {
 /// A stored field. Writes go through `assign`, so a field that is not UTF-8 or is longer
 /// than its column was damaged on disk or read with the wrong schema.
 pub(crate) fn decode(max_chars: NonZeroU16, bytes: &[u8]) -> Result<Value, TypeError> {
-    let corrupted = |reason| TypeError::CorruptedText {
+    let corrupted = |reason| TypeError::CorruptedValue {
         ty: DataType::Varchar(max_chars),
         reason,
     };

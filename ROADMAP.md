@@ -7,7 +7,7 @@ This is the authoritative implementation checklist for ferroDB. The README only 
 - `[x]` means the feature exists **and** is covered by tests (the links point to both).
 - `[ ]` means it is not done. A note says when part of it already exists.
 - Sections keep the order in which the project plans to build them. Items marked *(next)* come from the "next steps" recorded in the design notes and are the closest planned work.
-- Status was last verified against the code on 2026-10-18 (`cargo test --all-targets`: 556 tests passing).
+- Status was last verified against the code on 2026-10-18 (`cargo test --all-targets`: 602 tests passing).
 
 When an item is finished, mark it here in the same change that adds the code, and update the design notes (see the [documentation index](doc.md)).
 
@@ -30,7 +30,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 
 - [x] Integer: `SMALLINT`, `INTEGER` and `BIGINT`, with parsing, casts, checked arithmetic and comparison ([`src/types/`](src/types/), [`tests/types_integer.rs`](tests/types_integer.rs))
 - [ ] Float
-- [ ] Boolean: `eq`/`lt`/... returning `Value::Boolean` and the three-valued logic of `AND`/`OR`/`NOT`
+- [x] Boolean: `sql_eq`/`sql_lt`/... returning `Value::Boolean`, the three-valued logic of `AND`/`OR`/`NOT` and `IS TRUE`/`FALSE`/`UNKNOWN` ([`boolean.rs`](src/types/boolean.rs), [`value.rs`](src/types/value.rs), [`tests/types_boolean.rs`](tests/types_boolean.rs))
 - [x] String: `VARCHAR(n)` in UTF-8, with CAST vs. store assignment, `||` and byte-order comparison ([`text.rs`](src/types/text.rs), [`value.rs`](src/types/value.rs), [`tests/types_string.rs`](tests/types_string.rs)). Not included: `CHAR(n)`, `TEXT`, collations and text functions.
 - [x] NULL: `Value::Null`, the tuple NULL bitmap, SQL `UNKNOWN` comparison and `IS DISTINCT FROM` ([`value.rs`](src/types/value.rs), [`tuple.rs`](src/storage/tuple.rs))
 - [ ] Date/Time

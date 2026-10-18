@@ -39,8 +39,14 @@ pub enum TypeError {
         value: DataType,
         target: DataType,
     },
-    /// A stored text field that is not valid UTF-8 or is longer than its column.
-    CorruptedText {
+    /// A logical operator or boolean test (`AND`, `NOT`, `IS TRUE`...) given a non-boolean.
+    NotBoolean {
+        op: &'static str,
+        actual: DataType,
+    },
+    /// A stored field of the right width whose bytes are not a value of its type: text that
+    /// is not valid UTF-8 or is longer than its column, a boolean byte other than 0 or 1.
+    CorruptedValue {
         ty: DataType,
         reason: &'static str,
     },
@@ -54,8 +60,8 @@ impl TypeError {
             TypeError::DivisionByZero => "22012",
             TypeError::StringTooLong { .. } => "22001",
             TypeError::UndefinedOperator { .. } => "42883",
-            TypeError::DatatypeMismatch { .. } => "42804",
-            TypeError::InvalidEncoding { .. } | TypeError::CorruptedText { .. } => "XX001",
+            TypeError::DatatypeMismatch { .. } | TypeError::NotBoolean { .. } => "42804",
+            TypeError::InvalidEncoding { .. } | TypeError::CorruptedValue { .. } => "XX001",
         }
     }
 }
@@ -110,7 +116,12 @@ impl fmt::Display for TypeError {
                 type_name(*value),
                 full_type_name(*target)
             ),
-            TypeError::CorruptedText { ty, reason } => write!(
+            TypeError::NotBoolean { op, actual } => write!(
+                f,
+                "argument of {op} must be type boolean, not type {}",
+                type_name(*actual)
+            ),
+            TypeError::CorruptedValue { ty, reason } => write!(
                 f,
                 "stored {} value is corrupted: {reason}",
                 full_type_name(*ty)
@@ -140,6 +151,23 @@ mod tests {
                     ty: DataType::SmallInt,
                 },
                 "smallint out of range",
+            ),
+            (
+                TypeError::OutOfRange {
+                    ty: DataType::Boolean,
+                },
+                "boolean out of range",
+            ),
+            (
+                text_error(DataType::Boolean, "yes"),
+                "invalid input syntax for type boolean: \"yes\"",
+            ),
+            (
+                TypeError::CorruptedValue {
+                    ty: DataType::Boolean,
+                    reason: "boolean byte must be 0 or 1",
+                },
+                "stored boolean value is corrupted: boolean byte must be 0 or 1",
             ),
             (
                 TypeError::TextOutOfRange {
@@ -250,7 +278,7 @@ mod tests {
                 "42804",
             ),
             (
-                TypeError::CorruptedText {
+                TypeError::CorruptedValue {
                     ty: varchar(3),
                     reason: "text is not valid UTF-8",
                 },
@@ -258,6 +286,20 @@ mod tests {
                 "XX001",
             ),
         ]
+    }
+
+    #[test]
+    fn not_boolean_should_name_the_operator_and_the_type() {
+        let err = TypeError::NotBoolean {
+            op: "AND",
+            actual: DataType::Integer,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "argument of AND must be type boolean, not type integer"
+        );
+        assert_eq!(err.sqlstate(), "42804");
     }
 
     #[test]

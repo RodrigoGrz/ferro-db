@@ -397,6 +397,21 @@ mod tests {
     }
 
     #[test]
+    fn boolean_columns_should_use_one_fixed_byte() {
+        let schema = Schema::new(vec![
+            Column::not_null("id", Integer),
+            Column::new("active", DataType::Boolean),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            schema.layout().columns(),
+            [ColumnLayout::Fixed(4), ColumnLayout::Fixed(1)]
+        );
+        assert_eq!(schema.min_row_size(), 2 + 1 + 4 + 1);
+    }
+
+    #[test]
     fn new_without_columns_should_fail() {
         assert_eq!(Schema::new(vec![]).unwrap_err(), SchemaError::NoColumns);
     }
@@ -803,7 +818,7 @@ mod tests {
             err,
             type_error(
                 "name",
-                TypeError::CorruptedText {
+                TypeError::CorruptedValue {
                     ty: varchar(5),
                     reason: "text is not valid UTF-8"
                 }
@@ -824,12 +839,61 @@ mod tests {
             err,
             type_error(
                 "name",
-                TypeError::CorruptedText {
+                TypeError::CorruptedValue {
                     ty: varchar(3),
                     reason: "text is longer than its column"
                 }
             )
         );
+    }
+
+    fn flags() -> Schema {
+        Schema::new(vec![
+            Column::not_null("id", Integer),
+            Column::new("active", DataType::Boolean),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn encode_row_should_round_trip_booleans() {
+        let schema = flags();
+
+        for active in [Value::Boolean(true), Value::Boolean(false), Value::Null] {
+            let row = [Value::Integer(1), active];
+
+            let tuple = schema.encode_row(&row).unwrap();
+
+            assert_eq!(schema.decode_row(&tuple).unwrap(), row);
+        }
+    }
+
+    #[test]
+    fn encode_row_across_families_with_booleans_should_be_a_datatype_mismatch() {
+        let schema = flags();
+        let cases = [
+            (
+                [Value::Boolean(true), Value::Null],
+                "id",
+                DataType::Boolean,
+                Integer,
+            ),
+            (
+                [Value::Integer(1), Value::Integer(1)],
+                "active",
+                Integer,
+                DataType::Boolean,
+            ),
+        ];
+
+        for (row, column, value, target) in cases {
+            let err = schema.encode_row(&row).unwrap_err();
+
+            assert_eq!(
+                err,
+                type_error(column, TypeError::DatatypeMismatch { value, target })
+            );
+        }
     }
 
     #[test]
@@ -1101,8 +1165,9 @@ mod tests {
 
     /// Integers of every width and short VARCHARs, so text hits its limit often.
     fn random_type(rng: &mut Rng) -> DataType {
-        match rng.below(4) {
+        match rng.below(5) {
             0 => varchar(1 + rng.below(8) as u16),
+            1 => DataType::Boolean,
             _ => INTEGERS[rng.below(3)],
         }
     }
@@ -1138,8 +1203,10 @@ mod tests {
         if rng.below(7) == 0 {
             return Value::Null;
         }
-        if rng.below(4) == 0 {
-            return Value::Text(random_text(rng));
+        match rng.below(5) {
+            0 => return Value::Text(random_text(rng)),
+            1 => return Value::Boolean(rng.below(2) == 0),
+            _ => {}
         }
         let raw = match rng.below(3) {
             0 => [
@@ -1168,7 +1235,7 @@ mod tests {
             Value::SmallInt(v) => v.into(),
             Value::Integer(v) => v.into(),
             Value::BigInt(v) => v.into(),
-            Value::Null | Value::Text(_) => unreachable!("integers only"),
+            Value::Null | Value::Text(_) | Value::Boolean(_) => unreachable!("integers only"),
         }
     }
 
@@ -1177,7 +1244,7 @@ mod tests {
             SmallInt => i16::try_from(number).ok().map(Value::SmallInt),
             Integer => i32::try_from(number).ok().map(Value::Integer),
             BigInt => i64::try_from(number).ok().map(Value::BigInt),
-            DataType::Varchar(_) => unreachable!("integer columns only"),
+            DataType::Varchar(_) | DataType::Boolean => unreachable!("integer columns only"),
         };
         fitted.ok_or_else(|| {
             type_error(
@@ -1230,7 +1297,11 @@ mod tests {
                         expected_text(column, text, usize::from(max_chars.get()))
                     }
                     (Value::Text(_), _) => mismatch(DataType::VARCHAR_MAX),
-                    (number, DataType::Varchar(_)) => mismatch(number.data_type().unwrap()),
+                    (Value::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(*value)),
+                    (Value::Boolean(_), _) => mismatch(DataType::Boolean),
+                    (number, DataType::Varchar(_) | DataType::Boolean) => {
+                        mismatch(number.data_type().unwrap())
+                    }
                     (number, _) => expected_integer(column, as_i128(number)),
                 }
             })
@@ -1284,6 +1355,7 @@ mod tests {
                             .take(usize::from(max_chars.get()))
                             .collect(),
                     ),
+                    DataType::Boolean => Value::Boolean(rng.below(2) == 0),
                     integer => Value::BigInt(rng.below(100) as i64).cast(integer).unwrap(),
                 },
             })

@@ -1,15 +1,17 @@
 //! Runtime values. A stored field is `Option<&[u8]>`, the contract of `TupleLayout::encode`
 //! and `TupleRef::field`: `None` is NULL (a bit in the tuple's NULL bitmap). `Some` holds
-//! an integer in two's complement, little-endian, `DataType::fixed_width` bytes, or a
-//! VARCHAR as its UTF-8 bytes; empty text is `Some(&[])`, never NULL.
+//! an integer in two's complement, little-endian, `DataType::fixed_width` bytes, a VARCHAR
+//! as its UTF-8 bytes (empty text is `Some(&[])`, never NULL), or a BOOLEAN as one byte,
+//! `0` or `1`.
 
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::{DataType, TypeError, integer, text};
+use super::{DataType, TypeError, boolean, integer, text};
 
 /// `PartialEq` is structural and meant for tests: `Null == Null` and
-/// `SmallInt(1) != BigInt(1)`. SQL equality is `compare`, which yields UNKNOWN for NULL.
+/// `SmallInt(1) != BigInt(1)`. SQL equality is `sql_eq` (or `compare`), which yields
+/// UNKNOWN for NULL.
 ///
 /// NULL carries no type: the type of an expression is decided statically from the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +22,7 @@ pub enum Value {
     BigInt(i64),
     /// A VARCHAR value. The limit `n` belongs to the column, not to the value.
     Text(String),
+    Boolean(bool),
 }
 
 impl Value {
@@ -34,6 +37,7 @@ impl Value {
             Value::Integer(_) => Some(DataType::Integer),
             Value::BigInt(_) => Some(DataType::BigInt),
             Value::Text(_) => Some(DataType::VARCHAR_MAX),
+            Value::Boolean(_) => Some(DataType::Boolean),
         }
     }
 
@@ -44,6 +48,7 @@ impl Value {
             Value::Integer(value) => Some(value.to_le_bytes().to_vec()),
             Value::BigInt(value) => Some(value.to_le_bytes().to_vec()),
             Value::Text(text) => Some(text.as_bytes().to_vec()),
+            Value::Boolean(value) => Some(vec![boolean::encode(*value)]),
         }
     }
 
@@ -64,6 +69,10 @@ impl Value {
             DataType::Integer => Value::Integer(i32::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::BigInt => Value::BigInt(i64::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::Varchar(max_chars) => text::decode(max_chars, bytes)?,
+            DataType::Boolean => {
+                let [byte] = fixed_width(ty, bytes)?;
+                boolean::decode(byte)?
+            }
         })
     }
 
@@ -73,6 +82,7 @@ impl Value {
     pub fn parse(ty: DataType, input: &str) -> Result<Value, TypeError> {
         match ty {
             DataType::Varchar(max_chars) => text::assign(max_chars, input),
+            DataType::Boolean => boolean::parse(input),
             integer => integer::parse(integer, input),
         }
     }
@@ -83,7 +93,7 @@ impl Value {
         let Some(ty) = self.data_type() else {
             return Ok(Value::Null);
         };
-        if ty.is_text() != target.is_text() {
+        if ty.family() != target.family() {
             return Err(TypeError::DatatypeMismatch { value: ty, target });
         }
         match (self, target) {
@@ -92,13 +102,15 @@ impl Value {
         }
     }
 
-    /// Explicit `CAST`: integers and text convert both ways, and text longer than the
-    /// target VARCHAR(n) is cut, whatever the excess holds.
+    /// Explicit `CAST`: every pair of types converts. Text longer than the target VARCHAR(n)
+    /// is cut, whatever the excess holds; only `0`/`1` and `'true'`/`'false'`/`'1'`/`'0'`
+    /// become booleans.
     pub fn cast(&self, target: DataType) -> Result<Value, TypeError> {
         let Some(operand) = self.operand() else {
             return Ok(Value::Null);
         };
         match (operand, target) {
+            (Operand::Integer(_, value), DataType::Boolean) => boolean::from_integer(value),
             (Operand::Integer(_, value), DataType::Varchar(max_chars)) => {
                 Ok(text::truncate(max_chars, &value.to_string()))
             }
@@ -108,7 +120,14 @@ impl Value {
             (Operand::Text(text), DataType::Varchar(max_chars)) => {
                 Ok(text::truncate(max_chars, text))
             }
+            (Operand::Text(text), DataType::Boolean) => boolean::parse(text),
             (Operand::Text(text), integer) => integer::parse(integer, text),
+            (Operand::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(value)),
+            (Operand::Boolean(value), DataType::Varchar(max_chars)) => {
+                Ok(text::truncate(max_chars, boolean::literal(value)))
+            }
+            (Operand::Boolean(value), integer) => integer::narrow(integer, i64::from(value))
+                .ok_or(TypeError::OutOfRange { ty: integer }),
         }
     }
 
@@ -145,10 +164,10 @@ impl Value {
         match self.operand() {
             None => Ok(Value::Null),
             Some(Operand::Integer(ty, value)) => integer::neg(ty, value),
-            Some(text) => Err(TypeError::UndefinedOperator {
+            Some(other) => Err(TypeError::UndefinedOperator {
                 op: "-",
                 left: None,
-                right: text.data_type(),
+                right: other.data_type(),
             }),
         }
     }
@@ -180,6 +199,86 @@ impl Value {
         }
     }
 
+    pub fn sql_eq(&self, rhs: &Value) -> Result<Value, TypeError> {
+        self.sql_comparison(rhs, "=", Ordering::is_eq)
+    }
+
+    pub fn sql_ne(&self, rhs: &Value) -> Result<Value, TypeError> {
+        self.sql_comparison(rhs, "<>", Ordering::is_ne)
+    }
+
+    pub fn sql_lt(&self, rhs: &Value) -> Result<Value, TypeError> {
+        self.sql_comparison(rhs, "<", Ordering::is_lt)
+    }
+
+    pub fn sql_le(&self, rhs: &Value) -> Result<Value, TypeError> {
+        self.sql_comparison(rhs, "<=", Ordering::is_le)
+    }
+
+    pub fn sql_gt(&self, rhs: &Value) -> Result<Value, TypeError> {
+        self.sql_comparison(rhs, ">", Ordering::is_gt)
+    }
+
+    pub fn sql_ge(&self, rhs: &Value) -> Result<Value, TypeError> {
+        self.sql_comparison(rhs, ">=", Ordering::is_ge)
+    }
+
+    /// A comparison as a SQL value: `Boolean`, or `Null` (UNKNOWN) when a side is NULL. The
+    /// error across families names the operator actually used.
+    fn sql_comparison(
+        &self,
+        rhs: &Value,
+        op: &'static str,
+        holds: fn(Ordering) -> bool,
+    ) -> Result<Value, TypeError> {
+        match (self.operand(), rhs.operand()) {
+            (Some(lhs), Some(rhs)) => Ok(Value::Boolean(holds(lhs.compare(&rhs, op)?))),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    /// `AND` is not strict: `FALSE AND NULL` is FALSE. Both operands are type-checked first,
+    /// so a non-boolean fails even when the other side alone would decide the result.
+    pub fn and(&self, rhs: &Value) -> Result<Value, TypeError> {
+        let (lhs, rhs) = (self.truth("AND")?, rhs.truth("AND")?);
+        Ok(from_truth(boolean::and(lhs, rhs)))
+    }
+
+    /// `OR` is not strict: `TRUE OR NULL` is TRUE.
+    pub fn or(&self, rhs: &Value) -> Result<Value, TypeError> {
+        let (lhs, rhs) = (self.truth("OR")?, rhs.truth("OR")?);
+        Ok(from_truth(boolean::or(lhs, rhs)))
+    }
+
+    pub fn not(&self) -> Result<Value, TypeError> {
+        Ok(from_truth(self.truth("NOT")?.map(|value| !value)))
+    }
+
+    /// `IS TRUE`: never UNKNOWN, so it is what a `WHERE` filter keeps.
+    pub fn is_true(&self) -> Result<bool, TypeError> {
+        Ok(self.truth("IS TRUE")? == Some(true))
+    }
+
+    pub fn is_false(&self) -> Result<bool, TypeError> {
+        Ok(self.truth("IS FALSE")? == Some(false))
+    }
+
+    pub fn is_unknown(&self) -> Result<bool, TypeError> {
+        Ok(self.truth("IS UNKNOWN")?.is_none())
+    }
+
+    /// The truth value of a logical operand; NULL is UNKNOWN (`None`).
+    fn truth(&self, op: &'static str) -> Result<Option<bool>, TypeError> {
+        match self.operand() {
+            None => Ok(None),
+            Some(Operand::Boolean(value)) => Ok(Some(value)),
+            Some(other) => Err(TypeError::NotBoolean {
+                op,
+                actual: other.data_type(),
+            }),
+        }
+    }
+
     /// `IS DISTINCT FROM`: NULL equals NULL and differs from every value; never UNKNOWN.
     pub fn is_distinct_from(&self, rhs: &Value) -> Result<bool, TypeError> {
         match (self.operand(), rhs.operand()) {
@@ -189,8 +288,8 @@ impl Value {
     }
 
     /// Total order for `ORDER BY` and indexes. `compare` is not one because of UNKNOWN and
-    /// of the families it refuses to mix; here integers sort before text and NULL after
-    /// every value (`NULLS LAST` for `ASC`).
+    /// of the families it refuses to mix; here integers sort before text, text before
+    /// booleans, and NULL after every value (`NULLS LAST` for `ASC`).
     pub fn sort_cmp(&self, rhs: &Value) -> Ordering {
         match (self.operand(), rhs.operand()) {
             (Some(lhs), Some(rhs)) => lhs.sort_cmp(&rhs),
@@ -208,6 +307,7 @@ impl Value {
             Value::Integer(value) => Some(Operand::Integer(DataType::Integer, (*value).into())),
             Value::BigInt(value) => Some(Operand::Integer(DataType::BigInt, *value)),
             Value::Text(text) => Some(Operand::Text(text)),
+            Value::Boolean(value) => Some(Operand::Boolean(*value)),
         }
     }
 }
@@ -217,6 +317,7 @@ impl Value {
 enum Operand<'a> {
     Integer(DataType, i64),
     Text(&'a str),
+    Boolean(bool),
 }
 
 impl Operand<'_> {
@@ -224,26 +325,32 @@ impl Operand<'_> {
         match self {
             Operand::Integer(ty, _) => *ty,
             Operand::Text(_) => DataType::VARCHAR_MAX,
+            Operand::Boolean(_) => DataType::Boolean,
         }
     }
 
     fn compare(&self, rhs: &Operand, op: &'static str) -> Result<Ordering, TypeError> {
-        if self.data_type().is_text() != rhs.data_type().is_text() {
+        if self.data_type().family() != rhs.data_type().family() {
             return Err(undefined_operator(op, self, rhs));
         }
         Ok(self.sort_cmp(rhs))
     }
 
-    /// `str` orders by its UTF-8 bytes, which is also code point order. A column never
-    /// mixes families; putting integers first only makes the order total.
+    /// `str` orders by its UTF-8 bytes, which is also code point order, and `bool` puts
+    /// FALSE before TRUE. A column never mixes families; ordering them (integers, text,
+    /// booleans) only makes the order total.
     fn sort_cmp(&self, rhs: &Operand) -> Ordering {
         match (self, rhs) {
             (Operand::Integer(_, lhs), Operand::Integer(_, rhs)) => lhs.cmp(rhs),
             (Operand::Text(lhs), Operand::Text(rhs)) => lhs.cmp(rhs),
-            (Operand::Integer(..), Operand::Text(_)) => Ordering::Less,
-            (Operand::Text(_), Operand::Integer(..)) => Ordering::Greater,
+            (Operand::Boolean(lhs), Operand::Boolean(rhs)) => lhs.cmp(rhs),
+            _ => self.data_type().family().cmp(&rhs.data_type().family()),
         }
     }
+}
+
+fn from_truth(truth: Option<bool>) -> Value {
+    truth.map_or(Value::Null, Value::Boolean)
 }
 
 fn undefined_operator(op: &'static str, lhs: &Operand, rhs: &Operand) -> TypeError {
@@ -262,6 +369,7 @@ impl fmt::Display for Value {
             Value::Integer(value) => write!(f, "{value}"),
             Value::BigInt(value) => write!(f, "{value}"),
             Value::Text(text) => f.write_str(text),
+            Value::Boolean(value) => f.write_str(boolean::literal(*value)),
         }
     }
 }
@@ -495,7 +603,7 @@ mod tests {
     }
 
     fn corrupted(max_chars: u16, reason: &'static str) -> TypeError {
-        TypeError::CorruptedText {
+        TypeError::CorruptedValue {
             ty: varchar(max_chars),
             reason,
         }
@@ -915,6 +1023,538 @@ mod tests {
     }
 
     #[test]
+    fn boolean_should_have_the_boolean_type() {
+        assert_eq!(Value::Boolean(true).data_type(), Some(DataType::Boolean));
+        assert!(!Value::Boolean(false).is_null());
+    }
+
+    #[test]
+    fn encode_of_boolean_should_be_one_byte_0_or_1() {
+        assert_eq!(Value::Boolean(false).encode().unwrap(), [0]);
+        assert_eq!(Value::Boolean(true).encode().unwrap(), [1]);
+    }
+
+    #[test]
+    fn decode_should_round_trip_booleans() {
+        for value in [Value::Boolean(false), Value::Boolean(true)] {
+            let decoded = Value::decode(DataType::Boolean, value.encode().as_deref()).unwrap();
+
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn decode_of_a_boolean_byte_other_than_0_or_1_should_be_corrupted() {
+        for byte in [2, 0x80, 0xFF] {
+            let err = Value::decode(DataType::Boolean, Some(&[byte])).unwrap_err();
+
+            assert_eq!(
+                err,
+                TypeError::CorruptedValue {
+                    ty: DataType::Boolean,
+                    reason: "boolean byte must be 0 or 1"
+                },
+                "{byte}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_a_boolean_with_the_wrong_width_should_fail() {
+        for bytes in [&[][..], &[0, 1]] {
+            let err = Value::decode(DataType::Boolean, Some(bytes)).unwrap_err();
+
+            assert_eq!(
+                err,
+                TypeError::InvalidEncoding {
+                    ty: DataType::Boolean,
+                    expected: 1,
+                    actual: bytes.len()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_boolean_should_accept_true_and_false_in_any_case() {
+        let cases = [
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("tRuE", true),
+            ("false", false),
+            ("FALSE", false),
+            (
+                "  false	
+",
+                false,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                Value::parse(DataType::Boolean, input),
+                Ok(Value::Boolean(expected)),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_boolean_should_accept_1_and_0() {
+        assert_eq!(
+            Value::parse(DataType::Boolean, "1"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            Value::parse(DataType::Boolean, " 0 "),
+            Ok(Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn parse_of_boolean_should_reject_anything_else() {
+        let cases = [
+            "",
+            " ",
+            "t",
+            "f",
+            "yes",
+            "no",
+            "on",
+            "off",
+            "2",
+            "01",
+            "+1",
+            "-0",
+            "1.0",
+            "unknown",
+            "NULL",
+            "true false",
+            "truee",
+            "verdadeiro",
+        ];
+
+        for input in cases {
+            assert_eq!(
+                Value::parse(DataType::Boolean, input),
+                Err(invalid_text(DataType::Boolean, input)),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_of_boolean_should_be_the_sql_literal() {
+        assert_eq!(Value::Boolean(true).to_string(), "TRUE");
+        assert_eq!(Value::Boolean(false).to_string(), "FALSE");
+    }
+
+    fn boolean_out_of_range() -> TypeError {
+        TypeError::OutOfRange {
+            ty: DataType::Boolean,
+        }
+    }
+
+    #[test]
+    fn cast_of_0_and_1_to_boolean_should_work_for_every_integer_width() {
+        for (zero, one) in [
+            (Value::SmallInt(0), Value::SmallInt(1)),
+            (Value::Integer(0), Value::Integer(1)),
+            (Value::BigInt(0), Value::BigInt(1)),
+        ] {
+            assert_eq!(zero.cast(DataType::Boolean), Ok(Value::Boolean(false)));
+            assert_eq!(one.cast(DataType::Boolean), Ok(Value::Boolean(true)));
+        }
+    }
+
+    #[test]
+    fn cast_of_other_integers_to_boolean_should_be_out_of_range() {
+        let cases = [
+            Value::SmallInt(-1),
+            Value::SmallInt(2),
+            Value::SmallInt(i16::MIN),
+            Value::Integer(i32::MAX),
+            Value::BigInt(i64::MIN),
+            Value::BigInt(10),
+        ];
+
+        for value in cases {
+            assert_eq!(
+                value.cast(DataType::Boolean),
+                Err(boolean_out_of_range()),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_of_boolean_to_an_integer_should_be_0_or_1() {
+        assert_eq!(Value::Boolean(false).cast(SmallInt), Ok(Value::SmallInt(0)));
+        assert_eq!(Value::Boolean(true).cast(Integer), Ok(Value::Integer(1)));
+        assert_eq!(Value::Boolean(true).cast(BigInt), Ok(Value::BigInt(1)));
+    }
+
+    #[test]
+    fn cast_of_text_to_boolean_should_follow_the_input_rules() {
+        assert_eq!(
+            text("TRUE").cast(DataType::Boolean),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            text(" 0 ").cast(DataType::Boolean),
+            Ok(Value::Boolean(false))
+        );
+        assert_eq!(
+            text("yes").cast(DataType::Boolean),
+            Err(invalid_text(DataType::Boolean, "yes"))
+        );
+    }
+
+    #[test]
+    fn cast_of_boolean_to_varchar_should_be_the_sql_literal_cut_to_n() {
+        let cases = [
+            (true, DataType::VARCHAR_MAX, "TRUE"),
+            (false, DataType::VARCHAR_MAX, "FALSE"),
+            (true, varchar(1), "T"),
+            (false, varchar(4), "FALS"),
+            (false, varchar(5), "FALSE"),
+        ];
+
+        for (value, target, expected) in cases {
+            assert_eq!(Value::Boolean(value).cast(target), Ok(text(expected)));
+        }
+    }
+
+    #[test]
+    fn cast_of_boolean_to_boolean_should_be_identity() {
+        for value in [false, true] {
+            assert_eq!(
+                Value::Boolean(value).cast(DataType::Boolean),
+                Ok(Value::Boolean(value))
+            );
+        }
+        assert_eq!(Value::Null.cast(DataType::Boolean), Ok(Value::Null));
+    }
+
+    #[test]
+    fn assign_of_boolean_should_stay_within_its_family() {
+        let mismatch = |value, target| Err(TypeError::DatatypeMismatch { value, target });
+
+        assert_eq!(
+            Value::Boolean(true).assign(DataType::Boolean),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(Value::Null.assign(DataType::Boolean), Ok(Value::Null));
+        assert_eq!(
+            Value::Boolean(true).assign(Integer),
+            mismatch(DataType::Boolean, Integer)
+        );
+        assert_eq!(
+            Value::Integer(1).assign(DataType::Boolean),
+            mismatch(Integer, DataType::Boolean)
+        );
+        assert_eq!(
+            Value::Boolean(false).assign(varchar(5)),
+            mismatch(DataType::Boolean, varchar(5))
+        );
+        assert_eq!(
+            text("true").assign(DataType::Boolean),
+            mismatch(DataType::VARCHAR_MAX, DataType::Boolean)
+        );
+    }
+
+    /// TRUE, FALSE and UNKNOWN, in the order of the truth tables below.
+    const TRUTH_VALUES: [Value; 3] = [Value::Boolean(true), Value::Boolean(false), Value::Null];
+
+    fn truth(value: Option<bool>) -> Value {
+        value.map_or(Value::Null, Value::Boolean)
+    }
+
+    fn not_boolean(op: &'static str, actual: DataType) -> TypeError {
+        TypeError::NotBoolean { op, actual }
+    }
+
+    #[test]
+    fn and_should_follow_the_three_valued_truth_table() {
+        let (t, f, n) = (Some(true), Some(false), None);
+        let table = [[t, f, n], [f, f, f], [n, f, n]];
+
+        for (lhs, row) in TRUTH_VALUES.iter().zip(table) {
+            for (rhs, expected) in TRUTH_VALUES.iter().zip(row) {
+                assert_eq!(lhs.and(rhs), Ok(truth(expected)), "{lhs} AND {rhs}");
+            }
+        }
+    }
+
+    #[test]
+    fn or_should_follow_the_three_valued_truth_table() {
+        let (t, f, n) = (Some(true), Some(false), None);
+        let table = [[t, t, t], [t, f, n], [t, n, n]];
+
+        for (lhs, row) in TRUTH_VALUES.iter().zip(table) {
+            for (rhs, expected) in TRUTH_VALUES.iter().zip(row) {
+                assert_eq!(lhs.or(rhs), Ok(truth(expected)), "{lhs} OR {rhs}");
+            }
+        }
+    }
+
+    #[test]
+    fn not_should_flip_true_and_false_and_keep_unknown() {
+        assert_eq!(Value::Boolean(true).not(), Ok(Value::Boolean(false)));
+        assert_eq!(Value::Boolean(false).not(), Ok(Value::Boolean(true)));
+        assert_eq!(Value::Null.not(), Ok(Value::Null));
+    }
+
+    #[test]
+    fn logical_operators_with_a_non_boolean_should_fail_even_if_the_other_side_decides() {
+        assert_eq!(
+            Value::Boolean(false).and(&Value::Integer(0)),
+            Err(not_boolean("AND", Integer))
+        );
+        assert_eq!(
+            text("x").and(&Value::Null),
+            Err(not_boolean("AND", DataType::VARCHAR_MAX))
+        );
+        assert_eq!(
+            Value::BigInt(1).or(&Value::Boolean(true)),
+            Err(not_boolean("OR", BigInt))
+        );
+        assert_eq!(Value::SmallInt(0).not(), Err(not_boolean("NOT", SmallInt)));
+    }
+
+    #[test]
+    fn boolean_tests_should_never_be_unknown() {
+        let expected = [
+            (Value::Boolean(true), [true, false, false]),
+            (Value::Boolean(false), [false, true, false]),
+            (Value::Null, [false, false, true]),
+        ];
+
+        for (value, [is_true, is_false, is_unknown]) in expected {
+            assert_eq!(value.is_true(), Ok(is_true), "{value} IS TRUE");
+            assert_eq!(value.is_false(), Ok(is_false), "{value} IS FALSE");
+            assert_eq!(value.is_unknown(), Ok(is_unknown), "{value} IS UNKNOWN");
+        }
+    }
+
+    #[test]
+    fn boolean_tests_of_a_non_boolean_should_fail() {
+        assert_eq!(
+            Value::Integer(1).is_true(),
+            Err(not_boolean("IS TRUE", Integer))
+        );
+        assert_eq!(
+            text("false").is_false(),
+            Err(not_boolean("IS FALSE", DataType::VARCHAR_MAX))
+        );
+        assert_eq!(
+            Value::BigInt(0).is_unknown(),
+            Err(not_boolean("IS UNKNOWN", BigInt))
+        );
+    }
+
+    #[test]
+    fn arithmetic_with_booleans_should_be_an_undefined_operator() {
+        let (yes, one) = (Value::Boolean(true), Value::Integer(1));
+
+        for (name, op) in BINARY_OPS {
+            assert_eq!(
+                op(&yes, &one),
+                Err(undefined(name, Some(DataType::Boolean), Integer))
+            );
+            assert_eq!(
+                op(&yes, &yes),
+                Err(undefined(name, Some(DataType::Boolean), DataType::Boolean))
+            );
+        }
+        assert_eq!(yes.neg(), Err(undefined("-", None, DataType::Boolean)));
+        assert_eq!(
+            yes.neg().unwrap_err().to_string(),
+            "operator does not exist: - boolean"
+        );
+    }
+
+    #[test]
+    fn concat_with_a_boolean_should_be_an_undefined_operator() {
+        let yes = Value::Boolean(true);
+
+        assert_eq!(
+            text("a").concat(&yes),
+            Err(undefined(
+                "||",
+                Some(DataType::VARCHAR_MAX),
+                DataType::Boolean
+            ))
+        );
+        assert_eq!(
+            yes.concat(&yes),
+            Err(undefined("||", Some(DataType::Boolean), DataType::Boolean))
+        );
+    }
+
+    #[test]
+    fn logical_operators_with_null_and_a_non_boolean_should_fail() {
+        assert_eq!(
+            Value::Null.and(&Value::Integer(1)),
+            Err(not_boolean("AND", Integer))
+        );
+        assert_eq!(
+            Value::Integer(1).or(&Value::Null),
+            Err(not_boolean("OR", Integer))
+        );
+        assert_eq!(
+            Value::Null.or(&text("true")),
+            Err(not_boolean("OR", DataType::VARCHAR_MAX))
+        );
+    }
+
+    type SqlComparison = fn(&Value, &Value) -> Result<Value, TypeError>;
+
+    /// Each operator with the orderings for which it holds.
+    const SQL_COMPARISONS: [(&str, SqlComparison, [bool; 3]); 6] = [
+        ("=", Value::sql_eq, [false, true, false]),
+        ("<>", Value::sql_ne, [true, false, true]),
+        ("<", Value::sql_lt, [true, false, false]),
+        ("<=", Value::sql_le, [true, true, false]),
+        (">", Value::sql_gt, [false, false, true]),
+        (">=", Value::sql_ge, [false, true, true]),
+    ];
+
+    fn holds(expected: [bool; 3], ordering: Ordering) -> bool {
+        match ordering {
+            Ordering::Less => expected[0],
+            Ordering::Equal => expected[1],
+            Ordering::Greater => expected[2],
+        }
+    }
+
+    #[test]
+    fn compare_of_booleans_should_put_false_before_true() {
+        let (no, yes) = (Value::Boolean(false), Value::Boolean(true));
+
+        assert_eq!(no.compare(&yes), Ok(Some(Ordering::Less)));
+        assert_eq!(yes.compare(&yes), Ok(Some(Ordering::Equal)));
+        assert_eq!(yes.compare(&no), Ok(Some(Ordering::Greater)));
+    }
+
+    #[test]
+    fn compare_of_a_boolean_with_another_family_should_be_an_undefined_operator() {
+        assert_eq!(
+            Value::Boolean(true).compare(&Value::Integer(1)),
+            Err(undefined("=", Some(DataType::Boolean), Integer))
+        );
+        assert_eq!(
+            text("true").compare(&Value::Boolean(true)),
+            Err(undefined(
+                "=",
+                Some(DataType::VARCHAR_MAX),
+                DataType::Boolean
+            ))
+        );
+    }
+
+    #[test]
+    fn sql_comparisons_should_return_sql_booleans() {
+        let pairs = [
+            (Value::Integer(1), Value::BigInt(2), Ordering::Less),
+            (Value::SmallInt(5), Value::Integer(5), Ordering::Equal),
+            (text("b"), text("a"), Ordering::Greater),
+            (text("a"), text("a "), Ordering::Less),
+            (Value::Boolean(false), Value::Boolean(true), Ordering::Less),
+            (Value::Boolean(true), Value::Boolean(true), Ordering::Equal),
+        ];
+
+        for (lhs, rhs, ordering) in pairs {
+            for (name, op, expected) in SQL_COMPARISONS {
+                assert_eq!(
+                    op(&lhs, &rhs),
+                    Ok(Value::Boolean(holds(expected, ordering))),
+                    "{lhs:?} {name} {rhs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sql_comparisons_with_null_should_be_unknown() {
+        for (name, op, _) in SQL_COMPARISONS {
+            for value in [
+                Value::Integer(1),
+                text(""),
+                Value::Boolean(false),
+                Value::Null,
+            ] {
+                assert_eq!(
+                    op(&value, &Value::Null),
+                    Ok(Value::Null),
+                    "{value:?} {name}"
+                );
+                assert_eq!(
+                    op(&Value::Null, &value),
+                    Ok(Value::Null),
+                    "{name} {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sql_comparisons_across_families_should_name_the_operator() {
+        for (name, op, _) in SQL_COMPARISONS {
+            assert_eq!(
+                op(&Value::Integer(1), &text("1")),
+                Err(undefined(name, Some(Integer), DataType::VARCHAR_MAX))
+            );
+            assert_eq!(
+                op(&Value::Boolean(true), &Value::SmallInt(1)),
+                Err(undefined(name, Some(DataType::Boolean), SmallInt))
+            );
+        }
+    }
+
+    #[test]
+    fn is_distinct_from_should_compare_booleans() {
+        let cases = [
+            (Value::Boolean(true), Value::Boolean(true), false),
+            (Value::Boolean(true), Value::Boolean(false), true),
+            (Value::Boolean(false), Value::Null, true),
+        ];
+
+        for (lhs, rhs, is_distinct) in cases {
+            assert_eq!(
+                lhs.is_distinct_from(&rhs),
+                Ok(is_distinct),
+                "{lhs:?}, {rhs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_cmp_should_order_integers_then_text_then_booleans_then_null() {
+        let mut values = vec![
+            Value::Null,
+            Value::Boolean(true),
+            text("a"),
+            Value::Boolean(false),
+            Value::Integer(7),
+        ];
+
+        values.sort_by(Value::sort_cmp);
+
+        assert_eq!(
+            values,
+            [
+                Value::Integer(7),
+                text("a"),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Null,
+            ]
+        );
+    }
+
+    #[test]
     fn display_of_text_should_print_it_unquoted() {
         assert_eq!(text("ação 🦀").to_string(), "ação 🦀");
         assert_eq!(text("").to_string(), "");
@@ -1316,7 +1956,7 @@ mod tests {
             Value::SmallInt(v) => Some(v.into()),
             Value::Integer(v) => Some(v.into()),
             Value::BigInt(v) => Some(v.into()),
-            Value::Text(_) => unreachable!("integer model only"),
+            Value::Text(_) | Value::Boolean(_) => unreachable!("integer model only"),
         }
     }
 
@@ -1326,7 +1966,7 @@ mod tests {
             SmallInt => Value::SmallInt(i16::try_from(value).map_err(out_of_range)?),
             Integer => Value::Integer(i32::try_from(value).map_err(out_of_range)?),
             BigInt => Value::BigInt(i64::try_from(value).map_err(out_of_range)?),
-            DataType::Varchar(_) => unreachable!("integer model only"),
+            DataType::Varchar(_) | DataType::Boolean => unreachable!("integer model only"),
         })
     }
 
@@ -1459,15 +2099,116 @@ mod tests {
         }
     }
 
+    /// Integers (with NULL), text and booleans, so operators meet every family pair.
+    fn random_mixed_value(rng: &mut Rng) -> Value {
+        match rng.below(5) {
+            0 => text(&random_text(rng)),
+            1 => Value::Boolean(rng.below(2) == 0),
+            _ => random_value(rng),
+        }
+    }
+
+    fn random_truth(rng: &mut Rng) -> Value {
+        TRUTH_VALUES[rng.below(TRUTH_VALUES.len())].clone()
+    }
+
+    /// Kleene's logic as an order FALSE < UNKNOWN < TRUE: AND is the minimum, OR the maximum
+    /// and NOT the mirror. Independent of the `match` tables in `boolean.rs`.
+    fn kleene_rank(value: &Value) -> u8 {
+        match value {
+            Value::Boolean(false) => 0,
+            Value::Null => 1,
+            Value::Boolean(true) => 2,
+            other => unreachable!("not a truth value: {other:?}"),
+        }
+    }
+
+    fn from_kleene_rank(rank: u8) -> Value {
+        [Value::Boolean(false), Value::Null, Value::Boolean(true)][usize::from(rank)].clone()
+    }
+
+    #[test]
+    fn random_logic_should_match_the_kleene_order_model() {
+        let mut rng = Rng(0x3C6E_F372_FE94_F82B);
+
+        for _ in 0..10_000 {
+            let (a, b) = (random_truth(&mut rng), random_truth(&mut rng));
+            let (rank_a, rank_b) = (kleene_rank(&a), kleene_rank(&b));
+
+            assert_eq!(
+                a.and(&b),
+                Ok(from_kleene_rank(rank_a.min(rank_b))),
+                "{a} AND {b}"
+            );
+            assert_eq!(
+                a.or(&b),
+                Ok(from_kleene_rank(rank_a.max(rank_b))),
+                "{a} OR {b}"
+            );
+            assert_eq!(a.not(), Ok(from_kleene_rank(2 - rank_a)), "NOT {a}");
+            assert_eq!(a.and(&b), b.and(&a));
+            assert_eq!(a.or(&b), b.or(&a));
+            assert_eq!(a.not().unwrap().not(), Ok(a.clone()));
+            assert_eq!(
+                a.and(&b).unwrap().not(),
+                a.not().unwrap().or(&b.not().unwrap())
+            );
+            let tests = [a.is_true(), a.is_false(), a.is_unknown()];
+            assert_eq!(tests.iter().filter(|test| **test == Ok(true)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn random_sql_comparisons_should_agree_with_compare() {
+        let mut rng = Rng(0xBB67_AE85_84CA_A73B);
+
+        for _ in 0..10_000 {
+            let (lhs, rhs) = (random_mixed_value(&mut rng), random_mixed_value(&mut rng));
+            let (name, op, expected) = SQL_COMPARISONS[rng.below(SQL_COMPARISONS.len())];
+
+            let result = op(&lhs, &rhs);
+
+            let expected = match lhs.compare(&rhs) {
+                Ok(Some(ordering)) => Ok(Value::Boolean(holds(expected, ordering))),
+                Ok(None) => Ok(Value::Null),
+                Err(TypeError::UndefinedOperator { left, right, .. }) => {
+                    Err(TypeError::UndefinedOperator {
+                        op: name,
+                        left,
+                        right,
+                    })
+                }
+                Err(other) => panic!("unexpected compare error {other:?}"),
+            };
+            assert_eq!(result, expected, "{lhs:?} {name} {rhs:?}");
+        }
+    }
+
+    #[test]
+    fn booleans_should_round_trip_through_bytes_text_and_integers() {
+        for value in [Value::Boolean(false), Value::Boolean(true)] {
+            assert_eq!(
+                Value::decode(DataType::Boolean, value.encode().as_deref()).as_ref(),
+                Ok(&value)
+            );
+            assert_eq!(
+                Value::parse(DataType::Boolean, &value.to_string()).as_ref(),
+                Ok(&value)
+            );
+            for width in [SmallInt, Integer, BigInt] {
+                let number = value.cast(width).unwrap();
+
+                assert_eq!(number.cast(DataType::Boolean).as_ref(), Ok(&value));
+            }
+        }
+    }
+
     #[test]
     fn sort_cmp_should_be_a_total_order() {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
 
         for _ in 0..10_000 {
-            let [a, b, c] = [(); 3].map(|_| match rng.below(4) {
-                0 => text(&random_text(&mut rng)),
-                _ => random_value(&mut rng),
-            });
+            let [a, b, c] = [(); 3].map(|_| random_mixed_value(&mut rng));
 
             assert_eq!(a.sort_cmp(&a), Ordering::Equal);
             assert_eq!(a.sort_cmp(&b), b.sort_cmp(&a).reverse());
