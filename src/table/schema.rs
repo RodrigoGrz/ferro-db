@@ -338,7 +338,7 @@ fn check_column_names(columns: &[Column]) -> Result<(), SchemaError> {
 mod tests {
     use super::*;
     use crate::storage::tuple::{ColumnLayout, MAX_TUPLE_SIZE};
-    use crate::types::{Finite32, Finite64};
+    use crate::types::{Date, Finite32, Finite64};
     use DataType::{BigInt, Integer, SmallInt};
 
     fn people() -> Schema {
@@ -410,6 +410,13 @@ mod tests {
             [ColumnLayout::Fixed(4), ColumnLayout::Fixed(1)]
         );
         assert_eq!(schema.min_row_size(), 2 + 1 + 4 + 1);
+    }
+
+    #[test]
+    fn date_columns_should_use_four_fixed_bytes() {
+        let schema = Schema::new(vec![Column::new("born", DataType::Date)]).unwrap();
+
+        assert_eq!(schema.layout().columns(), [ColumnLayout::Fixed(4)]);
     }
 
     #[test]
@@ -953,6 +960,64 @@ mod tests {
         assert_eq!(err.sqlstate(), "42804");
     }
 
+    fn birthdays() -> Schema {
+        Schema::new(vec![
+            Column::not_null("name", varchar(10)),
+            Column::new("born", DataType::Date),
+        ])
+        .unwrap()
+    }
+
+    fn day(year: i32, month: u32, day: u32) -> Value {
+        Value::Date(crate::types::Date::from_ymd(year, month, day).unwrap())
+    }
+
+    #[test]
+    fn encode_row_should_round_trip_dates() {
+        let schema = birthdays();
+
+        for born in [
+            day(1, 1, 1),
+            day(2024, 2, 29),
+            day(9999, 12, 31),
+            Value::Null,
+        ] {
+            let row = [text("ana"), born];
+
+            let tuple = schema.encode_row(&row).unwrap();
+
+            assert_eq!(schema.decode_row(&tuple).unwrap(), row);
+        }
+    }
+
+    #[test]
+    fn encode_row_across_families_with_dates_should_be_a_datatype_mismatch() {
+        let schema = birthdays();
+        let cases = [
+            (
+                [day(2024, 1, 1), Value::Null],
+                "name",
+                DataType::Date,
+                varchar(10),
+            ),
+            (
+                [text("ana"), text("2024-01-01")],
+                "born",
+                DataType::VARCHAR_MAX,
+                DataType::Date,
+            ),
+        ];
+
+        for (row, column, value, target) in cases {
+            let err = schema.encode_row(&row).unwrap_err();
+
+            assert_eq!(
+                err,
+                type_error(column, TypeError::DatatypeMismatch { value, target })
+            );
+        }
+    }
+
     #[test]
     fn encode_row_across_type_families_should_be_a_datatype_mismatch() {
         let schema = profiles();
@@ -1222,13 +1287,19 @@ mod tests {
 
     /// Integers of every width and short VARCHARs, so text hits its limit often.
     fn random_type(rng: &mut Rng) -> DataType {
-        match rng.below(7) {
+        match rng.below(8) {
             0 => varchar(1 + rng.below(8) as u16),
             1 => DataType::Boolean,
             2 => DataType::Real,
             3 => DataType::Double,
+            4 => DataType::Date,
             _ => INTEGERS[rng.below(3)],
         }
+    }
+
+    fn random_date(rng: &mut Rng) -> Value {
+        let days = i32::try_from(rng.below(20_000)).unwrap() - 10_000;
+        Value::Date(Date::from_days_since_epoch(days).unwrap())
     }
 
     /// REAL or DOUBLE PRECISION near the limits where narrowing to REAL fails, or from
@@ -1277,10 +1348,11 @@ mod tests {
         if rng.below(7) == 0 {
             return Value::Null;
         }
-        match rng.below(6) {
+        match rng.below(7) {
             0 => return Value::Text(random_text(rng)),
             1 => return Value::Boolean(rng.below(2) == 0),
             2 => return random_float(rng),
+            3 => return random_date(rng),
             _ => {}
         }
         let raw = match rng.below(3) {
@@ -1314,7 +1386,8 @@ mod tests {
             | Value::Real(_)
             | Value::Double(_)
             | Value::Text(_)
-            | Value::Boolean(_) => unreachable!("integers only"),
+            | Value::Boolean(_)
+            | Value::Date(_) => unreachable!("integers only"),
         }
     }
 
@@ -1323,9 +1396,11 @@ mod tests {
             SmallInt => i16::try_from(number).ok().map(Value::SmallInt),
             Integer => i32::try_from(number).ok().map(Value::Integer),
             BigInt => i64::try_from(number).ok().map(Value::BigInt),
-            DataType::Real | DataType::Double | DataType::Varchar(_) | DataType::Boolean => {
-                unreachable!("integer columns only")
-            }
+            DataType::Real
+            | DataType::Double
+            | DataType::Varchar(_)
+            | DataType::Boolean
+            | DataType::Date => unreachable!("integer columns only"),
         };
         fitted.ok_or_else(|| {
             type_error(
@@ -1413,7 +1488,9 @@ mod tests {
                     (Value::Text(_), _) => mismatch(DataType::VARCHAR_MAX),
                     (Value::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(*value)),
                     (Value::Boolean(_), _) => mismatch(DataType::Boolean),
-                    (number, DataType::Varchar(_) | DataType::Boolean) => {
+                    (Value::Date(day), DataType::Date) => Ok(Value::Date(*day)),
+                    (Value::Date(_), _) => mismatch(DataType::Date),
+                    (number, DataType::Varchar(_) | DataType::Boolean | DataType::Date) => {
                         mismatch(number.data_type().unwrap())
                     }
                     (number, DataType::Real | DataType::Double) => expected_float(column, number),
@@ -1480,6 +1557,7 @@ mod tests {
                     DataType::Double => {
                         Value::Double(Finite64::new(rng.below(1000) as f64 / 8.0).unwrap())
                     }
+                    DataType::Date => random_date(rng),
                     integer => Value::BigInt(rng.below(100) as i64).cast(integer).unwrap(),
                 },
             })

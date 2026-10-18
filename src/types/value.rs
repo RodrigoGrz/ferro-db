@@ -2,13 +2,14 @@
 //! and `TupleRef::field`: `None` is NULL (a bit in the tuple's NULL bitmap). `Some` holds
 //! an integer in two's complement, little-endian, `DataType::fixed_width` bytes; a REAL or
 //! DOUBLE PRECISION as IEEE 754 little-endian, 4 or 8 bytes, never NaN, infinite or `-0.0`;
-//! a VARCHAR as its UTF-8 bytes (empty text is `Some(&[])`, never NULL); or a BOOLEAN as one
-//! byte, `0` or `1`.
+//! a VARCHAR as its UTF-8 bytes (empty text is `Some(&[])`, never NULL); a BOOLEAN as one
+//! byte, `0` or `1`; or a DATE as an `i32` little-endian of days since 1970-01-01, within
+//! 0001-01-01..=9999-12-31.
 
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::{DataType, Finite32, Finite64, TypeError, boolean, float, integer, text};
+use super::{DataType, Date, Finite32, Finite64, TypeError, boolean, date, float, integer, text};
 
 /// `PartialEq` is structural and meant for tests: `Null == Null` and
 /// `SmallInt(1) != BigInt(1)`. SQL equality is `sql_eq` (or `compare`), which yields
@@ -26,6 +27,7 @@ pub enum Value {
     /// A VARCHAR value. The limit `n` belongs to the column, not to the value.
     Text(String),
     Boolean(bool),
+    Date(Date),
 }
 
 impl Value {
@@ -41,6 +43,7 @@ impl Value {
             Value::BigInt(_) => Some(DataType::BigInt),
             Value::Text(_) => Some(DataType::VARCHAR_MAX),
             Value::Boolean(_) => Some(DataType::Boolean),
+            Value::Date(_) => Some(DataType::Date),
             Value::Real(_) => Some(DataType::Real),
             Value::Double(_) => Some(DataType::Double),
         }
@@ -54,6 +57,7 @@ impl Value {
             Value::BigInt(value) => Some(value.to_le_bytes().to_vec()),
             Value::Text(text) => Some(text.as_bytes().to_vec()),
             Value::Boolean(value) => Some(vec![boolean::encode(*value)]),
+            Value::Date(value) => Some(value.days_since_epoch().to_le_bytes().to_vec()),
             Value::Real(value) => Some(value.get().to_le_bytes().to_vec()),
             Value::Double(value) => Some(value.get().to_le_bytes().to_vec()),
         }
@@ -75,6 +79,7 @@ impl Value {
             DataType::SmallInt => Value::SmallInt(i16::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::Integer => Value::Integer(i32::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::BigInt => Value::BigInt(i64::from_le_bytes(fixed_width(ty, bytes)?)),
+            DataType::Date => date::decode(fixed_width(ty, bytes)?)?,
             DataType::Real => float::decode_real(fixed_width(ty, bytes)?)?,
             DataType::Double => float::decode_double(fixed_width(ty, bytes)?)?,
             DataType::Varchar(max_chars) => text::decode(max_chars, bytes)?,
@@ -94,6 +99,7 @@ impl Value {
             DataType::Boolean => boolean::parse(input),
             DataType::Real => float::parse_real(input),
             DataType::Double => float::parse_double(input),
+            DataType::Date => date::parse(input),
             integer => integer::parse(integer, input),
         }
     }
@@ -115,8 +121,8 @@ impl Value {
         }
     }
 
-    /// Explicit `CAST`: every pair of types converts except floats and booleans
-    /// (`CannotCast`). Text longer than the target VARCHAR(n) is cut, whatever the excess
+    /// Explicit `CAST`: every pair of types converts except floats and booleans, and dates
+    /// with anything but text and dates (`CannotCast`). Text longer than the target VARCHAR(n) is cut, whatever the excess
     /// holds; only `0`/`1` and `'true'`/`'false'`/`'1'`/`'0'` become booleans; floats become
     /// integers rounding half to even.
     pub fn cast(&self, target: DataType) -> Result<Value, TypeError> {
@@ -124,6 +130,13 @@ impl Value {
             return Ok(Value::Null);
         };
         match (operand, target) {
+            (
+                source @ (Operand::Integer(..) | Operand::Float(..) | Operand::Boolean(_)),
+                DataType::Date,
+            ) => Err(TypeError::CannotCast {
+                from: source.data_type(),
+                to: DataType::Date,
+            }),
             (Operand::Integer(_, value), DataType::Boolean) => boolean::from_integer(value),
             (Operand::Integer(_, value), DataType::Real | DataType::Double) => {
                 float::from_integer(target, value)
@@ -150,6 +163,14 @@ impl Value {
             }
             // The text input of the target type: integers, floats and booleans.
             (Operand::Text(text), other) => Value::parse(other, text),
+            (Operand::Date(_), DataType::Date) => Ok(self.clone()),
+            (Operand::Date(_), DataType::Varchar(max_chars)) => {
+                Ok(text::truncate(max_chars, &self.to_string()))
+            }
+            (Operand::Date(_), other) => Err(TypeError::CannotCast {
+                from: DataType::Date,
+                to: other,
+            }),
             (Operand::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(value)),
             (Operand::Boolean(_), DataType::Real | DataType::Double) => {
                 Err(TypeError::CannotCast {
@@ -174,12 +195,28 @@ impl Value {
         }
     }
 
+    /// Numbers, or `DATE + integer` / `integer + DATE` in days.
     pub fn add(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "+", integer::add, Some(float::add))
+        match (self.operand(), rhs.operand()) {
+            (Some(Operand::Date(days)), Some(Operand::Integer(_, offset)))
+            | (Some(Operand::Integer(_, offset)), Some(Operand::Date(days))) => {
+                date::add_days(days, offset)
+            }
+            _ => self.strict_binary(rhs, "+", integer::add, Some(float::add)),
+        }
     }
 
+    /// Numbers, `DATE - integer` in days, or `DATE - DATE` as the days between.
     pub fn sub(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "-", integer::sub, Some(float::sub))
+        match (self.operand(), rhs.operand()) {
+            (Some(Operand::Date(days)), Some(Operand::Integer(_, offset))) => {
+                date::subtract_days(days, offset)
+            }
+            (Some(Operand::Date(lhs)), Some(Operand::Date(rhs))) => {
+                Ok(date::days_between(lhs, rhs))
+            }
+            _ => self.strict_binary(rhs, "-", integer::sub, Some(float::sub)),
+        }
     }
 
     pub fn mul(&self, rhs: &Value) -> Result<Value, TypeError> {
@@ -331,8 +368,8 @@ impl Value {
 
     /// Total order for `ORDER BY` and indexes. `compare` is not one because of UNKNOWN and
     /// of the families it refuses to mix; here numbers (integers and floats, interleaved by
-    /// value) sort before text, text before booleans, and NULL after every value (`NULLS LAST`
-    /// for `ASC`).
+    /// value) sort before text, text before booleans, booleans before dates, and NULL after
+    /// every value (`NULLS LAST` for `ASC`).
     pub fn sort_cmp(&self, rhs: &Value) -> Ordering {
         match (self.operand(), rhs.operand()) {
             (Some(lhs), Some(rhs)) => lhs.sort_cmp(&rhs),
@@ -351,6 +388,7 @@ impl Value {
             Value::BigInt(value) => Some(Operand::Integer(DataType::BigInt, *value)),
             Value::Text(text) => Some(Operand::Text(text)),
             Value::Boolean(value) => Some(Operand::Boolean(*value)),
+            Value::Date(value) => Some(Operand::Date(value.days_since_epoch())),
             Value::Real(value) => Some(Operand::Float(DataType::Real, value.get().into())),
             Value::Double(value) => Some(Operand::Float(DataType::Double, value.get())),
         }
@@ -360,13 +398,16 @@ impl Value {
 type FloatOperation = fn(DataType, f64, f64) -> Result<Value, TypeError>;
 
 /// A non-NULL value as the operators see it: every integer widened to `i64` and every float
-/// to `f64`, so one implementation covers all widths, and text borrowed.
+/// to `f64`, so one implementation covers all widths, text borrowed, and a date as its day
+/// number.
 enum Operand<'a> {
     Integer(DataType, i64),
     /// REAL is widened to f64 exactly.
     Float(DataType, f64),
     Text(&'a str),
     Boolean(bool),
+    /// Days since 1970-01-01.
+    Date(i32),
 }
 
 impl Operand<'_> {
@@ -375,6 +416,7 @@ impl Operand<'_> {
             Operand::Integer(ty, _) | Operand::Float(ty, _) => *ty,
             Operand::Text(_) => DataType::VARCHAR_MAX,
             Operand::Boolean(_) => DataType::Boolean,
+            Operand::Date(_) => DataType::Date,
         }
     }
 
@@ -384,7 +426,7 @@ impl Operand<'_> {
         match *self {
             Operand::Integer(ty, value) => Some((ty, value as f64)),
             Operand::Float(ty, value) => Some((ty, value)),
-            Operand::Text(_) | Operand::Boolean(_) => None,
+            Operand::Text(_) | Operand::Boolean(_) | Operand::Date(_) => None,
         }
     }
 
@@ -411,6 +453,7 @@ impl Operand<'_> {
             }
             (Operand::Text(lhs), Operand::Text(rhs)) => lhs.cmp(rhs),
             (Operand::Boolean(lhs), Operand::Boolean(rhs)) => lhs.cmp(rhs),
+            (Operand::Date(lhs), Operand::Date(rhs)) => lhs.cmp(rhs),
             _ => self.data_type().family().cmp(&rhs.data_type().family()),
         }
     }
@@ -437,6 +480,7 @@ impl fmt::Display for Value {
             Value::BigInt(value) => write!(f, "{value}"),
             Value::Text(text) => f.write_str(text),
             Value::Boolean(value) => f.write_str(boolean::literal(*value)),
+            Value::Date(value) => write!(f, "{value}"),
             Value::Real(value) => write!(f, "{value}"),
             Value::Double(value) => write!(f, "{value}"),
         }
@@ -1916,6 +1960,427 @@ mod tests {
         );
     }
 
+    fn date(year: i32, month: u32, day: u32) -> Value {
+        Value::Date(Date::from_ymd(year, month, day).unwrap())
+    }
+
+    #[test]
+    fn date_should_have_the_date_type() {
+        assert_eq!(date(2024, 2, 29).data_type(), Some(DataType::Date));
+    }
+
+    #[test]
+    fn encode_of_date_should_be_days_since_1970_little_endian() {
+        assert_eq!(date(1970, 1, 2).encode().unwrap(), [1, 0, 0, 0]);
+        assert_eq!(date(1969, 12, 31).encode().unwrap(), [0xFF; 4]);
+        assert_eq!(date(2024, 2, 29).encode().unwrap(), 19_782i32.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_should_round_trip_dates() {
+        let dates = [
+            Value::Date(Date::MIN),
+            Value::Date(Date::MAX),
+            date(1970, 1, 1),
+            date(2024, 2, 29),
+        ];
+
+        for value in dates {
+            assert_eq!(
+                Value::decode(DataType::Date, value.encode().as_deref()),
+                Ok(value)
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_days_outside_the_range_should_be_corrupted() {
+        for days in [-719_163, 2_932_897, i32::MIN, i32::MAX] {
+            assert_eq!(
+                Value::decode(DataType::Date, Some(&days.to_le_bytes())),
+                Err(TypeError::CorruptedValue {
+                    ty: DataType::Date,
+                    reason: "date out of range"
+                }),
+                "{days}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_a_date_with_the_wrong_width_should_fail() {
+        for actual in [3, 5] {
+            assert_eq!(
+                Value::decode(DataType::Date, Some(&vec![0; actual])),
+                Err(TypeError::InvalidEncoding {
+                    ty: DataType::Date,
+                    expected: 4,
+                    actual
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_date_should_read_iso_dates() {
+        let cases = [
+            ("2024-02-29", date(2024, 2, 29)),
+            ("  1970-01-01\t\n", date(1970, 1, 1)),
+            ("0001-01-01", Value::Date(Date::MIN)),
+            ("9999-12-31", Value::Date(Date::MAX)),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                Value::parse(DataType::Date, input),
+                Ok(expected),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_date_should_reject_other_formats() {
+        let cases = [
+            "",
+            " ",
+            "2024-1-5",
+            "2024-01-5",
+            "2024/01/05",
+            "20240105",
+            "24-01-05",
+            "2024-01-05x",
+            "2024-01-05 00:00",
+            "2024-01-05T00:00:00",
+            "+2024-01-05",
+            "-2024-01-05",
+            "02024-01-05",
+            "10000-01-01",
+            "2024-O1-05",
+            "2024--01-05",
+            "２０２４-01-05",
+            "today",
+        ];
+
+        for input in cases {
+            let err = Value::parse(DataType::Date, input).unwrap_err();
+
+            assert_eq!(err, invalid_text(DataType::Date, input), "{input:?}");
+            assert_eq!(err.sqlstate(), "22007");
+        }
+    }
+
+    #[test]
+    fn parse_of_date_should_reject_days_that_do_not_exist() {
+        let cases = [
+            "2023-02-29",
+            "1900-02-29",
+            "2024-13-01",
+            "2024-00-10",
+            "2024-04-31",
+            "2024-01-00",
+            "2024-12-32",
+            "0000-01-01",
+        ];
+
+        for input in cases {
+            let err = Value::parse(DataType::Date, input).unwrap_err();
+
+            assert_eq!(err, text_out_of_range(DataType::Date, input), "{input:?}");
+            assert_eq!(err.sqlstate(), "22008");
+        }
+    }
+
+    #[test]
+    fn display_of_date_should_be_iso() {
+        assert_eq!(date(1, 1, 1).to_string(), "0001-01-01");
+        assert_eq!(date(2024, 2, 29).to_string(), "2024-02-29");
+    }
+
+    #[test]
+    fn dates_should_round_trip_through_their_text() {
+        for value in [
+            Value::Date(Date::MIN),
+            Value::Date(Date::MAX),
+            date(1970, 1, 1),
+            date(1600, 2, 29),
+        ] {
+            assert_eq!(Value::parse(DataType::Date, &value.to_string()), Ok(value));
+        }
+    }
+
+    #[test]
+    fn compare_of_dates_should_follow_the_calendar() {
+        assert_eq!(
+            date(2024, 1, 31).compare(&date(2024, 2, 1)),
+            Ok(Some(Ordering::Less))
+        );
+        assert_eq!(
+            Value::Date(Date::MAX).compare(&Value::Date(Date::MIN)),
+            Ok(Some(Ordering::Greater))
+        );
+        assert_eq!(
+            date(2000, 2, 29).compare(&date(2000, 2, 29)),
+            Ok(Some(Ordering::Equal))
+        );
+    }
+
+    #[test]
+    fn compare_of_a_date_with_another_family_should_be_an_undefined_operator() {
+        assert_eq!(
+            date(2024, 1, 1).compare(&Value::Integer(19_723)),
+            Err(undefined("=", Some(DataType::Date), Integer))
+        );
+        assert_eq!(
+            text("2024-01-01").sql_lt(&date(2024, 1, 1)),
+            Err(undefined("<", Some(DataType::VARCHAR_MAX), DataType::Date))
+        );
+    }
+
+    #[test]
+    fn sql_comparisons_should_work_on_dates() {
+        let (earlier, later) = (date(1999, 12, 31), date(2000, 1, 1));
+
+        assert_eq!(earlier.sql_lt(&later), Ok(Value::Boolean(true)));
+        assert_eq!(later.sql_le(&earlier), Ok(Value::Boolean(false)));
+        assert_eq!(earlier.sql_eq(&Value::Null), Ok(Value::Null));
+        assert_eq!(earlier.is_distinct_from(&later), Ok(true));
+        assert_eq!(earlier.is_distinct_from(&Value::Null), Ok(true));
+    }
+
+    #[test]
+    fn sort_cmp_should_put_dates_after_the_other_families_and_before_null() {
+        let mut values = vec![
+            Value::Null,
+            date(2024, 1, 1),
+            Value::Integer(1),
+            Value::Boolean(true),
+            text("a"),
+            date(1999, 1, 1),
+        ];
+
+        values.sort_by(Value::sort_cmp);
+
+        assert_eq!(
+            values,
+            [
+                Value::Integer(1),
+                text("a"),
+                Value::Boolean(true),
+                date(1999, 1, 1),
+                date(2024, 1, 1),
+                Value::Null,
+            ]
+        );
+    }
+
+    fn date_out_of_range() -> TypeError {
+        TypeError::OutOfRange { ty: DataType::Date }
+    }
+
+    #[test]
+    fn adding_an_integer_to_a_date_should_move_it_by_days() {
+        assert_eq!(
+            date(2024, 1, 31).add(&Value::Integer(30)),
+            Ok(date(2024, 3, 1))
+        );
+        assert_eq!(
+            Value::SmallInt(1).add(&date(2024, 2, 28)),
+            Ok(date(2024, 2, 29))
+        );
+        assert_eq!(
+            date(2024, 1, 1).add(&Value::Integer(-1)),
+            Ok(date(2023, 12, 31))
+        );
+        assert_eq!(
+            date(2024, 3, 1).sub(&Value::BigInt(1)),
+            Ok(date(2024, 2, 29))
+        );
+        assert_eq!(
+            date(2024, 3, 1).add(&Value::Integer(0)),
+            Ok(date(2024, 3, 1))
+        );
+    }
+
+    #[test]
+    fn subtracting_two_dates_should_give_the_days_between() {
+        assert_eq!(
+            date(2024, 3, 15).sub(&date(2024, 1, 1)),
+            Ok(Value::Integer(74))
+        );
+        assert_eq!(
+            date(2024, 1, 1).sub(&date(2024, 3, 15)),
+            Ok(Value::Integer(-74))
+        );
+        assert_eq!(
+            Value::Date(Date::MAX).sub(&Value::Date(Date::MIN)),
+            Ok(Value::Integer(3_652_058))
+        );
+    }
+
+    #[test]
+    fn date_arithmetic_past_the_range_should_be_out_of_range() {
+        let cases = [
+            Value::Date(Date::MAX).add(&Value::Integer(1)),
+            Value::Date(Date::MIN).sub(&Value::Integer(1)),
+            Value::Date(Date::MIN).add(&Value::Integer(-1)),
+            date(2024, 1, 1).add(&Value::BigInt(i64::MAX)),
+            date(2024, 1, 1).add(&Value::BigInt(i64::MIN)),
+            date(2024, 1, 1).sub(&Value::BigInt(i64::MIN)),
+        ];
+
+        for result in cases {
+            assert_eq!(result, Err(date_out_of_range()));
+        }
+        assert_eq!(date_out_of_range().sqlstate(), "22008");
+    }
+
+    #[test]
+    fn other_operators_with_dates_should_be_undefined() {
+        let day = date(2024, 1, 1);
+        let one = Value::Integer(1);
+
+        assert_eq!(
+            day.mul(&one),
+            Err(undefined("*", Some(DataType::Date), Integer))
+        );
+        assert_eq!(
+            day.div(&day),
+            Err(undefined("/", Some(DataType::Date), DataType::Date))
+        );
+        assert_eq!(
+            day.rem(&one),
+            Err(undefined("%", Some(DataType::Date), Integer))
+        );
+        assert_eq!(
+            day.add(&day),
+            Err(undefined("+", Some(DataType::Date), DataType::Date))
+        );
+        assert_eq!(
+            one.sub(&day),
+            Err(undefined("-", Some(Integer), DataType::Date))
+        );
+        assert_eq!(
+            day.add(&double(1.0)),
+            Err(undefined("+", Some(DataType::Date), DataType::Double))
+        );
+        assert_eq!(
+            day.add(&text("1")),
+            Err(undefined("+", Some(DataType::Date), DataType::VARCHAR_MAX))
+        );
+        assert_eq!(day.neg(), Err(undefined("-", None, DataType::Date)));
+    }
+
+    #[test]
+    fn date_arithmetic_with_null_should_be_null() {
+        assert_eq!(date(2024, 1, 1).add(&Value::Null), Ok(Value::Null));
+        assert_eq!(Value::Null.sub(&date(2024, 1, 1)), Ok(Value::Null));
+    }
+
+    #[test]
+    fn cast_of_a_date_to_varchar_should_be_its_iso_text_cut_to_n() {
+        assert_eq!(
+            date(2024, 2, 29).cast(DataType::VARCHAR_MAX),
+            Ok(text("2024-02-29"))
+        );
+        assert_eq!(date(2024, 2, 29).cast(varchar(4)), Ok(text("2024")));
+    }
+
+    #[test]
+    fn cast_of_text_to_a_date_should_follow_the_input_rules() {
+        assert_eq!(
+            text(" 2024-02-29 ").cast(DataType::Date),
+            Ok(date(2024, 2, 29))
+        );
+        assert_eq!(
+            text("2024/02/29").cast(DataType::Date),
+            Err(invalid_text(DataType::Date, "2024/02/29"))
+        );
+        assert_eq!(
+            text("2023-02-29").cast(DataType::Date),
+            Err(text_out_of_range(DataType::Date, "2023-02-29"))
+        );
+    }
+
+    #[test]
+    fn cast_of_a_date_to_a_date_should_be_identity() {
+        assert_eq!(date(1, 1, 1).cast(DataType::Date), Ok(date(1, 1, 1)));
+        assert_eq!(Value::Null.cast(DataType::Date), Ok(Value::Null));
+    }
+
+    #[test]
+    fn cast_between_dates_and_numbers_or_booleans_should_be_impossible() {
+        let cannot = |from, to| Err(TypeError::CannotCast { from, to });
+        let day = date(2024, 2, 29);
+
+        assert_eq!(day.cast(Integer), cannot(DataType::Date, Integer));
+        assert_eq!(
+            day.cast(DataType::Double),
+            cannot(DataType::Date, DataType::Double)
+        );
+        assert_eq!(
+            day.cast(DataType::Boolean),
+            cannot(DataType::Date, DataType::Boolean)
+        );
+        assert_eq!(
+            Value::Integer(19_782).cast(DataType::Date),
+            cannot(Integer, DataType::Date)
+        );
+        assert_eq!(
+            double(1.0).cast(DataType::Date),
+            cannot(DataType::Double, DataType::Date)
+        );
+        assert_eq!(
+            Value::Boolean(true).cast(DataType::Date),
+            cannot(DataType::Boolean, DataType::Date)
+        );
+    }
+
+    #[test]
+    fn assign_of_dates_should_stay_within_their_family() {
+        let mismatch = |value, target| Err(TypeError::DatatypeMismatch { value, target });
+
+        assert_eq!(
+            date(2024, 1, 1).assign(DataType::Date),
+            Ok(date(2024, 1, 1))
+        );
+        assert_eq!(
+            text("2024-01-01").assign(DataType::Date),
+            mismatch(DataType::VARCHAR_MAX, DataType::Date)
+        );
+        assert_eq!(
+            Value::Integer(1).assign(DataType::Date),
+            mismatch(Integer, DataType::Date)
+        );
+        assert_eq!(
+            date(2024, 1, 1).assign(varchar(10)),
+            mismatch(DataType::Date, varchar(10))
+        );
+    }
+
+    #[test]
+    fn logical_operators_and_tests_with_dates_should_fail() {
+        let and = date(2024, 1, 1).and(&Value::Boolean(true));
+
+        assert_eq!(and, Err(not_boolean("AND", DataType::Date)));
+        assert_eq!(
+            and.unwrap_err().to_string(),
+            "argument of AND must be type boolean, not type date"
+        );
+        assert_eq!(
+            date(2024, 1, 1).is_true(),
+            Err(not_boolean("IS TRUE", DataType::Date))
+        );
+    }
+
+    #[test]
+    fn concat_with_a_date_should_be_an_undefined_operator() {
+        assert_eq!(
+            text("a").concat(&date(2024, 1, 1)),
+            Err(undefined("||", Some(DataType::VARCHAR_MAX), DataType::Date))
+        );
+    }
+
     #[test]
     fn concat_with_a_float_should_be_an_undefined_operator() {
         assert_eq!(
@@ -2760,7 +3225,11 @@ mod tests {
             Value::SmallInt(v) => Some(v.into()),
             Value::Integer(v) => Some(v.into()),
             Value::BigInt(v) => Some(v.into()),
-            Value::Real(_) | Value::Double(_) | Value::Text(_) | Value::Boolean(_) => {
+            Value::Real(_)
+            | Value::Double(_)
+            | Value::Text(_)
+            | Value::Boolean(_)
+            | Value::Date(_) => {
                 unreachable!("integer model only")
             }
         }
@@ -2772,9 +3241,11 @@ mod tests {
             SmallInt => Value::SmallInt(i16::try_from(value).map_err(out_of_range)?),
             Integer => Value::Integer(i32::try_from(value).map_err(out_of_range)?),
             BigInt => Value::BigInt(i64::try_from(value).map_err(out_of_range)?),
-            DataType::Real | DataType::Double | DataType::Varchar(_) | DataType::Boolean => {
-                unreachable!("integer model only")
-            }
+            DataType::Real
+            | DataType::Double
+            | DataType::Varchar(_)
+            | DataType::Boolean
+            | DataType::Date => unreachable!("integer model only"),
         })
     }
 
@@ -2909,11 +3380,90 @@ mod tests {
 
     /// Integers (with NULL), text and booleans, so operators meet every family pair.
     fn random_mixed_value(rng: &mut Rng) -> Value {
-        match rng.below(6) {
+        match rng.below(7) {
             0 => text(&random_text(rng)),
             1 => Value::Boolean(rng.below(2) == 0),
             2 => random_float(rng),
+            3 => random_date(rng),
             _ => random_value(rng),
+        }
+    }
+
+    /// Any day of the range, half of them near its ends.
+    fn random_date(rng: &mut Rng) -> Value {
+        let (min, max) = (Date::MIN.days_since_epoch(), Date::MAX.days_since_epoch());
+        let offset = i32::try_from(rng.below(30)).unwrap();
+        let days = match rng.below(4) {
+            0 => min + offset,
+            1 => max - offset,
+            _ => min + i32::try_from(rng.next() % (max - min + 1).unsigned_abs() as u64).unwrap(),
+        };
+        Value::Date(Date::from_days_since_epoch(days).unwrap())
+    }
+
+    fn model_days(value: &Value) -> i64 {
+        match value {
+            Value::Date(day) => day.days_since_epoch().into(),
+            other => unreachable!("dates only: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn random_date_arithmetic_should_match_an_i64_model() {
+        let mut rng = Rng(0xBB67_AE85_84CA_A73B);
+        let in_range = |days: i64| {
+            i32::try_from(days)
+                .ok()
+                .and_then(Date::from_days_since_epoch)
+                .map(Value::Date)
+                .ok_or(TypeError::OutOfRange { ty: DataType::Date })
+        };
+
+        for _ in 0..10_000 {
+            let (day, other) = (random_date(&mut rng), random_date(&mut rng));
+            let offset: i64 = match rng.below(3) {
+                0 => rng.below(61) as i64 - 30,
+                1 => [i64::MIN, i64::MAX, 3_652_058, -3_652_058][rng.below(4)],
+                _ => (rng.next() as i64) >> rng.below(64),
+            };
+            let days = model_days(&day);
+
+            assert_eq!(
+                day.add(&Value::BigInt(offset)),
+                days.checked_add(offset)
+                    .map_or(Err(TypeError::OutOfRange { ty: DataType::Date }), in_range),
+                "{day} + {offset}"
+            );
+            assert_eq!(
+                day.sub(&Value::BigInt(offset)),
+                days.checked_sub(offset)
+                    .map_or(Err(TypeError::OutOfRange { ty: DataType::Date }), in_range),
+                "{day} - {offset}"
+            );
+            assert_eq!(
+                day.sub(&other),
+                Ok(Value::Integer(
+                    i32::try_from(days - model_days(&other)).unwrap()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn random_dates_should_round_trip_through_bytes_and_text() {
+        let mut rng = Rng(0x3C6E_F372_FE94_F82B);
+
+        for _ in 0..10_000 {
+            let value = random_date(&mut rng);
+
+            assert_eq!(
+                Value::decode(DataType::Date, value.encode().as_deref()).as_ref(),
+                Ok(&value)
+            );
+            assert_eq!(
+                Value::parse(DataType::Date, &value.to_string()).as_ref(),
+                Ok(&value)
+            );
         }
     }
 
@@ -2952,7 +3502,9 @@ mod tests {
             Value::BigInt(v) => Some(v as f64),
             Value::Real(v) => Some(v.get().into()),
             Value::Double(v) => Some(v.get()),
-            Value::Text(_) | Value::Boolean(_) => unreachable!("numeric model only"),
+            Value::Text(_) | Value::Boolean(_) | Value::Date(_) => {
+                unreachable!("numeric model only")
+            }
         }
     }
 

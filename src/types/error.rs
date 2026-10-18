@@ -58,8 +58,16 @@ pub enum TypeError {
 }
 
 impl TypeError {
+    /// Range and syntax errors of datetimes have their own SQLSTATE class in the standard
+    /// (datetime field overflow, invalid datetime format); the messages are the same.
     pub fn sqlstate(&self) -> &'static str {
         match self {
+            TypeError::OutOfRange { ty } | TypeError::TextOutOfRange { ty, .. }
+                if ty.is_datetime() =>
+            {
+                "22008"
+            }
+            TypeError::InvalidTextRepresentation { ty, .. } if ty.is_datetime() => "22007",
             TypeError::OutOfRange { .. } | TypeError::TextOutOfRange { .. } => "22003",
             TypeError::InvalidTextRepresentation { .. } => "22P02",
             TypeError::DivisionByZero => "22012",
@@ -339,6 +347,49 @@ mod tests {
         for (err, message) in cases {
             assert_eq!(err.to_string(), message);
         }
+    }
+
+    #[test]
+    fn date_errors_should_use_the_datetime_sqlstates() {
+        let cases = [
+            (
+                text_error(DataType::Date, "2024/01/05"),
+                "invalid input syntax for type date: \"2024/01/05\"",
+                "22007",
+            ),
+            (
+                TypeError::TextOutOfRange {
+                    ty: DataType::Date,
+                    input: "2023-02-29".to_string(),
+                },
+                "value \"2023-02-29\" is out of range for type date",
+                "22008",
+            ),
+            (
+                TypeError::OutOfRange { ty: DataType::Date },
+                "date out of range",
+                "22008",
+            ),
+        ];
+
+        for (err, message, sqlstate) in cases {
+            assert_eq!(err.to_string(), message);
+            assert_eq!(err.sqlstate(), sqlstate, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn date_corruption_message_should_name_the_type() {
+        let err = TypeError::CorruptedValue {
+            ty: DataType::Date,
+            reason: "date out of range",
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "stored date value is corrupted: date out of range"
+        );
+        assert_eq!(err.sqlstate(), "XX001");
     }
 
     #[test]

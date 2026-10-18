@@ -15,6 +15,8 @@ pub enum DataType {
     /// At most `n` characters (Unicode scalar values); the type rules out `VARCHAR(0)`.
     Varchar(NonZeroU16),
     Boolean,
+    /// A calendar day, 0001-01-01 to 9999-12-31.
+    Date,
 }
 
 /// Values of one family can be assigned and compared to each other; across families only an
@@ -25,6 +27,8 @@ pub(crate) enum TypeFamily {
     Numeric,
     Text,
     Boolean,
+    /// DATE now; TIME and TIMESTAMP will join it.
+    Datetime,
 }
 
 impl DataType {
@@ -41,6 +45,7 @@ impl DataType {
             DataType::Double => "DOUBLE PRECISION",
             DataType::Varchar(_) => "VARCHAR",
             DataType::Boolean => "BOOLEAN",
+            DataType::Date => "DATE",
         }
     }
 
@@ -53,6 +58,7 @@ impl DataType {
             DataType::Double => Some(size_of::<f64>()),
             DataType::Varchar(_) => None,
             DataType::Boolean => Some(size_of::<bool>()),
+            DataType::Date => Some(size_of::<i32>()),
         }
     }
 
@@ -84,6 +90,10 @@ impl DataType {
         self.family() == TypeFamily::Text
     }
 
+    pub fn is_datetime(self) -> bool {
+        self.family() == TypeFamily::Datetime
+    }
+
     pub fn is_boolean(self) -> bool {
         self.family() == TypeFamily::Boolean
     }
@@ -97,6 +107,7 @@ impl DataType {
             | DataType::Double => TypeFamily::Numeric,
             DataType::Varchar(_) => TypeFamily::Text,
             DataType::Boolean => TypeFamily::Boolean,
+            DataType::Date => TypeFamily::Datetime,
         }
     }
 
@@ -168,6 +179,20 @@ mod tests {
         assert_eq!(DataType::VARCHAR_MAX.to_string(), "VARCHAR(65535)");
         assert_eq!(DataType::Boolean.to_string(), "BOOLEAN");
         assert_eq!(DataType::Double.to_string(), "DOUBLE PRECISION");
+    }
+
+    #[test]
+    fn date_should_be_a_fixed_four_byte_datetime() {
+        assert_eq!(DataType::Date.name(), "DATE");
+        assert_eq!(DataType::Date.to_string(), "DATE");
+        assert_eq!(DataType::Date.fixed_width(), Some(4));
+        assert_eq!(DataType::Date.layout(), ColumnLayout::Fixed(4));
+        assert!(DataType::Date.is_datetime());
+        assert!(!DataType::Date.is_numeric());
+        assert_eq!(DataType::Date.family(), TypeFamily::Datetime);
+        for ty in [Integer, DataType::Double, varchar(3), DataType::Boolean] {
+            assert!(!ty.is_datetime(), "{ty}");
+        }
     }
 
     #[test]

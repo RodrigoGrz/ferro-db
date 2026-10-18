@@ -7,10 +7,10 @@
 //! ```
 //!
 //! `data_type`: 1 SMALLINT, 2 INTEGER, 3 BIGINT, 4 VARCHAR followed by its `n` (1 to 65535),
-//! 5 BOOLEAN, 6 REAL, 7 DOUBLE PRECISION; 0 stays invalid so a zeroed entry never decodes.
-//! `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to 63 bytes of UTF-8.
-//! Decoding rejects anything else, including missing or trailing bytes, so an entry is at most
-//! 74 bytes and always fits a page.
+//! 5 BOOLEAN, 6 REAL, 7 DOUBLE PRECISION, 8 DATE; 0 stays invalid so a zeroed entry never
+//! decodes. `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to 63 bytes of
+//! UTF-8. Decoding rejects anything else, including missing or trailing bytes, so an entry is
+//! at most 74 bytes and always fits a page.
 
 use std::num::NonZeroU16;
 
@@ -119,6 +119,7 @@ fn write_data_type(bytes: &mut Vec<u8>, data_type: DataType) {
         DataType::Boolean => bytes.push(5),
         DataType::Real => bytes.push(6),
         DataType::Double => bytes.push(7),
+        DataType::Date => bytes.push(8),
     }
 }
 
@@ -138,6 +139,7 @@ fn read_data_type(reader: &mut ByteReader<'_>) -> Result<DataType, CatalogError>
         5 => Ok(DataType::Boolean),
         6 => Ok(DataType::Real),
         7 => Ok(DataType::Double),
+        8 => Ok(DataType::Date),
         _ => Err(CatalogError::Corrupted {
             reason: "unknown column type",
         }),
@@ -235,7 +237,8 @@ mod tests {
         DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
     }
 
-    const ALL_TYPES: [DataType; 8] = [
+    const ALL_TYPES: [DataType; 9] = [
+        DataType::Date,
         SmallInt,
         Integer,
         BigInt,
@@ -245,6 +248,13 @@ mod tests {
         DataType::VARCHAR_MAX,
         DataType::Boolean,
     ];
+
+    #[test]
+    fn column_record_of_date_should_use_code_8() {
+        let bytes = column("on", DataType::Date, true).encode().unwrap();
+
+        assert_eq!(bytes, [5, 0, 0, 0, 1, 2, 8, 1, 2, b'o', b'n']);
+    }
 
     #[test]
     fn column_records_of_floats_should_use_codes_6_and_7() {
@@ -375,7 +385,7 @@ mod tests {
         let valid = column("id", Integer, true).encode().unwrap();
         let cases = [
             (6, 0, "unknown column type"),
-            (6, 8, "unknown column type"),
+            (6, 9, "unknown column type"),
             (7, 0b10, "unknown column flags"),
             (7, 0xFF, "unknown column flags"),
         ];
@@ -470,7 +480,8 @@ mod tests {
                         DataType::Boolean,
                         DataType::Real,
                         DataType::Double,
-                    ][rng.below(7)],
+                        DataType::Date,
+                    ][rng.below(8)],
                 },
                 nullable: rng.below(2) == 0,
             },

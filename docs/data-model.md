@@ -8,6 +8,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 - [Data Types: VARCHAR](#data-types-varchar)
 - [Data Types: BOOLEAN](#data-types-boolean)
 - [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision)
+- [Data Types: DATE](#data-types-date)
 - [Schema](#schema)
 - [Catalog](#catalog)
 - [Deviations from the SQL Standard](#deviations-from-the-sql-standard)
@@ -16,7 +17,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 
 ## Data Types: Integers and NULL
 
-The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text, booleans and floats are in [Data Types: VARCHAR](#data-types-varchar), [Data Types: BOOLEAN](#data-types-boolean) and [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
+The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text, booleans, floats and dates are in [Data Types: VARCHAR](#data-types-varchar), [Data Types: BOOLEAN](#data-types-boolean), [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision) and [Data Types: DATE](#data-types-date). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
 
 | File | Responsibility |
 |---|---|
@@ -24,6 +25,7 @@ The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and 
 | `value.rs` | `Value`: `NULL`, encode/decode, parse, `Display`, cast and assignment, operators, comparison |
 | `integer.rs` | integer semantics in `i64` + narrowing to the target type (private) |
 | `text.rs` | `VARCHAR(n)` semantics: length in characters, truncation, trailing-space rule, UTF-8 validation (private) |
+| `date.rs` | `DATE`: the `Date` newtype, Hinnant's calendar conversions, ISO text input, day arithmetic (private; `Date` is re-exported) |
 | `float.rs` | `REAL` / `DOUBLE PRECISION`: finite newtypes, text input and output, checked arithmetic, conversions, exact comparison with integers (private) |
 | `boolean.rs` | `BOOLEAN` semantics: the 1-byte format, text input, integer conversion, Kleene's `AND`/`OR` (private) |
 | `error.rs` | `TypeError` with message and PostgreSQL-compatible `SQLSTATE` |
@@ -31,8 +33,8 @@ The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and 
 ### Types and bytes
 
 ```rust
-pub enum DataType { SmallInt, Integer, BigInt, Real, Double, Varchar(NonZeroU16), Boolean }
-pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32), Double(Finite64), Text(String), Boolean(bool) }
+pub enum DataType { SmallInt, Integer, BigInt, Real, Double, Varchar(NonZeroU16), Boolean, Date }
+pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32), Double(Finite64), Text(String), Boolean(bool), Date(Date) }
 ```
 
 | Type | Rust | `ColumnLayout` | Field in the tuple | `-2` |
@@ -59,7 +61,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32),
   - `compare` → `Result<Option<Ordering>, TypeError>`; `Ok(None)` is `UNKNOWN` whenever one side is `NULL` (including `NULL = NULL`). Compares by value regardless of width (`INTEGER 5 = BIGINT 5`). Comparing an integer with text → `UndefinedOperator` (`42883`).
   - `sql_eq` / `sql_lt` / ... → the same comparison as a SQL value (`Boolean` or `Null`); see [BOOLEAN](#comparison-as-sql-values).
   - `is_distinct_from` → `Result<bool, TypeError>`, `IS DISTINCT FROM`: `NULL` equals `NULL`, never `UNKNOWN`.
-  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: numbers (integers and floats, interleaved by value) sort before text and text before booleans, an order that only exists to make the function total (a column never mixes families).
+  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: numbers (integers and floats, interleaved by value) sort before text, text before booleans and booleans before dates, an order that only exists to make the function total (a column never mixes families).
 
 ### Errors
 
@@ -71,7 +73,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32),
 | `DivisionByZero` | `22012` | `division by zero` |
 | `InvalidEncoding` | `XX001` | `integer field must be 4 bytes, got 2` |
 
-The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), `NotBoolean` in the [BOOLEAN section](#errors-2), and `CannotCast` in the [float section](#errors-3).
+The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), `NotBoolean` in the [BOOLEAN section](#errors-2), `CannotCast` in the [float section](#errors-3), and the datetime SQLSTATEs (`22007`, `22008`) in the [DATE section](#errors-4).
 
 ### Design decisions
 
@@ -238,7 +240,7 @@ The table is symmetric; `NOT T = F`, `NOT F = T`, `NOT N = N`.
 
 - **One byte, `0`/`1`, strict on read:** the natural format (also PostgreSQL's). Reading "anything non-zero is TRUE" would give one value two encodings, which breaks byte comparisons and future indexes. Bit-packing several booleans per byte was not worth its complexity.
 - **UNKNOWN = `Value::Null`:** two kinds of null would double every case.
-- **`TypeFamily`** (`pub(crate)`, `DataType::family()`): with three families, "same family" can no longer be `is_text() == is_text()`; assignment and comparison ask `family()`, and its order (integers, text, booleans) is the cross-family order of `sort_cmp`.
+- **`TypeFamily`** (`pub(crate)`, `DataType::family()`): with more than two families, "same family" can no longer be `is_text() == is_text()`; assignment and comparison ask `family()`, and its order (numbers, text, booleans, then datetimes) is the cross-family order of `sort_cmp`.
 - **`CorruptedValue`** generalizes the former `CorruptedText`: one variant with the type and a reason serves every type whose bytes can be invalid at the right width.
 - **`NotBoolean` instead of `UndefinedOperator`** for logical operators: `UndefinedOperator` reads "type op type", which fits neither `NULL AND 'x'` (the `NULL` has no type) nor the postfix `1 IS TRUE`.
 
@@ -356,6 +358,94 @@ See [ADR 0009](decisions/0009-floats-finite-exact-comparison-numeric-family.md).
 - `random_floats_should_round_trip_through_bytes_and_text`; `sort_cmp_should_be_a_total_order` and the random `sql_*` test now include floats.
 - `schema.rs` and `catalog`: `Fixed(4)` / `Fixed(8)` columns, integer into a float column, float into an integer column (`42804`), the random assignment model with `REAL` overflow and underflow, catalog codes `6` and `7` and random creations with both types.
 - Integration in [`tests/types_float.rs`](../tests/types_float.rs): a catalog table `(id INTEGER NOT NULL, price DOUBLE PRECISION NOT NULL, ratio REAL)` with 2,000 rows (limits, subnormals, zero, `NULL`) survives eviction with a 2-frame pool and reopening the file; integers assigned to float columns come back as floats; a NaN written below the schema → `Type { .., CorruptedValue }` (`XX001`).
+
+## Data Types: DATE
+
+`DATE` is a calendar day without time or time zone, from **0001-01-01 to 9999-12-31** (the range of the SQL standard), in the **proleptic Gregorian calendar**: today's leap rule (every 4 years, except centuries, except every 400) applied to every year. `TIME`, `TIMESTAMP` and `INTERVAL` are separate roadmap items.
+
+```rust
+DataType::Date
+Value::Date(Date)
+Date::from_ymd(2024, 2, 29)          // Option: None for a day that does not exist or a year outside 1..=9999
+Date::from_days_since_epoch(19_782)  // Option: None outside MIN..=MAX
+```
+
+`src/types/date.rs` (private; `Date` is re-exported) holds the calendar, the text input, the day arithmetic and the decoding.
+
+### Representation
+
+A `Date` is the **number of days since 1970-01-01** in an `i32` (`Date::MIN` = -719,162, `Date::MAX` = 2,932,896), like the "integer since an epoch" of real databases (PostgreSQL counts from 2000-01-01). Comparing and adding days are integer operations; the calendar only matters when converting to and from year, month and day.
+
+The conversion uses Howard Hinnant's `days_from_civil` / `civil_from_days` ([date algorithms](http://howardhinnant.github.io/date_algorithms.html)), closed formulas that count years from March (so February and its leap day close the year) and repeat every 400-year era of 146,097 days. No tables, no loops, no dependency.
+
+| Type | `ColumnLayout` | Field in the tuple |
+|---|---|---|
+| `DATE` | `Fixed(4)` | `i32` LE, days since 1970-01-01 |
+
+A day number outside `MIN..=MAX` read from disk → `CorruptedValue` (`XX001`, `date out of range`); a wrong width → `InvalidEncoding`.
+
+### Text
+
+- **Input** (`Value::parse`): surrounding whitespace, then **exactly** `YYYY-MM-DD` (4 + 2 + 2 ASCII digits and two hyphens), the standard's date literal.
+  - Any other shape (`2024-1-5`, `2024/01/05`, `20240105`, `24-01-05`, `2024-01-05T00:00`, `10000-01-01`, `today`) → `InvalidTextRepresentation`, SQLSTATE `22007` (*invalid datetime format*).
+  - The right shape for a day that does not exist or is outside the range (`2023-02-29`, `1900-02-29`, `2024-04-31`, `2024-13-01`, `0000-01-01`) → `TextOutOfRange`, SQLSTATE `22008` (*datetime field overflow*).
+- **Output** (`Display`): `YYYY-MM-DD` with a 4-digit, zero-padded year (`0001-01-01`). `parse(display(d)) == d`.
+
+### Arithmetic in days
+
+The standard does arithmetic on datetimes only with `INTERVAL`, which does not exist yet. Like PostgreSQL, ferroDB accepts a number of days meanwhile (decided with the author):
+
+| Operation | Result |
+|---|---|
+| `DATE + integer`, `integer + DATE` | `DATE`, that many days later |
+| `DATE - integer` | `DATE` |
+| `DATE - DATE` | `INTEGER`, the days between them (the largest difference, about 3.65 million, always fits) |
+| anything else with a `DATE` (`*`, `/`, `%`, unary `-`, `DATE + DATE`, `integer - DATE`, floats, text, booleans) | `UndefinedOperator` (`42883`) |
+
+- The sum is computed in `i64`, so even `DATE + BIGINT::MAX` is an error, never a wrap; a result outside 0001..=9999 → `OutOfRange` (`date out of range`, SQLSTATE `22008`).
+- `NULL` stays strict. Months and years (`+ 1 month`) wait for `INTERVAL`, which will sit next to this without breaking it.
+
+### Comparison
+
+A `DATE` compares only with a `DATE`, by day number; with any other family → `42883`, naming the operator used. `sql_*`, `is_distinct_from` and `sort_cmp` follow; in `sort_cmp`, dates come after booleans, and `NULL` stays last.
+
+### Cast and assignment
+
+| From → to | `DATE` | `VARCHAR(n)` | integer, float, boolean |
+|---|---|---|---|
+| `DATE` | identity | `cast`: `YYYY-MM-DD` cut to `n`; `assign`: `42804` | `CannotCast` (`42846`) |
+| text | `cast`: the `parse` rules; `assign`: `42804` | — | — |
+| integer, float, boolean | `CannotCast` (`42846`) | — | — |
+| `NULL` | `NULL` | `NULL` | `NULL` |
+
+### Errors
+
+There is no new `TypeError` variant: the standard gives datetimes their own SQLSTATE class, so the existing variants report a different code for a `DATE`, with the same message:
+
+| `TypeError` | Numbers | `DATE` | `DATE` message |
+|---|---|---|---|
+| `InvalidTextRepresentation` | `22P02` | `22007` | `invalid input syntax for type date: "2024/01/05"` |
+| `TextOutOfRange` | `22003` | `22008` | `value "2023-02-29" is out of range for type date` |
+| `OutOfRange` | `22003` | `22008` | `date out of range` |
+
+`CannotCast` (`42846`), `UndefinedOperator` (`42883`), `DatatypeMismatch` (`42804`) and `CorruptedValue` (`XX001`) are reused as they are.
+
+### Design decisions
+
+- **Days since 1970-01-01 in `i32`**: comparison and arithmetic are integer operations, and 4 bytes cover 0001–9999 with room to spare. Packing year, month and day would complicate both; the Unix epoch is the better known one.
+- **The standard's range and only the ISO format** (decided with the author): always a 4-digit year, no `BC` suffix, no ambiguity between `01/02` as January or February, no `DateStyle` setting.
+- **Newtype `Date`** with validating constructors, like `Finite64`: an invalid `Value::Date` cannot exist.
+- **`TypeFamily::Datetime`**, so `TIME` and `TIMESTAMP` join without new family rules; in the family order it comes last, after booleans.
+- **SQLSTATE by type** instead of date-specific variants: the message is the same, only the standard's class differs.
+
+### Tests
+
+- Unit in `date.rs`: day 0 is 1970-01-01; the range limits; February 29 in leap and non-leap years (4, 1600, 2000, 2024 vs. 1900, 2023, 2100); every month's last day and the day after; fields out of range; consecutive days across month and year ends; `Display`.
+- `every_day_of_the_range_should_follow_the_previous_one`: **all 3,652,059 days**, checking that each converts to the calendar successor of the previous one and back. Random samples were not enough: a wrong century term in Hinnant's formulas (`36_525` instead of `36_524`) only changes a few days every 400 years and survived 2,000 random days; the exhaustive walk catches it, as well as a broken leap rule (both mutation-checked by hand).
+- `random_days_should_match_a_naive_calendar`: 2,000 random days against a year-by-year, month-by-month walk from 0001-01-01.
+- `value.rs`: bytes and every corrupt pattern; every accepted and rejected text, with the right SQLSTATE; comparison and the `sql_*` operators; day arithmetic at the range ends and with `i64` extremes; every refused operator; every cast/assign cell. `random_date_arithmetic_should_match_an_i64_model` and `random_dates_should_round_trip_through_bytes_and_text` (10,000 each); `sort_cmp_should_be_a_total_order` now mixes all five families.
+- `schema.rs` and `catalog`: `Fixed(4)` columns, round trip, `42804` both ways, the random assignment and corruption tests with dates, catalog code `8` and random creations with `DATE`.
+- Integration in [`tests/types_date.rs`](../tests/types_date.rs): a catalog table `(id INTEGER NOT NULL, born DATE NOT NULL, died DATE)` with 2,000 rows (range limits, leap days, the epoch, `NULL`) survives eviction with a 2-frame pool and reopening the file; `died - born` and `born > DATE '2000-01-01'` on the stored rows give the expected results; a day number past 9999-12-31 written below the schema → `Type { .., CorruptedValue }` (`XX001`).
 
 ---
 
@@ -475,9 +565,9 @@ The checksum catches flipped bytes; the magic rejects a file whose page 0 is val
 | Entry | Fields |
 |---|---|
 | `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · name |
-| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
+| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
 
-Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, then `6` REAL and `7` DOUBLE PRECISION), so older databases still open.
+Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, then `8` DATE), so older databases still open.
 
 ### Operations
 
@@ -533,7 +623,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 ### Tests
 
 - `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
-- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`8`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
+- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`9`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
 - `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, data heap that accepts the schema's rows, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch) and every error with message, SQLSTATE and `source()`.
 - `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
@@ -573,4 +663,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Exact vs. approximate comparison | by algebraic value | exact, as the standard (PostgreSQL converts the integer to `float8`) |
 | `MOD` with approximate numbers | not defined | `%` with a float → `42883` |
 | `CAST` of a float to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like integers |
+| Arithmetic on dates | only with `INTERVAL` (`DATE + INTERVAL '30' DAY`) | `DATE ± integer` and `DATE - DATE` in days, as PostgreSQL, until `INTERVAL` exists (decided with the author) |
+| Date text | the literal `DATE 'YYYY-MM-DD'` | only `YYYY-MM-DD`, same as the standard (PostgreSQL also takes other styles set by `DateStyle`) |
+| `CAST` of a `DATE` to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like the other types |
 | `CAST` of a `BOOLEAN` to a short `VARCHAR(n)` | `22001` when `'TRUE'`/`'FALSE'` does not fit | cut to `n`, like integers (`CAST(TRUE AS VARCHAR(1))` = `'T'`) |
