@@ -1,13 +1,14 @@
 //! Runtime values. A stored field is `Option<&[u8]>`, the contract of `TupleLayout::encode`
 //! and `TupleRef::field`: `None` is NULL (a bit in the tuple's NULL bitmap). `Some` holds
-//! an integer in two's complement, little-endian, `DataType::fixed_width` bytes, a VARCHAR
-//! as its UTF-8 bytes (empty text is `Some(&[])`, never NULL), or a BOOLEAN as one byte,
-//! `0` or `1`.
+//! an integer in two's complement, little-endian, `DataType::fixed_width` bytes; a REAL or
+//! DOUBLE PRECISION as IEEE 754 little-endian, 4 or 8 bytes, never NaN, infinite or `-0.0`;
+//! a VARCHAR as its UTF-8 bytes (empty text is `Some(&[])`, never NULL); or a BOOLEAN as one
+//! byte, `0` or `1`.
 
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::{DataType, TypeError, boolean, integer, text};
+use super::{DataType, Finite32, Finite64, TypeError, boolean, float, integer, text};
 
 /// `PartialEq` is structural and meant for tests: `Null == Null` and
 /// `SmallInt(1) != BigInt(1)`. SQL equality is `sql_eq` (or `compare`), which yields
@@ -20,6 +21,8 @@ pub enum Value {
     SmallInt(i16),
     Integer(i32),
     BigInt(i64),
+    Real(Finite32),
+    Double(Finite64),
     /// A VARCHAR value. The limit `n` belongs to the column, not to the value.
     Text(String),
     Boolean(bool),
@@ -38,6 +41,8 @@ impl Value {
             Value::BigInt(_) => Some(DataType::BigInt),
             Value::Text(_) => Some(DataType::VARCHAR_MAX),
             Value::Boolean(_) => Some(DataType::Boolean),
+            Value::Real(_) => Some(DataType::Real),
+            Value::Double(_) => Some(DataType::Double),
         }
     }
 
@@ -49,6 +54,8 @@ impl Value {
             Value::BigInt(value) => Some(value.to_le_bytes().to_vec()),
             Value::Text(text) => Some(text.as_bytes().to_vec()),
             Value::Boolean(value) => Some(vec![boolean::encode(*value)]),
+            Value::Real(value) => Some(value.get().to_le_bytes().to_vec()),
+            Value::Double(value) => Some(value.get().to_le_bytes().to_vec()),
         }
     }
 
@@ -68,6 +75,8 @@ impl Value {
             DataType::SmallInt => Value::SmallInt(i16::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::Integer => Value::Integer(i32::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::BigInt => Value::BigInt(i64::from_le_bytes(fixed_width(ty, bytes)?)),
+            DataType::Real => float::decode_real(fixed_width(ty, bytes)?)?,
+            DataType::Double => float::decode_double(fixed_width(ty, bytes)?)?,
             DataType::Varchar(max_chars) => text::decode(max_chars, bytes)?,
             DataType::Boolean => {
                 let [byte] = fixed_width(ty, bytes)?;
@@ -83,17 +92,21 @@ impl Value {
         match ty {
             DataType::Varchar(max_chars) => text::assign(max_chars, input),
             DataType::Boolean => boolean::parse(input),
+            DataType::Real => float::parse_real(input),
+            DataType::Double => float::parse_double(input),
             integer => integer::parse(integer, input),
         }
     }
 
-    /// Store assignment (`INSERT`/`UPDATE`): only within a type family. Text longer than
-    /// the target VARCHAR(n) is an error unless the excess is only spaces, which are cut.
+    /// Store assignment (`INSERT`/`UPDATE`): only within a type family, and a float becomes
+    /// an integer only through an explicit CAST, so a fraction is never rounded away
+    /// silently. Text longer than the target VARCHAR(n) is an error unless the excess is only
+    /// spaces, which are cut.
     pub fn assign(&self, target: DataType) -> Result<Value, TypeError> {
         let Some(ty) = self.data_type() else {
             return Ok(Value::Null);
         };
-        if ty.family() != target.family() {
+        if ty.family() != target.family() || ty.is_float() && target.is_integer() {
             return Err(TypeError::DatatypeMismatch { value: ty, target });
         }
         match (self, target) {
@@ -102,27 +115,48 @@ impl Value {
         }
     }
 
-    /// Explicit `CAST`: every pair of types converts. Text longer than the target VARCHAR(n)
-    /// is cut, whatever the excess holds; only `0`/`1` and `'true'`/`'false'`/`'1'`/`'0'`
-    /// become booleans.
+    /// Explicit `CAST`: every pair of types converts except floats and booleans
+    /// (`CannotCast`). Text longer than the target VARCHAR(n) is cut, whatever the excess
+    /// holds; only `0`/`1` and `'true'`/`'false'`/`'1'`/`'0'` become booleans; floats become
+    /// integers rounding half to even.
     pub fn cast(&self, target: DataType) -> Result<Value, TypeError> {
         let Some(operand) = self.operand() else {
             return Ok(Value::Null);
         };
         match (operand, target) {
             (Operand::Integer(_, value), DataType::Boolean) => boolean::from_integer(value),
+            (Operand::Integer(_, value), DataType::Real | DataType::Double) => {
+                float::from_integer(target, value)
+            }
             (Operand::Integer(_, value), DataType::Varchar(max_chars)) => {
                 Ok(text::truncate(max_chars, &value.to_string()))
             }
             (Operand::Integer(_, value), integer) => {
                 integer::narrow(integer, value).ok_or(TypeError::OutOfRange { ty: integer })
             }
+            (Operand::Float(source, _), DataType::Boolean) => Err(TypeError::CannotCast {
+                from: source,
+                to: DataType::Boolean,
+            }),
+            (Operand::Float(_, value), DataType::Real | DataType::Double) => {
+                float::convert(target, value)
+            }
+            (Operand::Float(..), DataType::Varchar(max_chars)) => {
+                Ok(text::truncate(max_chars, &self.to_string()))
+            }
+            (Operand::Float(_, value), integer) => float::to_integer(integer, value),
             (Operand::Text(text), DataType::Varchar(max_chars)) => {
                 Ok(text::truncate(max_chars, text))
             }
-            (Operand::Text(text), DataType::Boolean) => boolean::parse(text),
-            (Operand::Text(text), integer) => integer::parse(integer, text),
+            // The text input of the target type: integers, floats and booleans.
+            (Operand::Text(text), other) => Value::parse(other, text),
             (Operand::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(value)),
+            (Operand::Boolean(_), DataType::Real | DataType::Double) => {
+                Err(TypeError::CannotCast {
+                    from: DataType::Boolean,
+                    to: target,
+                })
+            }
             (Operand::Boolean(value), DataType::Varchar(max_chars)) => {
                 Ok(text::truncate(max_chars, boolean::literal(value)))
             }
@@ -141,29 +175,31 @@ impl Value {
     }
 
     pub fn add(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "+", integer::add)
+        self.strict_binary(rhs, "+", integer::add, Some(float::add))
     }
 
     pub fn sub(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "-", integer::sub)
+        self.strict_binary(rhs, "-", integer::sub, Some(float::sub))
     }
 
     pub fn mul(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "*", integer::mul)
+        self.strict_binary(rhs, "*", integer::mul, Some(float::mul))
     }
 
     pub fn div(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "/", integer::div)
+        self.strict_binary(rhs, "/", integer::div, Some(float::div))
     }
 
+    /// Integers only: SQL's `MOD` is not defined for approximate numbers.
     pub fn rem(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, "%", integer::rem)
+        self.strict_binary(rhs, "%", integer::rem, None)
     }
 
     pub fn neg(&self) -> Result<Value, TypeError> {
         match self.operand() {
             None => Ok(Value::Null),
             Some(Operand::Integer(ty, value)) => integer::neg(ty, value),
+            Some(Operand::Float(ty, value)) => float::neg(ty, value),
             Some(other) => Err(TypeError::UndefinedOperator {
                 op: "-",
                 left: None,
@@ -178,13 +214,19 @@ impl Value {
         &self,
         rhs: &Value,
         op: &'static str,
-        operation: fn(DataType, i64, i64) -> Result<Value, TypeError>,
+        integer_operation: fn(DataType, i64, i64) -> Result<Value, TypeError>,
+        float_operation: Option<FloatOperation>,
     ) -> Result<Value, TypeError> {
         match (self.operand(), rhs.operand()) {
             (Some(Operand::Integer(lhs_ty, lhs)), Some(Operand::Integer(rhs_ty, rhs))) => {
-                operation(lhs_ty.promote(rhs_ty), lhs, rhs)
+                integer_operation(lhs_ty.promote(rhs_ty), lhs, rhs)
             }
-            (Some(lhs), Some(rhs)) => Err(undefined_operator(op, &lhs, &rhs)),
+            (Some(lhs), Some(rhs)) => match (lhs.as_float(), rhs.as_float(), float_operation) {
+                (Some((lhs_ty, lhs)), Some((rhs_ty, rhs)), Some(operation)) => {
+                    operation(float::result_type(lhs_ty, rhs_ty), lhs, rhs)
+                }
+                _ => Err(undefined_operator(op, &lhs, &rhs)),
+            },
             _ => Ok(Value::Null),
         }
     }
@@ -288,8 +330,9 @@ impl Value {
     }
 
     /// Total order for `ORDER BY` and indexes. `compare` is not one because of UNKNOWN and
-    /// of the families it refuses to mix; here integers sort before text, text before
-    /// booleans, and NULL after every value (`NULLS LAST` for `ASC`).
+    /// of the families it refuses to mix; here numbers (integers and floats, interleaved by
+    /// value) sort before text, text before booleans, and NULL after every value (`NULLS LAST`
+    /// for `ASC`).
     pub fn sort_cmp(&self, rhs: &Value) -> Ordering {
         match (self.operand(), rhs.operand()) {
             (Some(lhs), Some(rhs)) => lhs.sort_cmp(&rhs),
@@ -308,14 +351,20 @@ impl Value {
             Value::BigInt(value) => Some(Operand::Integer(DataType::BigInt, *value)),
             Value::Text(text) => Some(Operand::Text(text)),
             Value::Boolean(value) => Some(Operand::Boolean(*value)),
+            Value::Real(value) => Some(Operand::Float(DataType::Real, value.get().into())),
+            Value::Double(value) => Some(Operand::Float(DataType::Double, value.get())),
         }
     }
 }
 
-/// A non-NULL value as the operators see it: every integer widened to `i64`, so one
-/// implementation covers all widths, and text borrowed.
+type FloatOperation = fn(DataType, f64, f64) -> Result<Value, TypeError>;
+
+/// A non-NULL value as the operators see it: every integer widened to `i64` and every float
+/// to `f64`, so one implementation covers all widths, and text borrowed.
 enum Operand<'a> {
     Integer(DataType, i64),
+    /// REAL is widened to f64 exactly.
+    Float(DataType, f64),
     Text(&'a str),
     Boolean(bool),
 }
@@ -323,9 +372,19 @@ enum Operand<'a> {
 impl Operand<'_> {
     fn data_type(&self) -> DataType {
         match self {
-            Operand::Integer(ty, _) => *ty,
+            Operand::Integer(ty, _) | Operand::Float(ty, _) => *ty,
             Operand::Text(_) => DataType::VARCHAR_MAX,
             Operand::Boolean(_) => DataType::Boolean,
+        }
+    }
+
+    /// A numeric operand as a float, for arithmetic that involves a float. An integer above
+    /// 2^53 rounds to the nearest f64: such arithmetic is approximate by definition.
+    fn as_float(&self) -> Option<(DataType, f64)> {
+        match *self {
+            Operand::Integer(ty, value) => Some((ty, value as f64)),
+            Operand::Float(ty, value) => Some((ty, value)),
+            Operand::Text(_) | Operand::Boolean(_) => None,
         }
     }
 
@@ -336,12 +395,20 @@ impl Operand<'_> {
         Ok(self.sort_cmp(rhs))
     }
 
+    /// Integers and floats compare by value (`total_cmp` is numeric without NaN and `-0.0`),
     /// `str` orders by its UTF-8 bytes, which is also code point order, and `bool` puts
     /// FALSE before TRUE. A column never mixes families; ordering them (integers, text,
     /// booleans) only makes the order total.
     fn sort_cmp(&self, rhs: &Operand) -> Ordering {
         match (self, rhs) {
             (Operand::Integer(_, lhs), Operand::Integer(_, rhs)) => lhs.cmp(rhs),
+            (Operand::Float(_, lhs), Operand::Float(_, rhs)) => lhs.total_cmp(rhs),
+            (Operand::Integer(_, lhs), Operand::Float(_, rhs)) => {
+                float::compare_integer_with_float(*lhs, *rhs)
+            }
+            (Operand::Float(_, lhs), Operand::Integer(_, rhs)) => {
+                float::compare_integer_with_float(*rhs, *lhs).reverse()
+            }
             (Operand::Text(lhs), Operand::Text(rhs)) => lhs.cmp(rhs),
             (Operand::Boolean(lhs), Operand::Boolean(rhs)) => lhs.cmp(rhs),
             _ => self.data_type().family().cmp(&rhs.data_type().family()),
@@ -370,6 +437,8 @@ impl fmt::Display for Value {
             Value::BigInt(value) => write!(f, "{value}"),
             Value::Text(text) => f.write_str(text),
             Value::Boolean(value) => f.write_str(boolean::literal(*value)),
+            Value::Real(value) => write!(f, "{value}"),
+            Value::Double(value) => write!(f, "{value}"),
         }
     }
 }
@@ -1148,6 +1217,741 @@ mod tests {
     fn display_of_boolean_should_be_the_sql_literal() {
         assert_eq!(Value::Boolean(true).to_string(), "TRUE");
         assert_eq!(Value::Boolean(false).to_string(), "FALSE");
+    }
+
+    fn real(value: f32) -> Value {
+        Value::Real(Finite32::new(value).unwrap())
+    }
+
+    fn double(value: f64) -> Value {
+        Value::Double(Finite64::new(value).unwrap())
+    }
+
+    fn corrupted_float(ty: DataType, reason: &'static str) -> TypeError {
+        TypeError::CorruptedValue { ty, reason }
+    }
+
+    #[test]
+    fn floats_should_have_their_float_type() {
+        assert_eq!(real(1.5).data_type(), Some(DataType::Real));
+        assert_eq!(double(1.5).data_type(), Some(DataType::Double));
+    }
+
+    #[test]
+    fn encode_of_floats_should_be_ieee_754_little_endian() {
+        assert_eq!(real(1.5).encode().unwrap(), [0x00, 0x00, 0xC0, 0x3F]);
+        assert_eq!(double(-2.0).encode().unwrap(), [0, 0, 0, 0, 0, 0, 0, 0xC0]);
+    }
+
+    #[test]
+    fn decode_should_round_trip_float_limits() {
+        let reals = [
+            f32::MIN,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            0.0,
+            -1.5,
+        ];
+        let doubles = [
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            0.0,
+            -1.5,
+        ];
+
+        for value in reals.map(real).into_iter().chain(doubles.map(double)) {
+            let ty = value.data_type().unwrap();
+
+            assert_eq!(Value::decode(ty, value.encode().as_deref()), Ok(value));
+        }
+    }
+
+    #[test]
+    fn decode_of_non_finite_float_bits_should_be_corrupted() {
+        for bits in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY].map(f32::to_le_bytes) {
+            assert_eq!(
+                Value::decode(DataType::Real, Some(&bits)),
+                Err(corrupted_float(DataType::Real, "float must be finite"))
+            );
+        }
+        for bits in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].map(f64::to_le_bytes) {
+            assert_eq!(
+                Value::decode(DataType::Double, Some(&bits)),
+                Err(corrupted_float(DataType::Double, "float must be finite"))
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_negative_zero_should_be_corrupted() {
+        let reason = "negative zero is never stored";
+
+        assert_eq!(
+            Value::decode(DataType::Real, Some(&(-0.0f32).to_le_bytes())),
+            Err(corrupted_float(DataType::Real, reason))
+        );
+        assert_eq!(
+            Value::decode(DataType::Double, Some(&(-0.0f64).to_le_bytes())),
+            Err(corrupted_float(DataType::Double, reason))
+        );
+    }
+
+    #[test]
+    fn decode_of_a_float_with_the_wrong_width_should_fail() {
+        for (ty, expected, widths) in [(DataType::Real, 4, [3, 5]), (DataType::Double, 8, [7, 9])] {
+            for actual in widths {
+                assert_eq!(
+                    Value::decode(ty, Some(&vec![0; actual])),
+                    Err(TypeError::InvalidEncoding {
+                        ty,
+                        expected,
+                        actual
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_of_double_should_read_decimal_and_scientific_forms() {
+        let cases = [
+            ("1", 1.0),
+            ("-2.5", -2.5),
+            (".5", 0.5),
+            ("5.", 5.0),
+            ("1e10", 1e10),
+            ("1.5E-3", 1.5e-3),
+            ("+7", 7.0),
+            ("  3.25\t\n", 3.25),
+            ("0", 0.0),
+            ("123456789012345678901234567890", 1.2345678901234568e29),
+            ("1e-300", 1e-300),
+            ("0e-999", 0.0),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                Value::parse(DataType::Double, input),
+                Ok(double(expected)),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_minus_zero_should_be_zero() {
+        assert_eq!(Value::parse(DataType::Double, "-0"), Ok(double(0.0)));
+        assert_eq!(Value::parse(DataType::Real, "-0.0"), Ok(real(0.0)));
+    }
+
+    #[test]
+    fn parse_of_real_should_round_directly_to_f32() {
+        assert_eq!(Value::parse(DataType::Real, "0.1"), Ok(real(0.1)));
+        assert_eq!(
+            Value::parse(DataType::Real, "16777217"),
+            Ok(real(16_777_216.0))
+        );
+        assert_eq!(Value::parse(DataType::Real, "-3.4e38"), Ok(real(-3.4e38)));
+    }
+
+    #[test]
+    fn parse_of_floats_should_reject_anything_but_finite_decimals() {
+        let cases = [
+            "", " ", "NaN", "nan", "inf", "-inf", "Infinity", "infinity", "0x1p3", "1_0", "1,5",
+            ".", "-.", "e5", "1e", "1e+", "--1", "+-1", "1.2.3", "1e2e3", "1 2", "١", "1f",
+        ];
+
+        for ty in [DataType::Real, DataType::Double] {
+            for input in cases {
+                assert_eq!(
+                    Value::parse(ty, input),
+                    Err(invalid_text(ty, input)),
+                    "{ty} {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_of_floats_beyond_the_type_should_be_out_of_range() {
+        let cases = [
+            (DataType::Double, "1e309"),
+            (DataType::Double, "-1e400"),
+            (DataType::Double, "1e-400"),
+            (DataType::Real, "1e39"),
+            (DataType::Real, "3.5e38"),
+            (DataType::Real, "1e-50"),
+        ];
+
+        for (ty, input) in cases {
+            assert_eq!(
+                Value::parse(ty, input),
+                Err(text_out_of_range(ty, input)),
+                "{ty} {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_of_double_should_use_the_shortest_round_trip_digits() {
+        let cases = [
+            (1.5, "1.5"),
+            (3.0, "3"),
+            (0.0, "0"),
+            (-0.1, "-0.1"),
+            (123.456, "123.456"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1e14, "100000000000000"),
+            (1e15, "1e+15"),
+            (1.2345e20, "1.2345e+20"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (0.1 + 0.2, "0.30000000000000004"),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(double(value).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn display_of_real_should_switch_to_scientific_from_1e6() {
+        let cases = [
+            (0.1, "0.1"),
+            (123456.0, "123456"),
+            (1e6, "1e+06"),
+            (16_777_216.0, "1.6777216e+07"),
+            (f32::MAX, "3.4028235e+38"),
+            (-2.5e-5, "-2.5e-05"),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(real(value).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn floats_should_round_trip_through_their_text() {
+        let reals = [
+            f32::MIN,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            0.1,
+            -7.25,
+        ];
+        let doubles = [
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            0.1,
+            -7.25,
+        ];
+
+        for value in reals.map(real).into_iter().chain(doubles.map(double)) {
+            let ty = value.data_type().unwrap();
+
+            assert_eq!(Value::parse(ty, &value.to_string()), Ok(value));
+        }
+    }
+
+    #[test]
+    fn float_arithmetic_should_compute_common_cases() {
+        let (lhs, rhs) = (double(7.5), double(2.0));
+
+        assert_eq!(lhs.add(&rhs), Ok(double(9.5)));
+        assert_eq!(lhs.sub(&rhs), Ok(double(5.5)));
+        assert_eq!(lhs.mul(&rhs), Ok(double(15.0)));
+        assert_eq!(lhs.div(&rhs), Ok(double(3.75)));
+        assert_eq!(lhs.neg(), Ok(double(-7.5)));
+        assert_eq!(real(1.5).neg(), Ok(real(-1.5)));
+    }
+
+    #[test]
+    fn float_arithmetic_should_give_real_only_for_two_reals() {
+        let cases = [
+            (real(1.0), real(2.0), DataType::Real),
+            (real(1.0), double(2.0), DataType::Double),
+            (double(1.0), real(2.0), DataType::Double),
+            (Value::Integer(1), real(2.0), DataType::Double),
+            (real(1.0), Value::SmallInt(2), DataType::Double),
+            (Value::BigInt(1), double(2.0), DataType::Double),
+        ];
+
+        for (lhs, rhs, ty) in cases {
+            for (name, op) in BINARY_OPS.into_iter().filter(|(name, _)| *name != "%") {
+                let result = op(&lhs, &rhs).unwrap();
+
+                assert_eq!(result.data_type(), Some(ty), "{lhs:?} {name} {rhs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn real_arithmetic_should_round_to_f32() {
+        assert_eq!(real(0.1).add(&real(0.2)), Ok(real(0.1 + 0.2)));
+        assert_eq!(real(1.0).div(&real(3.0)), Ok(real(1.0 / 3.0)));
+        assert_eq!(
+            Value::Integer(16_777_217).mul(&real(1.0)),
+            Ok(double(16_777_217.0))
+        );
+    }
+
+    #[test]
+    fn float_overflow_should_be_out_of_range() {
+        let double_overflow = Err(TypeError::OutOfRange {
+            ty: DataType::Double,
+        });
+        let real_overflow = Err(TypeError::OutOfRange { ty: DataType::Real });
+
+        assert_eq!(double(f64::MAX).mul(&double(2.0)), double_overflow);
+        assert_eq!(double(f64::MAX).mul(&real(f32::MAX)), double_overflow);
+        assert_eq!(double(f64::MAX).add(&double(f64::MAX)), double_overflow);
+        assert_eq!(double(-f64::MAX).sub(&double(f64::MAX)), double_overflow);
+        assert_eq!(double(f64::MAX).div(&double(0.5)), double_overflow);
+        assert_eq!(real(f32::MAX).mul(&real(2.0)), real_overflow);
+        assert_eq!(real(3e38).add(&real(3e38)), real_overflow);
+    }
+
+    #[test]
+    fn float_underflow_should_be_out_of_range() {
+        let cases = [
+            (
+                double(f64::MIN_POSITIVE),
+                double(f64::MIN_POSITIVE),
+                DataType::Double,
+            ),
+            (real(1e-30), real(1e-30), DataType::Real),
+        ];
+
+        for (lhs, rhs, ty) in cases {
+            assert_eq!(lhs.mul(&rhs), Err(TypeError::OutOfRange { ty }), "{lhs:?}");
+        }
+        assert_eq!(
+            double(1e-300).div(&double(1e300)),
+            Err(TypeError::OutOfRange {
+                ty: DataType::Double
+            })
+        );
+    }
+
+    #[test]
+    fn float_arithmetic_should_keep_subnormal_and_exact_zero_results() {
+        assert_eq!(
+            double(f64::MIN_POSITIVE).div(&double(2.0)),
+            Ok(double(f64::MIN_POSITIVE / 2.0))
+        );
+        assert_eq!(double(1.5).sub(&double(1.5)), Ok(double(0.0)));
+        assert_eq!(double(0.0).mul(&double(1e-300)), Ok(double(0.0)));
+        assert_eq!(double(0.0).neg(), Ok(double(0.0)));
+    }
+
+    #[test]
+    fn float_division_by_zero_should_fail() {
+        let cases = [
+            (double(1.0), double(0.0)),
+            (double(0.0), double(0.0)),
+            (double(1.0), Value::Integer(0)),
+            (Value::Integer(1), real(0.0)),
+        ];
+
+        for (lhs, rhs) in cases {
+            assert_eq!(lhs.div(&rhs), Err(TypeError::DivisionByZero), "{lhs:?}");
+        }
+    }
+
+    #[test]
+    fn remainder_with_floats_should_be_an_undefined_operator() {
+        assert_eq!(
+            double(5.0).rem(&double(2.0)),
+            Err(undefined("%", Some(DataType::Double), DataType::Double))
+        );
+        assert_eq!(
+            Value::Integer(5).rem(&real(2.0)),
+            Err(undefined("%", Some(Integer), DataType::Real))
+        );
+    }
+
+    #[test]
+    fn float_arithmetic_with_null_or_another_family_should_follow_the_usual_rules() {
+        assert_eq!(double(1.0).add(&Value::Null), Ok(Value::Null));
+        assert_eq!(Value::Null.mul(&real(1.0)), Ok(Value::Null));
+        assert_eq!(
+            double(1.0).add(&text("1")),
+            Err(undefined(
+                "+",
+                Some(DataType::Double),
+                DataType::VARCHAR_MAX
+            ))
+        );
+        assert_eq!(
+            Value::Boolean(true).sub(&real(1.0)),
+            Err(undefined("-", Some(DataType::Boolean), DataType::Real))
+        );
+    }
+
+    const TWO_POW_53: i64 = 1 << 53;
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+    #[test]
+    fn compare_of_floats_should_be_numeric() {
+        assert_eq!(double(1.5).compare(&double(2.5)), Ok(Some(Ordering::Less)));
+        assert_eq!(real(1.5).compare(&double(1.5)), Ok(Some(Ordering::Equal)));
+        assert_eq!(
+            double(-0.5).compare(&real(-1.0)),
+            Ok(Some(Ordering::Greater))
+        );
+    }
+
+    #[test]
+    fn compare_of_real_0_1_should_see_its_f32_rounding() {
+        assert_eq!(real(0.1).compare(&double(0.1)), Ok(Some(Ordering::Greater)));
+    }
+
+    #[test]
+    fn compare_of_integers_with_floats_should_be_exact() {
+        let cases = [
+            (
+                Value::BigInt(TWO_POW_53 + 1),
+                double(TWO_POW_53 as f64),
+                Ordering::Greater,
+            ),
+            (
+                Value::BigInt(TWO_POW_53),
+                double(TWO_POW_53 as f64),
+                Ordering::Equal,
+            ),
+            (Value::BigInt(i64::MAX), double(TWO_POW_63), Ordering::Less),
+            (
+                Value::BigInt(i64::MAX),
+                double(9.223_372_036_854_775e18),
+                Ordering::Greater,
+            ),
+            (
+                Value::BigInt(i64::MIN),
+                double(-TWO_POW_63),
+                Ordering::Equal,
+            ),
+            (Value::BigInt(i64::MIN), double(-1e19), Ordering::Greater),
+            (
+                Value::BigInt(i64::MIN + 1),
+                double(-TWO_POW_63),
+                Ordering::Greater,
+            ),
+            (Value::Integer(1), double(1.0), Ordering::Equal),
+            (Value::Integer(1), double(1.5), Ordering::Less),
+            (Value::Integer(-2), double(-1.5), Ordering::Less),
+            (Value::Integer(-1), double(-1.5), Ordering::Greater),
+            (Value::SmallInt(0), double(1e-300), Ordering::Less),
+            (Value::SmallInt(0), double(-1e-300), Ordering::Greater),
+            (
+                Value::Integer(16_777_217),
+                real(16_777_216.0),
+                Ordering::Greater,
+            ),
+        ];
+
+        for (integer, float, expected) in cases {
+            assert_eq!(
+                integer.compare(&float),
+                Ok(Some(expected)),
+                "{integer:?} vs {float:?}"
+            );
+            assert_eq!(float.compare(&integer), Ok(Some(expected.reverse())));
+        }
+    }
+
+    #[test]
+    fn sql_comparisons_should_mix_integers_and_floats() {
+        assert_eq!(
+            Value::Integer(1).sql_lt(&double(1.5)),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            real(2.0).sql_eq(&Value::SmallInt(2)),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(double(1.0).sql_ne(&Value::Null), Ok(Value::Null));
+        assert_eq!(Value::Integer(1).is_distinct_from(&double(1.0)), Ok(false));
+        assert_eq!(
+            double(1.0).sql_gt(&text("1")),
+            Err(undefined(
+                ">",
+                Some(DataType::Double),
+                DataType::VARCHAR_MAX
+            ))
+        );
+    }
+
+    #[test]
+    fn sort_cmp_should_interleave_integers_and_floats_by_value() {
+        let mut values = vec![
+            double(2.5),
+            Value::Integer(2),
+            real(-1.0),
+            Value::Null,
+            Value::BigInt(3),
+            double(2.0),
+        ];
+
+        values.sort_by(Value::sort_cmp);
+
+        assert_eq!(
+            values,
+            [
+                real(-1.0),
+                Value::Integer(2),
+                double(2.0),
+                double(2.5),
+                Value::BigInt(3),
+                Value::Null,
+            ]
+        );
+    }
+
+    fn out_of_range_for(ty: DataType) -> TypeError {
+        TypeError::OutOfRange { ty }
+    }
+
+    #[test]
+    fn cast_of_integers_to_floats_should_round_to_the_nearest() {
+        assert_eq!(Value::Integer(1).cast(DataType::Real), Ok(real(1.0)));
+        assert_eq!(
+            Value::BigInt(TWO_POW_53 + 1).cast(DataType::Double),
+            Ok(double(TWO_POW_53 as f64))
+        );
+        assert_eq!(
+            Value::Integer(16_777_217).cast(DataType::Real),
+            Ok(real(16_777_216.0))
+        );
+        assert_eq!(
+            Value::BigInt(i64::MAX).cast(DataType::Real),
+            Ok(real(9.223_372e18))
+        );
+        assert_eq!(
+            Value::SmallInt(i16::MIN).cast(DataType::Double),
+            Ok(double(-32768.0))
+        );
+    }
+
+    #[test]
+    fn cast_of_floats_to_integers_should_round_half_to_even() {
+        let cases = [
+            (0.5, 0),
+            (1.5, 2),
+            (2.5, 2),
+            (3.5, 4),
+            (-0.5, 0),
+            (-2.5, -2),
+            (2.4, 2),
+            (2.6, 3),
+            (-2.6, -3),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(
+                double(value).cast(Integer),
+                Ok(Value::Integer(expected)),
+                "{value}"
+            );
+        }
+        assert_eq!(real(3.5).cast(SmallInt), Ok(Value::SmallInt(4)));
+    }
+
+    #[test]
+    fn cast_of_floats_to_integers_at_the_limits_should_check_the_range() {
+        let fits = [
+            (double(32767.4), Value::SmallInt(i16::MAX)),
+            (double(-32768.5), Value::SmallInt(i16::MIN)),
+            (double(-TWO_POW_63), Value::BigInt(i64::MIN)),
+            (
+                double(9.223_372_036_854_775e18),
+                Value::BigInt(9_223_372_036_854_774_784),
+            ),
+        ];
+        let too_large = [
+            (double(32767.5), SmallInt),
+            (double(-32769.0), SmallInt),
+            (double(2_147_483_647.5), Integer),
+            (double(TWO_POW_63), BigInt),
+            (double(-1e300), BigInt),
+        ];
+
+        for (value, expected) in fits {
+            let ty = expected.data_type().unwrap();
+
+            assert_eq!(value.cast(ty), Ok(expected), "{value:?}");
+        }
+        for (value, ty) in too_large {
+            assert_eq!(
+                value.cast(ty),
+                Err(out_of_range_for(ty)),
+                "{value:?} as {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_between_real_and_double_should_round_and_check_the_range() {
+        assert_eq!(double(0.1).cast(DataType::Real), Ok(real(0.1)));
+        assert_eq!(
+            real(0.1).cast(DataType::Double),
+            Ok(double(f64::from(0.1f32)))
+        );
+        assert_eq!(double(0.0).cast(DataType::Real), Ok(real(0.0)));
+        assert_eq!(
+            double(1e300).cast(DataType::Real),
+            Err(out_of_range_for(DataType::Real))
+        );
+        assert_eq!(
+            double(1e-300).cast(DataType::Real),
+            Err(out_of_range_for(DataType::Real))
+        );
+    }
+
+    #[test]
+    fn cast_of_floats_to_varchar_should_be_their_text_cut_to_n() {
+        assert_eq!(double(1.5).cast(DataType::VARCHAR_MAX), Ok(text("1.5")));
+        assert_eq!(real(0.1).cast(DataType::VARCHAR_MAX), Ok(text("0.1")));
+        assert_eq!(double(1e20).cast(varchar(3)), Ok(text("1e+")));
+        assert_eq!(double(-0.25).cast(varchar(4)), Ok(text("-0.2")));
+    }
+
+    #[test]
+    fn cast_of_text_to_floats_should_follow_the_input_rules() {
+        assert_eq!(text(" 1.5e3 ").cast(DataType::Double), Ok(double(1500.0)));
+        assert_eq!(text("0.1").cast(DataType::Real), Ok(real(0.1)));
+        assert_eq!(
+            text("NaN").cast(DataType::Double),
+            Err(invalid_text(DataType::Double, "NaN"))
+        );
+    }
+
+    #[test]
+    fn cast_between_floats_and_booleans_should_be_impossible() {
+        let cannot = |from, to| Err(TypeError::CannotCast { from, to });
+
+        assert_eq!(
+            real(1.0).cast(DataType::Boolean),
+            cannot(DataType::Real, DataType::Boolean)
+        );
+        assert_eq!(
+            double(0.0).cast(DataType::Boolean),
+            cannot(DataType::Double, DataType::Boolean)
+        );
+        assert_eq!(
+            Value::Boolean(true).cast(DataType::Real),
+            cannot(DataType::Boolean, DataType::Real)
+        );
+        assert_eq!(
+            Value::Boolean(false).cast(DataType::Double),
+            cannot(DataType::Boolean, DataType::Double)
+        );
+        assert_eq!(Value::Null.cast(DataType::Real), Ok(Value::Null));
+    }
+
+    #[test]
+    fn assign_of_a_float_to_an_integer_should_need_an_explicit_cast() {
+        for ty in [SmallInt, Integer, BigInt] {
+            assert_eq!(
+                double(2.0).assign(ty),
+                Err(TypeError::DatatypeMismatch {
+                    value: DataType::Double,
+                    target: ty
+                })
+            );
+            assert_eq!(
+                real(1.0).assign(ty),
+                Err(TypeError::DatatypeMismatch {
+                    value: DataType::Real,
+                    target: ty
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn assign_to_a_float_should_accept_any_numeric_value() {
+        assert_eq!(Value::Integer(2).assign(DataType::Double), Ok(double(2.0)));
+        assert_eq!(
+            Value::BigInt(i64::MAX).assign(DataType::Real),
+            Ok(real(9.223_372e18))
+        );
+        assert_eq!(double(1.5).assign(DataType::Double), Ok(double(1.5)));
+        assert_eq!(real(1.5).assign(DataType::Double), Ok(double(1.5)));
+        assert_eq!(
+            double(1e300).assign(DataType::Real),
+            Err(out_of_range_for(DataType::Real))
+        );
+        assert_eq!(Value::Null.assign(DataType::Real), Ok(Value::Null));
+    }
+
+    #[test]
+    fn assign_of_text_or_booleans_to_floats_should_be_a_datatype_mismatch() {
+        assert_eq!(
+            text("1.5").assign(DataType::Double),
+            Err(TypeError::DatatypeMismatch {
+                value: DataType::VARCHAR_MAX,
+                target: DataType::Double
+            })
+        );
+        assert_eq!(
+            Value::Boolean(true).assign(DataType::Real),
+            Err(TypeError::DatatypeMismatch {
+                value: DataType::Boolean,
+                target: DataType::Real
+            })
+        );
+        assert_eq!(
+            double(1.0).assign(varchar(5)),
+            Err(TypeError::DatatypeMismatch {
+                value: DataType::Double,
+                target: varchar(5)
+            })
+        );
+    }
+
+    #[test]
+    fn concat_with_a_float_should_be_an_undefined_operator() {
+        assert_eq!(
+            text("a").concat(&double(1.5)),
+            Err(undefined(
+                "||",
+                Some(DataType::VARCHAR_MAX),
+                DataType::Double
+            ))
+        );
+        assert_eq!(
+            real(1.5).concat(&real(1.5)),
+            Err(undefined("||", Some(DataType::Real), DataType::Real))
+        );
+    }
+
+    #[test]
+    fn logical_operators_and_tests_with_floats_should_fail() {
+        let and = double(1.0).and(&Value::Boolean(true));
+
+        assert_eq!(and, Err(not_boolean("AND", DataType::Double)));
+        assert_eq!(
+            and.unwrap_err().to_string(),
+            "argument of AND must be type boolean, not type double precision"
+        );
+        assert_eq!(real(0.0).not(), Err(not_boolean("NOT", DataType::Real)));
+        assert_eq!(
+            double(1.0).is_true(),
+            Err(not_boolean("IS TRUE", DataType::Double))
+        );
+    }
+
+    #[test]
+    fn parse_of_floats_should_accept_a_signed_exponent() {
+        assert_eq!(Value::parse(DataType::Double, "1e+5"), Ok(double(1e5)));
+        assert_eq!(Value::parse(DataType::Real, "-2E+3"), Ok(real(-2000.0)));
     }
 
     fn boolean_out_of_range() -> TypeError {
@@ -1956,7 +2760,9 @@ mod tests {
             Value::SmallInt(v) => Some(v.into()),
             Value::Integer(v) => Some(v.into()),
             Value::BigInt(v) => Some(v.into()),
-            Value::Text(_) | Value::Boolean(_) => unreachable!("integer model only"),
+            Value::Real(_) | Value::Double(_) | Value::Text(_) | Value::Boolean(_) => {
+                unreachable!("integer model only")
+            }
         }
     }
 
@@ -1966,7 +2772,9 @@ mod tests {
             SmallInt => Value::SmallInt(i16::try_from(value).map_err(out_of_range)?),
             Integer => Value::Integer(i32::try_from(value).map_err(out_of_range)?),
             BigInt => Value::BigInt(i64::try_from(value).map_err(out_of_range)?),
-            DataType::Varchar(_) | DataType::Boolean => unreachable!("integer model only"),
+            DataType::Real | DataType::Double | DataType::Varchar(_) | DataType::Boolean => {
+                unreachable!("integer model only")
+            }
         })
     }
 
@@ -2101,10 +2909,210 @@ mod tests {
 
     /// Integers (with NULL), text and booleans, so operators meet every family pair.
     fn random_mixed_value(rng: &mut Rng) -> Value {
-        match rng.below(5) {
+        match rng.below(6) {
             0 => text(&random_text(rng)),
             1 => Value::Boolean(rng.below(2) == 0),
+            2 => random_float(rng),
             _ => random_value(rng),
+        }
+    }
+
+    /// REAL or DOUBLE PRECISION: limits, subnormals, round values and random bits.
+    fn random_float(rng: &mut Rng) -> Value {
+        let raw = match rng.below(4) {
+            0 => [
+                0.0,
+                0.1,
+                -1.5,
+                f64::MAX,
+                -f64::MAX,
+                f64::MIN_POSITIVE,
+                f64::from_bits(1),
+                1e-40,
+                3.4e38,
+                1e300,
+            ][rng.below(10)],
+            1 => rng.below(41) as f64 / 4.0 - 5.0,
+            2 => (rng.next() as i64) as f64,
+            _ => f64::from_bits(rng.next()),
+        };
+        let value = if rng.below(2) == 0 {
+            Finite32::new(raw as f32).map(Value::Real)
+        } else {
+            Finite64::new(raw).map(Value::Double)
+        };
+        value.unwrap_or_else(|| double(1.0))
+    }
+
+    fn model_as_f64(value: &Value) -> Option<f64> {
+        match *value {
+            Value::Null => None,
+            Value::SmallInt(v) => Some(v.into()),
+            Value::Integer(v) => Some(v.into()),
+            Value::BigInt(v) => Some(v as f64),
+            Value::Real(v) => Some(v.get().into()),
+            Value::Double(v) => Some(v.get()),
+            Value::Text(_) | Value::Boolean(_) => unreachable!("numeric model only"),
+        }
+    }
+
+    /// IEEE 754 arithmetic in the native type of the result (f32 for REAL op REAL, so the
+    /// "compute in f64, round to f32" claim is checked), plus the SQL rules written apart.
+    fn model_float_arithmetic(name: &str, lhs: &Value, rhs: &Value) -> Result<Value, TypeError> {
+        let (Some(l), Some(r)) = (model_as_f64(lhs), model_as_f64(rhs)) else {
+            return Ok(Value::Null);
+        };
+        if name == "%" {
+            return Err(undefined("%", lhs.data_type(), rhs.data_type().unwrap()));
+        }
+        if name == "/" && r == 0.0 {
+            return Err(TypeError::DivisionByZero);
+        }
+        let is_real = matches!((lhs, rhs), (Value::Real(_), Value::Real(_)));
+        let underflow_needs_zero = |a: f64, b: f64| match name {
+            "*" => a != 0.0 && b != 0.0,
+            "/" => a != 0.0,
+            _ => false,
+        };
+        if is_real {
+            let (a, b) = (l as f32, r as f32);
+            let result = match name {
+                "+" => a + b,
+                "-" => a - b,
+                "*" => a * b,
+                _ => a / b,
+            };
+            let is_underflow = result == 0.0 && underflow_needs_zero(l, r);
+            return match Finite32::new(result) {
+                Some(value) if !is_underflow => Ok(Value::Real(value)),
+                _ => Err(TypeError::OutOfRange { ty: DataType::Real }),
+            };
+        }
+        let result = match name {
+            "+" => l + r,
+            "-" => l - r,
+            "*" => l * r,
+            _ => l / r,
+        };
+        let is_underflow = result == 0.0 && underflow_needs_zero(l, r);
+        match Finite64::new(result) {
+            Some(value) if !is_underflow => Ok(Value::Double(value)),
+            _ => Err(TypeError::OutOfRange {
+                ty: DataType::Double,
+            }),
+        }
+    }
+
+    #[test]
+    fn random_float_arithmetic_should_match_native_ieee_754_arithmetic() {
+        let mut rng = Rng(0x510E_527F_ADE6_82D1);
+
+        for _ in 0..10_000 {
+            let [lhs, rhs] = [(); 2].map(|_| match rng.below(3) {
+                0 => random_value(&mut rng),
+                _ => random_float(&mut rng),
+            });
+            let both_integers = [&lhs, &rhs]
+                .iter()
+                .all(|value| value.data_type().is_some_and(DataType::is_integer));
+            if both_integers {
+                continue;
+            }
+            let (name, op) = BINARY_OPS[rng.below(BINARY_OPS.len())];
+
+            assert_eq!(
+                op(&lhs, &rhs),
+                model_float_arithmetic(name, &lhs, &rhs),
+                "{lhs:?} {name} {rhs:?}"
+            );
+        }
+    }
+
+    /// Exact order of an integer and a finite float through i128 and `floor`, a different
+    /// route from the implementation's `trunc` in `[-2^63, 2^63)`.
+    fn model_compare_integer_with_float(integer: i64, float: f64) -> Ordering {
+        let floor = float.floor();
+        // Saturates for huge floats, which still orders them past every i64.
+        let floor_integer = floor as i128;
+        let has_fraction = float != floor;
+        i128::from(integer)
+            .cmp(&floor_integer)
+            .then(if has_fraction {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            })
+    }
+
+    #[test]
+    fn random_integer_float_comparisons_should_match_an_exact_i128_model() {
+        let mut rng = Rng(0x9B05_688C_2B3E_6C1F);
+        let interesting = [
+            i64::MIN,
+            i64::MIN + 1,
+            -TWO_POW_53 - 1,
+            -TWO_POW_53,
+            -1,
+            0,
+            1,
+            TWO_POW_53,
+            TWO_POW_53 + 1,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+
+        for _ in 0..10_000 {
+            let integer = match rng.below(2) {
+                0 => interesting[rng.below(interesting.len())],
+                _ => rng.next() as i64,
+            };
+            let float = match rng.below(4) {
+                0 => integer as f64 + [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0][rng.below(6)],
+                1 => [TWO_POW_63, -TWO_POW_63, 1e300, -1e300, 0.25][rng.below(5)],
+                2 => (rng.next() as i64) as f64,
+                _ => f64::from_bits(rng.next()),
+            };
+            let Some(finite) = Finite64::new(float) else {
+                continue;
+            };
+
+            assert_eq!(
+                Value::BigInt(integer).compare(&Value::Double(finite)),
+                Ok(Some(model_compare_integer_with_float(
+                    integer,
+                    finite.get()
+                ))),
+                "{integer} vs {float:e}"
+            );
+            if let Some(narrow) = Finite32::new(float as f32) {
+                assert_eq!(
+                    Value::BigInt(integer).compare(&Value::Real(narrow)),
+                    Ok(Some(model_compare_integer_with_float(
+                        integer,
+                        narrow.get().into()
+                    )))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_floats_should_round_trip_through_bytes_and_text() {
+        let mut rng = Rng(0x1F83_D9AB_FB41_BD6B);
+
+        for _ in 0..10_000 {
+            let value = random_float(&mut rng);
+            let ty = value.data_type().unwrap();
+
+            assert_eq!(
+                Value::decode(ty, value.encode().as_deref()).as_ref(),
+                Ok(&value)
+            );
+            assert_eq!(
+                Value::parse(ty, &value.to_string()).as_ref(),
+                Ok(&value),
+                "{value}"
+            );
         }
     }
 

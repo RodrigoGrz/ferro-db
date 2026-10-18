@@ -39,6 +39,11 @@ pub enum TypeError {
         value: DataType,
         target: DataType,
     },
+    /// An explicit CAST between types that have no conversion (a float and a boolean).
+    CannotCast {
+        from: DataType,
+        to: DataType,
+    },
     /// A logical operator or boolean test (`AND`, `NOT`, `IS TRUE`...) given a non-boolean.
     NotBoolean {
         op: &'static str,
@@ -60,6 +65,7 @@ impl TypeError {
             TypeError::DivisionByZero => "22012",
             TypeError::StringTooLong { .. } => "22001",
             TypeError::UndefinedOperator { .. } => "42883",
+            TypeError::CannotCast { .. } => "42846",
             TypeError::DatatypeMismatch { .. } | TypeError::NotBoolean { .. } => "42804",
             TypeError::InvalidEncoding { .. } | TypeError::CorruptedValue { .. } => "XX001",
         }
@@ -115,6 +121,12 @@ impl fmt::Display for TypeError {
                 "cannot assign a value of type {} to a column of type {}",
                 type_name(*value),
                 full_type_name(*target)
+            ),
+            TypeError::CannotCast { from, to } => write!(
+                f,
+                "cannot cast type {} to {}",
+                type_name(*from),
+                type_name(*to)
             ),
             TypeError::NotBoolean { op, actual } => write!(
                 f,
@@ -286,6 +298,61 @@ mod tests {
                 "XX001",
             ),
         ]
+    }
+
+    #[test]
+    fn float_errors_should_name_the_sql_type() {
+        let cases = [
+            (
+                TypeError::OutOfRange {
+                    ty: DataType::Double,
+                },
+                "double precision out of range",
+            ),
+            (
+                TypeError::TextOutOfRange {
+                    ty: DataType::Real,
+                    input: "1e39".to_string(),
+                },
+                "value \"1e39\" is out of range for type real",
+            ),
+            (
+                text_error(DataType::Double, "x"),
+                "invalid input syntax for type double precision: \"x\"",
+            ),
+            (
+                TypeError::CorruptedValue {
+                    ty: DataType::Double,
+                    reason: "float must be finite",
+                },
+                "stored double precision value is corrupted: float must be finite",
+            ),
+            (
+                TypeError::DatatypeMismatch {
+                    value: DataType::Double,
+                    target: DataType::Integer,
+                },
+                "cannot assign a value of type double precision to a column of type integer",
+            ),
+        ];
+
+        for (err, message) in cases {
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn cannot_cast_should_name_both_types() {
+        let err = TypeError::CannotCast {
+            from: DataType::Double,
+            to: DataType::Boolean,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "cannot cast type double precision to boolean"
+        );
+        assert_eq!(err.sqlstate(), "42846");
     }
 
     #[test]

@@ -8,6 +8,10 @@ pub enum DataType {
     SmallInt,
     Integer,
     BigInt,
+    /// IEEE 754 binary32.
+    Real,
+    /// IEEE 754 binary64.
+    Double,
     /// At most `n` characters (Unicode scalar values); the type rules out `VARCHAR(0)`.
     Varchar(NonZeroU16),
     Boolean,
@@ -17,7 +21,8 @@ pub enum DataType {
 /// explicit CAST converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TypeFamily {
-    Integer,
+    /// Integers and floats: they mix in arithmetic and comparison.
+    Numeric,
     Text,
     Boolean,
 }
@@ -32,6 +37,8 @@ impl DataType {
             DataType::SmallInt => "SMALLINT",
             DataType::Integer => "INTEGER",
             DataType::BigInt => "BIGINT",
+            DataType::Real => "REAL",
+            DataType::Double => "DOUBLE PRECISION",
             DataType::Varchar(_) => "VARCHAR",
             DataType::Boolean => "BOOLEAN",
         }
@@ -42,6 +49,8 @@ impl DataType {
             DataType::SmallInt => Some(size_of::<i16>()),
             DataType::Integer => Some(size_of::<i32>()),
             DataType::BigInt => Some(size_of::<i64>()),
+            DataType::Real => Some(size_of::<f32>()),
+            DataType::Double => Some(size_of::<f64>()),
             DataType::Varchar(_) => None,
             DataType::Boolean => Some(size_of::<bool>()),
         }
@@ -55,8 +64,20 @@ impl DataType {
         }
     }
 
+    /// The exact numeric types; `is_numeric` also takes the floats.
     pub fn is_integer(self) -> bool {
-        self.family() == TypeFamily::Integer
+        matches!(
+            self,
+            DataType::SmallInt | DataType::Integer | DataType::BigInt
+        )
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, DataType::Real | DataType::Double)
+    }
+
+    pub fn is_numeric(self) -> bool {
+        self.family() == TypeFamily::Numeric
     }
 
     pub fn is_text(self) -> bool {
@@ -69,14 +90,19 @@ impl DataType {
 
     pub(crate) fn family(self) -> TypeFamily {
         match self {
-            DataType::SmallInt | DataType::Integer | DataType::BigInt => TypeFamily::Integer,
+            DataType::SmallInt
+            | DataType::Integer
+            | DataType::BigInt
+            | DataType::Real
+            | DataType::Double => TypeFamily::Numeric,
             DataType::Varchar(_) => TypeFamily::Text,
             DataType::Boolean => TypeFamily::Boolean,
         }
     }
 
     /// Result type of `a op b` for integers: the wider operand (`SMALLINT + INTEGER -> INTEGER`).
-    /// Meaningless for VARCHAR, so only the integer operators in `types` call it.
+    /// Integers only: REAL has the width of INTEGER, so floats would get a wrong answer here;
+    /// float arithmetic uses `float::result_type`.
     pub(crate) fn promote(self, other: DataType) -> DataType {
         if self.fixed_width() >= other.fixed_width() {
             self
@@ -108,14 +134,30 @@ mod tests {
 
     #[test]
     fn name_should_be_the_sql_keyword() {
-        let names: Vec<_> = [SmallInt, Integer, BigInt, varchar(5), DataType::Boolean]
-            .iter()
-            .map(|ty| ty.name())
-            .collect();
+        let names: Vec<_> = [
+            SmallInt,
+            Integer,
+            BigInt,
+            DataType::Real,
+            DataType::Double,
+            varchar(5),
+            DataType::Boolean,
+        ]
+        .iter()
+        .map(|ty| ty.name())
+        .collect();
 
         assert_eq!(
             names,
-            ["SMALLINT", "INTEGER", "BIGINT", "VARCHAR", "BOOLEAN"]
+            [
+                "SMALLINT",
+                "INTEGER",
+                "BIGINT",
+                "REAL",
+                "DOUBLE PRECISION",
+                "VARCHAR",
+                "BOOLEAN"
+            ]
         );
     }
 
@@ -125,6 +167,31 @@ mod tests {
         assert_eq!(varchar(40).to_string(), "VARCHAR(40)");
         assert_eq!(DataType::VARCHAR_MAX.to_string(), "VARCHAR(65535)");
         assert_eq!(DataType::Boolean.to_string(), "BOOLEAN");
+        assert_eq!(DataType::Double.to_string(), "DOUBLE PRECISION");
+    }
+
+    #[test]
+    fn floats_should_be_fixed_ieee_754_widths() {
+        assert_eq!(DataType::Real.fixed_width(), Some(4));
+        assert_eq!(DataType::Double.fixed_width(), Some(8));
+        assert_eq!(DataType::Real.layout(), ColumnLayout::Fixed(4));
+        assert_eq!(DataType::Double.layout(), ColumnLayout::Fixed(8));
+    }
+
+    #[test]
+    fn floats_should_be_numeric_but_not_integers() {
+        for ty in [DataType::Real, DataType::Double] {
+            assert!(ty.is_float());
+            assert!(ty.is_numeric());
+            assert!(!ty.is_integer());
+            assert_eq!(ty.family(), TypeFamily::Numeric);
+        }
+        for ty in INTEGERS {
+            assert!(ty.is_numeric());
+            assert!(!ty.is_float());
+        }
+        assert!(!varchar(1).is_numeric());
+        assert!(!DataType::Boolean.is_numeric());
     }
 
     #[test]
@@ -178,7 +245,7 @@ mod tests {
     #[test]
     fn family_should_group_the_integer_widths_and_every_varchar() {
         for ty in INTEGERS {
-            assert_eq!(ty.family(), TypeFamily::Integer);
+            assert_eq!(ty.family(), TypeFamily::Numeric);
         }
         assert_eq!(varchar(1).family(), TypeFamily::Text);
         assert_eq!(DataType::VARCHAR_MAX.family(), TypeFamily::Text);

@@ -7,9 +7,10 @@
 //! ```
 //!
 //! `data_type`: 1 SMALLINT, 2 INTEGER, 3 BIGINT, 4 VARCHAR followed by its `n` (1 to 65535),
-//! 5 BOOLEAN; 0 stays invalid so a zeroed entry never decodes. `flags`: bit 0 = nullable, the
-//! other bits must be 0. Names have 1 to 63 bytes of UTF-8. Decoding rejects anything else,
-//! including missing or trailing bytes, so an entry is at most 74 bytes and always fits a page.
+//! 5 BOOLEAN, 6 REAL, 7 DOUBLE PRECISION; 0 stays invalid so a zeroed entry never decodes.
+//! `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to 63 bytes of UTF-8.
+//! Decoding rejects anything else, including missing or trailing bytes, so an entry is at most
+//! 74 bytes and always fits a page.
 
 use std::num::NonZeroU16;
 
@@ -116,6 +117,8 @@ fn write_data_type(bytes: &mut Vec<u8>, data_type: DataType) {
             bytes.extend(max_chars.get().to_le_bytes());
         }
         DataType::Boolean => bytes.push(5),
+        DataType::Real => bytes.push(6),
+        DataType::Double => bytes.push(7),
     }
 }
 
@@ -133,6 +136,8 @@ fn read_data_type(reader: &mut ByteReader<'_>) -> Result<DataType, CatalogError>
                 })
         }
         5 => Ok(DataType::Boolean),
+        6 => Ok(DataType::Real),
+        7 => Ok(DataType::Double),
         _ => Err(CatalogError::Corrupted {
             reason: "unknown column type",
         }),
@@ -230,14 +235,25 @@ mod tests {
         DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
     }
 
-    const ALL_TYPES: [DataType; 6] = [
+    const ALL_TYPES: [DataType; 8] = [
         SmallInt,
         Integer,
         BigInt,
+        DataType::Real,
+        DataType::Double,
         DataType::Varchar(std::num::NonZeroU16::MIN),
         DataType::VARCHAR_MAX,
         DataType::Boolean,
     ];
+
+    #[test]
+    fn column_records_of_floats_should_use_codes_6_and_7() {
+        let real = column("r", DataType::Real, true).encode().unwrap();
+        let double = column("d", DataType::Double, true).encode().unwrap();
+
+        assert_eq!(real, [5, 0, 0, 0, 1, 2, 6, 1, 1, b'r']);
+        assert_eq!(double, [5, 0, 0, 0, 1, 2, 7, 1, 1, b'd']);
+    }
 
     #[test]
     fn column_record_of_boolean_should_use_code_5() {
@@ -359,7 +375,7 @@ mod tests {
         let valid = column("id", Integer, true).encode().unwrap();
         let cases = [
             (6, 0, "unknown column type"),
-            (6, 6, "unknown column type"),
+            (6, 8, "unknown column type"),
             (7, 0b10, "unknown column flags"),
             (7, 0xFF, "unknown column flags"),
         ];
@@ -452,7 +468,9 @@ mod tests {
                         BigInt,
                         varchar((rng.next() as u16).max(1)),
                         DataType::Boolean,
-                    ][rng.below(5)],
+                        DataType::Real,
+                        DataType::Double,
+                    ][rng.below(7)],
                 },
                 nullable: rng.below(2) == 0,
             },

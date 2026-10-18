@@ -14,6 +14,7 @@ The rationale comes from the design notes written while each component was built
 | [0006](0006-catalog-on-page-zero.md) | Catalog bootstrapped from page 0, stored in two heaps with its own record format | Accepted |
 | [0007](0007-fail-without-side-effects.md) | Operations validate first and fail without side effects; disk data is never trusted | Accepted |
 | [0008](0008-varchar-utf8-byte-order-and-assignment.md) | Text is `VARCHAR(n)` in UTF-8, compared by bytes, with store assignment separate from `CAST` | Accepted |
+| [0009](0009-floats-finite-exact-comparison-numeric-family.md) | Floats are finite, compare exactly with integers and share one numeric family | Accepted |
 
 ## Adding a record
 

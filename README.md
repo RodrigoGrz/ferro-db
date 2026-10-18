@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine and a persistent catalog work and are tested (602 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine and a persistent catalog work and are tested (662 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -26,7 +26,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **Slotted pages and RID** | Variable-size tuples inside a page behind stable slot ids, with tombstones and lazy compaction. A `Rid` (page + slot) addresses any row. |
 | **Tuple format** | NULL bitmap, fixed and variable-width fields, strict validation of bytes read from disk. |
 | **Heap File + free space map** | A table's rows across a linked list of pages, first-fit placement in O(log n), moves rows that outgrow their page. |
-| **Data types** | `SMALLINT`, `INTEGER`, `BIGINT`, `VARCHAR(n)`, `BOOLEAN` and `NULL`, with SQL semantics: parsing, casts and store assignment, overflow-checked arithmetic, `||`, comparisons as SQL values, three-valued `AND`/`OR`/`NOT` and PostgreSQL-compatible SQLSTATE codes. |
+| **Data types** | `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `VARCHAR(n)`, `BOOLEAN` and `NULL`, with SQL semantics: parsing, casts and store assignment, overflow-checked arithmetic, `||`, comparisons as SQL values, three-valued `AND`/`OR`/`NOT` and PostgreSQL-compatible SQLSTATE codes. |
 | **Schema** | Column definitions, `NOT NULL`, and typed row ⇄ tuple conversion with SQL assignment rules. |
 | **Catalog** | Tables and columns persisted on disk and bootstrapped from page 0, loaded into memory on open. |
 
@@ -36,7 +36,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** SQL lexer and parser, query planning and execution, B+Tree indexes, more data types (floats, dates), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** SQL lexer and parser, query planning and execution, B+Tree indexes, more data types (`NUMERIC`, dates), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -139,7 +139,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - [ROADMAP.md](ROADMAP.md): implementation checklist, with evidence for what is done
 - [docs/architecture.md](docs/architecture.md): components, data flow, testing strategy, limitations
 - [docs/storage-engine.md](docs/storage-engine.md): disk manager, buffer pool, LRU-K, page and tuple formats, heap file, free space management
-- [docs/data-model.md](docs/data-model.md): integers, VARCHAR, BOOLEAN and NULL, schema, catalog, deviations from the SQL standard
+- [docs/data-model.md](docs/data-model.md): integers, floats, VARCHAR, BOOLEAN and NULL, schema, catalog, deviations from the SQL standard
 - [docs/decisions/](docs/decisions/README.md): architectural decision records
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and conventions
 
@@ -148,7 +148,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - **No SQL yet.** Everything is driven through the Rust API.
 - **Single-threaded.** No concurrent access, locks or transactions.
 - **No crash safety.** Without a WAL, a crash can lose pages that were not yet written, and multi-page operations (moving an updated row, creating a table) are not atomic. Errors *inside* the process return without leaving half-applied changes in a page or in the buffer pool; multi-page operations fall back to a best-effort undo.
-- **Few types:** integers, `VARCHAR(n)`, `BOOLEAN` and `NULL`. Text compares by bytes (no collations), and a value must fit in one page.
+- **Few types:** integers, floats, `VARCHAR(n)`, `BOOLEAN` and `NULL`; no `NUMERIC` yet. Text compares by bytes (no collations), and a value must fit in one page.
 - **Unstable formats.** On-disk formats change between versions without migrations; database files are disposable.
 
 ## Acknowledgements

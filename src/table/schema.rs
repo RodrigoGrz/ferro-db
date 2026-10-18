@@ -338,6 +338,7 @@ fn check_column_names(columns: &[Column]) -> Result<(), SchemaError> {
 mod tests {
     use super::*;
     use crate::storage::tuple::{ColumnLayout, MAX_TUPLE_SIZE};
+    use crate::types::{Finite32, Finite64};
     use DataType::{BigInt, Integer, SmallInt};
 
     fn people() -> Schema {
@@ -409,6 +410,20 @@ mod tests {
             [ColumnLayout::Fixed(4), ColumnLayout::Fixed(1)]
         );
         assert_eq!(schema.min_row_size(), 2 + 1 + 4 + 1);
+    }
+
+    #[test]
+    fn float_columns_should_use_fixed_ieee_754_fields() {
+        let schema = Schema::new(vec![
+            Column::new("ratio", DataType::Real),
+            Column::new("price", DataType::Double),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            schema.layout().columns(),
+            [ColumnLayout::Fixed(4), ColumnLayout::Fixed(8)]
+        );
     }
 
     #[test]
@@ -896,6 +911,48 @@ mod tests {
         }
     }
 
+    fn prices() -> Schema {
+        Schema::new(vec![
+            Column::not_null("id", Integer),
+            Column::new("price", DataType::Double),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn encode_row_should_assign_integers_to_float_columns() {
+        let schema = prices();
+
+        let tuple = schema
+            .encode_row(&[Value::Integer(1), Value::Integer(10)])
+            .unwrap();
+
+        assert_eq!(
+            schema.decode_column(&tuple, 1).unwrap(),
+            Value::Double(crate::types::Finite64::new(10.0).unwrap())
+        );
+    }
+
+    #[test]
+    fn encode_row_with_a_float_in_an_integer_column_should_be_a_datatype_mismatch() {
+        let schema = prices();
+        let price = Value::Double(crate::types::Finite64::new(2.5).unwrap());
+
+        let err = schema.encode_row(&[price, Value::Null]).unwrap_err();
+
+        assert_eq!(
+            err,
+            type_error(
+                "id",
+                TypeError::DatatypeMismatch {
+                    value: DataType::Double,
+                    target: Integer
+                }
+            )
+        );
+        assert_eq!(err.sqlstate(), "42804");
+    }
+
     #[test]
     fn encode_row_across_type_families_should_be_a_datatype_mismatch() {
         let schema = profiles();
@@ -1165,10 +1222,27 @@ mod tests {
 
     /// Integers of every width and short VARCHARs, so text hits its limit often.
     fn random_type(rng: &mut Rng) -> DataType {
-        match rng.below(5) {
+        match rng.below(7) {
             0 => varchar(1 + rng.below(8) as u16),
             1 => DataType::Boolean,
+            2 => DataType::Real,
+            3 => DataType::Double,
             _ => INTEGERS[rng.below(3)],
+        }
+    }
+
+    /// REAL or DOUBLE PRECISION near the limits where narrowing to REAL fails, or from
+    /// random bits; NULL when the bits are not a finite value.
+    fn random_float(rng: &mut Rng) -> Value {
+        let raw = match rng.below(3) {
+            0 => [0.0, 1.5, -2.25, 1e-40, 1e-300, 3e38, 1e300, f64::MAX][rng.below(8)],
+            1 => rng.below(201) as f64 - 100.0,
+            _ => f64::from_bits(rng.next()),
+        };
+        if rng.below(2) == 0 {
+            Finite32::new(raw as f32).map_or(Value::Null, Value::Real)
+        } else {
+            Finite64::new(raw).map_or(Value::Null, Value::Double)
         }
     }
 
@@ -1203,9 +1277,10 @@ mod tests {
         if rng.below(7) == 0 {
             return Value::Null;
         }
-        match rng.below(5) {
+        match rng.below(6) {
             0 => return Value::Text(random_text(rng)),
             1 => return Value::Boolean(rng.below(2) == 0),
+            2 => return random_float(rng),
             _ => {}
         }
         let raw = match rng.below(3) {
@@ -1235,7 +1310,11 @@ mod tests {
             Value::SmallInt(v) => v.into(),
             Value::Integer(v) => v.into(),
             Value::BigInt(v) => v.into(),
-            Value::Null | Value::Text(_) | Value::Boolean(_) => unreachable!("integers only"),
+            Value::Null
+            | Value::Real(_)
+            | Value::Double(_)
+            | Value::Text(_)
+            | Value::Boolean(_) => unreachable!("integers only"),
         }
     }
 
@@ -1244,7 +1323,9 @@ mod tests {
             SmallInt => i16::try_from(number).ok().map(Value::SmallInt),
             Integer => i32::try_from(number).ok().map(Value::Integer),
             BigInt => i64::try_from(number).ok().map(Value::BigInt),
-            DataType::Varchar(_) | DataType::Boolean => unreachable!("integer columns only"),
+            DataType::Real | DataType::Double | DataType::Varchar(_) | DataType::Boolean => {
+                unreachable!("integer columns only")
+            }
         };
         fitted.ok_or_else(|| {
             type_error(
@@ -1254,6 +1335,39 @@ mod tests {
                 },
             )
         })
+    }
+
+    /// Assignment to a float column: integers round once, straight to the column's type;
+    /// DOUBLE PRECISION into REAL overflows to infinity or underflows to zero.
+    fn expected_float(column: &Column, value: &Value) -> Result<Value, SchemaError> {
+        let out_of_range = || {
+            type_error(
+                &column.name,
+                TypeError::OutOfRange {
+                    ty: column.data_type,
+                },
+            )
+        };
+        if column.data_type == DataType::Double {
+            let wide = match *value {
+                Value::Real(real) => f64::from(real.get()),
+                Value::Double(double) => double.get(),
+                ref integer => as_i128(integer) as f64,
+            };
+            return Ok(Value::Double(Finite64::new(wide).unwrap()));
+        }
+        let narrow = match *value {
+            Value::Real(real) => real.get(),
+            Value::Double(double) => double.get() as f32,
+            ref integer => as_i128(integer) as f32,
+        };
+        let is_underflow = narrow == 0.0 && matches!(value, Value::Double(d) if d.get() != 0.0);
+        if is_underflow {
+            return Err(out_of_range());
+        }
+        Finite32::new(narrow)
+            .map(Value::Real)
+            .ok_or_else(out_of_range)
     }
 
     /// Store assignment on a `Vec<char>`: past `n` characters, only spaces may be cut.
@@ -1301,6 +1415,10 @@ mod tests {
                     (Value::Boolean(_), _) => mismatch(DataType::Boolean),
                     (number, DataType::Varchar(_) | DataType::Boolean) => {
                         mismatch(number.data_type().unwrap())
+                    }
+                    (number, DataType::Real | DataType::Double) => expected_float(column, number),
+                    (float @ (Value::Real(_) | Value::Double(_)), _) => {
+                        mismatch(float.data_type().unwrap())
                     }
                     (number, _) => expected_integer(column, as_i128(number)),
                 }
@@ -1356,6 +1474,12 @@ mod tests {
                             .collect(),
                     ),
                     DataType::Boolean => Value::Boolean(rng.below(2) == 0),
+                    DataType::Real => {
+                        Value::Real(Finite32::new(rng.below(1000) as f32 / 8.0).unwrap())
+                    }
+                    DataType::Double => {
+                        Value::Double(Finite64::new(rng.below(1000) as f64 / 8.0).unwrap())
+                    }
                     integer => Value::BigInt(rng.below(100) as i64).cast(integer).unwrap(),
                 },
             })

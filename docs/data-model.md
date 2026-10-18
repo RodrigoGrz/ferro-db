@@ -7,6 +7,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 - [Data Types: Integers and NULL](#data-types-integers-and-null)
 - [Data Types: VARCHAR](#data-types-varchar)
 - [Data Types: BOOLEAN](#data-types-boolean)
+- [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision)
 - [Schema](#schema)
 - [Catalog](#catalog)
 - [Deviations from the SQL Standard](#deviations-from-the-sql-standard)
@@ -15,7 +16,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 
 ## Data Types: Integers and NULL
 
-The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text and booleans are in [Data Types: VARCHAR](#data-types-varchar) and [Data Types: BOOLEAN](#data-types-boolean). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
+The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text, booleans and floats are in [Data Types: VARCHAR](#data-types-varchar), [Data Types: BOOLEAN](#data-types-boolean) and [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
 
 | File | Responsibility |
 |---|---|
@@ -23,14 +24,15 @@ The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and 
 | `value.rs` | `Value`: `NULL`, encode/decode, parse, `Display`, cast and assignment, operators, comparison |
 | `integer.rs` | integer semantics in `i64` + narrowing to the target type (private) |
 | `text.rs` | `VARCHAR(n)` semantics: length in characters, truncation, trailing-space rule, UTF-8 validation (private) |
+| `float.rs` | `REAL` / `DOUBLE PRECISION`: finite newtypes, text input and output, checked arithmetic, conversions, exact comparison with integers (private) |
 | `boolean.rs` | `BOOLEAN` semantics: the 1-byte format, text input, integer conversion, Kleene's `AND`/`OR` (private) |
 | `error.rs` | `TypeError` with message and PostgreSQL-compatible `SQLSTATE` |
 
 ### Types and bytes
 
 ```rust
-pub enum DataType { SmallInt, Integer, BigInt, Varchar(NonZeroU16), Boolean }
-pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String), Boolean(bool) }
+pub enum DataType { SmallInt, Integer, BigInt, Real, Double, Varchar(NonZeroU16), Boolean }
+pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32), Double(Finite64), Text(String), Boolean(bool) }
 ```
 
 | Type | Rust | `ColumnLayout` | Field in the tuple | `-2` |
@@ -57,7 +59,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String), B
   - `compare` → `Result<Option<Ordering>, TypeError>`; `Ok(None)` is `UNKNOWN` whenever one side is `NULL` (including `NULL = NULL`). Compares by value regardless of width (`INTEGER 5 = BIGINT 5`). Comparing an integer with text → `UndefinedOperator` (`42883`).
   - `sql_eq` / `sql_lt` / ... → the same comparison as a SQL value (`Boolean` or `Null`); see [BOOLEAN](#comparison-as-sql-values).
   - `is_distinct_from` → `Result<bool, TypeError>`, `IS DISTINCT FROM`: `NULL` equals `NULL`, never `UNKNOWN`.
-  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: integers sort before text and text before booleans, an order that only exists to make the function total (a column never mixes families).
+  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: numbers (integers and floats, interleaved by value) sort before text and text before booleans, an order that only exists to make the function total (a column never mixes families).
 
 ### Errors
 
@@ -69,7 +71,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String), B
 | `DivisionByZero` | `22012` | `division by zero` |
 | `InvalidEncoding` | `XX001` | `integer field must be 4 bytes, got 2` |
 
-The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), and `NotBoolean` in the [BOOLEAN section](#errors-2).
+The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), `NotBoolean` in the [BOOLEAN section](#errors-2), and `CannotCast` in the [float section](#errors-3).
 
 ### Design decisions
 
@@ -248,6 +250,113 @@ The table is symmetric; `NOT T = F`, `NOT F = T`, `NOT N = N`.
 - `schema.rs` and `catalog`: boolean columns (`Fixed(1)`), round trip, `42804` in both directions, the random assignment and corruption tests with boolean columns and values, catalog code `5` and random creations with `BOOLEAN`.
 - Integration in [`tests/types_boolean.rs`](../tests/types_boolean.rs): a catalog table `(id INTEGER NOT NULL, active BOOLEAN NOT NULL, verified BOOLEAN)` with 2,000 rows survives eviction with a 2-frame pool and reopening the file; a `WHERE active AND verified` filter written with `and` + `is_true`, and `verified IS UNKNOWN`, return the expected rows; a boolean byte `2` written below the schema → `Type { .., CorruptedValue }` (`XX001`).
 
+## Data Types: REAL and DOUBLE PRECISION
+
+`REAL` is IEEE 754 binary32 (`f32`) and `DOUBLE PRECISION` binary64 (`f64`). They are *approximate* numbers (`0.1 + 0.2 <> 0.3`) and share the **numeric family** with the integers: they mix in arithmetic and comparison without a `CAST`. See [ADR 0009](decisions/0009-floats-finite-exact-comparison-numeric-family.md).
+
+```rust
+DataType::Real, DataType::Double
+Value::Real(Finite32), Value::Double(Finite64)
+Finite64::new(1.5)                    // Option: None for NaN and ±infinity; -0.0 becomes 0.0
+```
+
+`src/types/float.rs` (private) holds the finite newtypes, the text input and output, the arithmetic, the conversions and the exact comparison with integers.
+
+### Only finite values
+
+SQL has no NaN or infinity, so ferroDB has none either: `Finite32` / `Finite64` are built only from finite values and fold `-0.0` into `0.0`. A `Value` can never hold NaN, which keeps `Value: Eq`; without NaN and `-0.0`, `total_cmp` is the numeric order and equal values have equal bits, so every value has a single encoding.
+
+### Bytes
+
+| Type | `ColumnLayout` | Field in the tuple |
+|---|---|---|
+| `REAL` | `Fixed(4)` | IEEE 754 binary32, little-endian |
+| `DOUBLE PRECISION` | `Fixed(8)` | IEEE 754 binary64, little-endian |
+
+Reading NaN, ±infinity (`float must be finite`) or `-0.0` (`negative zero is never stored`) → `CorruptedValue` (`XX001`); a wrong width → `InvalidEncoding`.
+
+### Text
+
+- **Input** (`Value::parse`): surrounding whitespace, optional sign, digits with an optional point and an optional exponent (`1`, `-2.5`, `.5`, `5.`, `1e10`, `1.5E-3`).
+  - `NaN`, `inf`, `Infinity`, hexadecimal, `1_000`, `1,5`, `.`, `e5`, empty → `InvalidTextRepresentation` (`22P02`). The syntax is checked by hand first, because Rust's `str::parse` (which rounds correctly) would accept `inf` and `NaN`.
+  - `REAL` parses straight to `f32`; going through `f64` would round twice (`'16777217'` → `16777216`).
+  - Too large for the type (`1e309`, or `3.5e38` for `REAL`), or a non-zero literal that rounds to zero (`1e-400`) → `TextOutOfRange` (`22003`).
+- **Output** (`Display`): the **shortest digits that round-trip** (Rust's `{:e}`), laid out like C's `%g`, as PostgreSQL prints floats: positional when the decimal exponent is in `[-4, 15)` for `DOUBLE PRECISION` and `[-4, 6)` for `REAL` (`f64::DIGITS`, `f32::DIGITS`), scientific with a signed two-digit exponent otherwise.
+
+| Value | `DOUBLE PRECISION` | `REAL` |
+|---|---|---|
+| `1.5`, `3` | `1.5`, `3` | `1.5`, `3` |
+| `0.0001`, `0.00001` | `0.0001`, `1e-05` | `0.0001`, `1e-05` |
+| `123456`, `1e6` | `123456`, `1000000` | `123456`, `1e+06` |
+| `1e15` | `1e+15` | `1e+15` |
+| `0.1 + 0.2` | `0.30000000000000004` | — |
+| maximum | `1.7976931348623157e+308` | `3.4028235e+38` |
+
+`parse(display(x)) == x` for every value.
+
+### Arithmetic
+
+| Operands | Result type |
+|---|---|
+| `REAL` op `REAL` | `REAL` |
+| any other mix with a float (`REAL` op `DOUBLE`, integer op float) | `DOUBLE PRECISION` |
+
+- Operands are widened to `f64` and the result is narrowed to its type, like the integers in `i64`. For `REAL`, rounding the `f64` result to `f32` equals computing in `f32` (double rounding is harmless for `+ - * /`, since 53 ≥ 2·24 + 2); the randomized test checks it against native `f32`.
+- **Overflow** (infinite in the result type) → `OutOfRange` (`22003`).
+- **Underflow**: a result that is zero while the exact result is not (`MIN_POSITIVE * MIN_POSITIVE`) → `OutOfRange` (`22003`), as in PostgreSQL. Subnormal results are kept.
+- **`x / 0`** → `DivisionByZero` (`22012`), never IEEE's infinity.
+- **`%` with a float** → `UndefinedOperator` (`42883`): SQL's `MOD` is defined for exact numbers only.
+- `NULL` stays strict; text or booleans → `42883`.
+
+### Comparison
+
+- Float with float: numeric (`total_cmp`).
+- Integer with float: **exact**, by algebraic value, as the standard asks. The integer is never converted to `f64`: outside `[-2⁶³, 2⁶³)` the float decides; inside, the integer is compared with the float's integral part and a tie is broken by the fraction. So `9007199254740993 > 9007199254740992.0`, where PostgreSQL (which converts to `float8`) says they are equal.
+- `sql_*`, `is_distinct_from` and `sort_cmp` follow: in `sort_cmp`, integers and floats interleave by value (`2` and `2.0` tie).
+
+### Cast and assignment
+
+| From → to | integer | float | `VARCHAR(n)` | `BOOLEAN` |
+|---|---|---|---|---|
+| integer | (integers) | rounds to the nearest `f32`/`f64` (straight from `i64`) | (integers) | (BOOLEAN) |
+| float | `cast`: rounds **half to even** (`2.5` → `2`, `3.5` → `4`), out of range → `22003`; `assign`: `42804` | `DOUBLE` → `REAL` rounds; overflow or underflow → `22003` | `cast`: the `Display` text cut to `n`; `assign`: `42804` | `CannotCast` (`42846`) |
+| text | (VARCHAR) | `cast`: `parse`; `assign`: `42804` | (VARCHAR) | (BOOLEAN) |
+| boolean | (BOOLEAN) | `CannotCast` (`42846`) | (BOOLEAN) | (BOOLEAN) |
+| `NULL` | `NULL` | `NULL` | `NULL` | `NULL` |
+
+- **Assignment is asymmetric** inside the numeric family: an integer goes into a float column, but a float goes into an integer column only through an explicit `CAST`, so a fraction is never rounded away by an `INSERT`.
+- Floats and booleans have no `CAST` in either direction (`cannot cast type double precision to boolean`), as in PostgreSQL; this is the only pair of types without one.
+
+### Errors
+
+| `TypeError` | SQLSTATE | Message |
+|---|---|---|
+| `OutOfRange` | `22003` | `double precision out of range` (overflow, underflow, `DOUBLE` → `REAL`, float → integer) |
+| `TextOutOfRange` | `22003` | `value "1e400" is out of range for type double precision` |
+| `InvalidTextRepresentation` | `22P02` | `invalid input syntax for type real: "NaN"` |
+| `DivisionByZero` | `22012` | `division by zero` |
+| `CannotCast` | `42846` | `cannot cast type double precision to boolean` |
+| `DatatypeMismatch` | `42804` | `cannot assign a value of type double precision to a column of type integer` |
+| `CorruptedValue` | `XX001` | `stored double precision value is corrupted: float must be finite` |
+
+### Design decisions
+
+See [ADR 0009](decisions/0009-floats-finite-exact-comparison-numeric-family.md). Also:
+
+- **`Finite32` / `Finite64` generated by one `macro_rules!`**: the two types differ only in the float type; a macro avoids two copies of the same forty lines.
+- **`TypeFamily::Integer` became `Numeric`**: assignment and comparison ask `family()`, so integers and floats mix without new checks; `is_integer` stays for the exact types and `is_numeric` covers both.
+- **Underflow is an error** so that operands that are not zero never produce zero silently; subnormals, which still carry the value, are kept.
+- **Half to even** for float → integer (`f64::round_ties_even`) avoids a bias in sums of rounded values; it is what PostgreSQL does for floats (`NUMERIC` rounds half away from zero).
+
+### Tests
+
+- Unit in `float.rs`, `value.rs`, `data_type.rs`, `error.rs`: the finite newtypes (limits, subnormals, `±0`, NaN, ±infinity, order); bytes and every corrupt pattern; every accepted and rejected text form, overflow and underflow per type; the output table and the exponent boundaries; result types of every mix; overflow, underflow, subnormals, exact zero, division by zero, `%`; exact comparison at `2⁵³`, `2⁶³`, negatives and fractions; every cell of the cast/assign matrix with half-to-even cases and range limits; every new error with message and SQLSTATE.
+- `random_float_arithmetic_should_match_native_ieee_754_arithmetic`: 10,000 operations against native `f32`/`f64` arithmetic plus the SQL rules written apart. Mutation-checked by hand: disabling the underflow rule makes it fail.
+- `random_integer_float_comparisons_should_match_an_exact_i128_model`: 10,000 comparisons against an exact model through `i128` and `floor` (a different route from the implementation's `trunc`), with values next to `2⁵³` and `2⁶³`. Mutation-checked by hand: ignoring the fraction makes it fail.
+- `random_floats_should_round_trip_through_bytes_and_text`; `sort_cmp_should_be_a_total_order` and the random `sql_*` test now include floats.
+- `schema.rs` and `catalog`: `Fixed(4)` / `Fixed(8)` columns, integer into a float column, float into an integer column (`42804`), the random assignment model with `REAL` overflow and underflow, catalog codes `6` and `7` and random creations with both types.
+- Integration in [`tests/types_float.rs`](../tests/types_float.rs): a catalog table `(id INTEGER NOT NULL, price DOUBLE PRECISION NOT NULL, ratio REAL)` with 2,000 rows (limits, subnormals, zero, `NULL`) survives eviction with a 2-frame pool and reopening the file; integers assigned to float columns come back as floats; a NaN written below the schema → `Type { .., CorruptedValue }` (`XX001`).
+
 ---
 
 ## Schema
@@ -279,7 +388,7 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 - **`encode_row`** applies SQL *assignment* column by column, and only builds the tuple if every column passes (the first error, in column order, is the one returned):
   - number of values ≠ number of columns → `ColumnCountMismatch`;
   - `NULL` in a `NOT NULL` column → `NullViolation`;
-  - the value is converted to the column type with `Value::assign`: a `SMALLINT` in a `BIGINT` column is accepted; `70000` in a `SMALLINT` column → `Type { column: "age", OutOfRange }`; text longer than a `VARCHAR(n)` column → `Type { .., StringTooLong }` unless the excess is only spaces; a value of another family (text in an integer column, a boolean in a text column, ...) → `Type { .., DatatypeMismatch }`;
+  - the value is converted to the column type with `Value::assign`: a `SMALLINT` in a `BIGINT` column is accepted; `70000` in a `SMALLINT` column → `Type { column: "age", OutOfRange }`; an integer in a float column is accepted, a float in an integer column → `Type { .., DatatypeMismatch }` (only a `CAST` converts); text longer than a `VARCHAR(n)` column → `Type { .., StringTooLong }` unless the excess is only spaces; a value of another family (text in an integer column, a boolean in a text column, ...) → `Type { .., DatatypeMismatch }`;
   - valid values whose tuple exceeds the tuple format's limit (65,535 bytes, reachable only with long text) → `RowTooLarge`, not the `Tuple` error, which means corruption.
 - **`decode_row` / `decode_column` / `decode_columns`** read bytes from disk and do not trust them: truncated or corrupted tuple, or one written with another schema → `Tuple(..)`; `NULL` stored in a `NOT NULL` column → `NullViolation`. Values come back **in the column's type** (a `SmallInt` stored in an `INTEGER` column comes back as `Integer`).
   - Every field is read with `TupleRef::field`, which returns an error: a field the tuple cannot produce is never mistaken for `NULL`.
@@ -366,9 +475,9 @@ The checksum catches flipped bytes; the magic rejects a file whose page 0 is val
 | Entry | Fields |
 |---|---|
 | `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · name |
-| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
+| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
 
-Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, then `5` BOOLEAN), so older databases still open.
+Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, then `6` REAL and `7` DOUBLE PRECISION), so older databases still open.
 
 ### Operations
 
@@ -424,7 +533,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 ### Tests
 
 - `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
-- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`6`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
+- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`8`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
 - `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, data heap that accepts the schema's rows, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch) and every error with message, SQLSTATE and `source()`.
 - `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
@@ -457,4 +566,11 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Empty string | different from `NULL` | same (Oracle treats `''` as `NULL`; ferroDB does not) |
 | Text to `BOOLEAN` | trim spaces, then the literals `TRUE`, `FALSE` (any case) or `UNKNOWN` (→ `NULL`); otherwise `22018` | `true` / `false` in any case **and `1` / `0`** (decided with the author); `'unknown'` is rejected (`22P02`), since text input never yields `NULL` |
 | `CAST` between integers and `BOOLEAN` | not defined | `0` ⇄ FALSE and `1` ⇄ TRUE in every width (decided with the author); other integers → `22003`. PostgreSQL takes any non-zero `INTEGER` as TRUE |
+| `NaN` and `Infinity` | not in SQL | not accepted (PostgreSQL accepts `'NaN'`, `'Infinity'`, `'-Infinity'`); overflow is an error |
+| Negative zero | not in SQL | folded into `0` (PostgreSQL keeps and prints `-0`) |
+| Float underflow | implementation-defined | `22003` when a non-zero result becomes zero, as PostgreSQL |
+| Approximate to exact in assignment | allowed, with the `CAST` rules | rejected (`42804`); only an explicit `CAST` rounds (decided with the author; PostgreSQL accepts, rounding) |
+| Exact vs. approximate comparison | by algebraic value | exact, as the standard (PostgreSQL converts the integer to `float8`) |
+| `MOD` with approximate numbers | not defined | `%` with a float → `42883` |
+| `CAST` of a float to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like integers |
 | `CAST` of a `BOOLEAN` to a short `VARCHAR(n)` | `22001` when `'TRUE'`/`'FALSE'` does not fit | cut to `n`, like integers (`CAST(TRUE AS VARCHAR(1))` = `'T'`) |

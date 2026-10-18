@@ -1033,11 +1033,13 @@ mod tests {
 
         /// Every type, with VARCHARs of any length including the limits 1 and 65535.
         fn data_type(&mut self) -> DataType {
-            match self.below(6) {
+            match self.below(8) {
                 0 => DataType::SmallInt,
                 1 => DataType::Integer,
                 2 => DataType::BigInt,
                 3 => DataType::Boolean,
+                4 => DataType::Real,
+                5 => DataType::Double,
                 _ => {
                     let max_chars = [1, u16::MAX, self.next() as u16][self.below(3)];
                     DataType::Varchar(NonZeroU16::new(max_chars).unwrap_or(NonZeroU16::MIN))
