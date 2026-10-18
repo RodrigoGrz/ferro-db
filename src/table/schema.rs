@@ -1,8 +1,10 @@
 //! Schema of a table: ordered columns (name, type, nullability) and the `TupleLayout` they
 //! map to. It turns a row of `Value`s into tuple bytes and back:
 //!
-//! - writing applies SQL store assignment: each value is cast to its column type (`22003`
-//!   when it does not fit) and NULL is rejected in NOT NULL columns (`23502`);
+//! - writing applies SQL store assignment (`Value::assign`): each value is converted to its
+//!   column type within its family (`22003` when an integer does not fit, `22001` when text
+//!   is too long, `42804` across families) and NULL is rejected in NOT NULL columns
+//!   (`23502`);
 //! - reading trusts nothing from disk: a corrupted tuple, a tuple of another schema or a NULL
 //!   in a NOT NULL column is an error, never a panic.
 //!
@@ -73,6 +75,12 @@ pub enum SchemaError {
         source: TypeError,
     },
     Tuple(TupleError),
+    /// A row whose values are valid but whose tuple exceeds the tuple format's limit (text
+    /// is limited in characters, the tuple in bytes).
+    RowTooLarge {
+        size: usize,
+        max: usize,
+    },
 }
 
 impl SchemaError {
@@ -88,6 +96,7 @@ impl SchemaError {
             SchemaError::ColumnOutOfRange { .. } => "XX000",
             SchemaError::Type { source, .. } => source.sqlstate(),
             SchemaError::Tuple(_) => "XX001",
+            SchemaError::RowTooLarge { .. } => "54000",
         }
     }
 }
@@ -123,6 +132,9 @@ impl fmt::Display for SchemaError {
             }
             SchemaError::Type { column, source } => write!(f, "column \"{column}\": {source}"),
             SchemaError::Tuple(err) => write!(f, "stored row does not match the schema: {err}"),
+            SchemaError::RowTooLarge { size, max } => {
+                write!(f, "row of {size} bytes exceeds the maximum of {max} bytes")
+            }
         }
     }
 }
@@ -185,12 +197,13 @@ impl Schema {
         &self.layout
     }
 
-    /// Size of a row whose variable columns are all empty (today, every row).
+    /// Size of a row whose variable columns are all empty or NULL: the smallest row the
+    /// table can hold.
     pub fn min_row_size(&self) -> usize {
         self.layout.min_tuple_size()
     }
 
-    /// Store assignment: each value is cast to its column type and NULL is rejected in
+    /// Store assignment: each value is assigned to its column type and NULL is rejected in
     /// NOT NULL columns, all before the tuple is built.
     pub fn encode_row(&self, row: &[Value]) -> Result<Vec<u8>, SchemaError> {
         if row.len() != self.columns.len() {
@@ -203,10 +216,14 @@ impl Schema {
             .columns
             .iter()
             .zip(row)
-            .map(|(column, value)| assign(column, value).map(|value| value.encode()))
+            .map(|(column, value)| assign(column, value).map(Value::into_encoded))
             .collect::<Result<Vec<_>, _>>()?;
         let borrowed: Vec<Option<&[u8]>> = fields.iter().map(Option::as_deref).collect();
-        Ok(self.layout.encode(&borrowed)?)
+        // Every value is valid here, so a tuple the layout refuses is too large, not corrupted.
+        self.layout.encode(&borrowed).map_err(|err| match err {
+            TupleError::TupleTooLarge { size, max } => SchemaError::RowTooLarge { size, max },
+            other => SchemaError::Tuple(other),
+        })
     }
 
     /// Reads every field with `TupleRef::field`, so a field the tuple cannot produce is an
@@ -275,7 +292,7 @@ fn assign(column: &Column, value: &Value) -> Result<Value, SchemaError> {
         });
     }
     value
-        .cast(column.data_type)
+        .assign(column.data_type)
         .map_err(|source| SchemaError::Type {
             column: column.name.clone(),
             source,
@@ -320,7 +337,7 @@ fn check_column_names(columns: &[Column]) -> Result<(), SchemaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::tuple::ColumnLayout;
+    use crate::storage::tuple::{ColumnLayout, MAX_TUPLE_SIZE};
     use DataType::{BigInt, Integer, SmallInt};
 
     fn people() -> Schema {
@@ -358,6 +375,25 @@ mod tests {
                 ColumnLayout::Fixed(8)
             ]
         );
+    }
+
+    pub(super) fn varchar(max_chars: u16) -> DataType {
+        DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
+    }
+
+    #[test]
+    fn varchar_columns_should_use_variable_fields() {
+        let schema = Schema::new(vec![
+            Column::not_null("id", Integer),
+            Column::new("name", varchar(40)),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            schema.layout().columns(),
+            [ColumnLayout::Fixed(4), ColumnLayout::Variable]
+        );
+        assert_eq!(schema.min_row_size(), 2 + 1 + 4 + 4);
     }
 
     #[test]
@@ -560,6 +596,14 @@ mod tests {
                 "stored row does not match the schema: expected 3 columns, got 2",
                 "XX001",
             ),
+            (
+                SchemaError::RowTooLarge {
+                    size: 70_000,
+                    max: 65_535,
+                },
+                "row of 70000 bytes exceeds the maximum of 65535 bytes",
+                "54000",
+            ),
         ]
     }
 
@@ -671,6 +715,155 @@ mod tests {
             type_error("age", TypeError::OutOfRange { ty: SmallInt })
         );
         assert_eq!(err.sqlstate(), "22003");
+    }
+
+    fn profiles() -> Schema {
+        Schema::new(vec![
+            Column::not_null("id", Integer),
+            Column::new("name", varchar(5)),
+        ])
+        .unwrap()
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Text(value.to_string())
+    }
+
+    #[test]
+    fn encode_row_should_round_trip_text() {
+        let schema = profiles();
+
+        for name in [text(""), text("ação"), text("🦀🦀🦀🦀🦀"), Value::Null] {
+            let row = [Value::Integer(1), name];
+
+            let tuple = schema.encode_row(&row).unwrap();
+
+            assert_eq!(schema.decode_row(&tuple).unwrap(), row);
+        }
+    }
+
+    #[test]
+    fn encode_row_should_cut_trailing_spaces_past_the_varchar_length() {
+        let schema = profiles();
+
+        let tuple = schema
+            .encode_row(&[Value::Integer(1), text("maria   ")])
+            .unwrap();
+
+        assert_eq!(schema.decode_column(&tuple, 1).unwrap(), text("maria"));
+    }
+
+    #[test]
+    fn encode_row_with_text_too_long_should_fail() {
+        let schema = profiles();
+
+        let err = schema
+            .encode_row(&[Value::Integer(1), text("joaquim")])
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            type_error(
+                "name",
+                TypeError::StringTooLong {
+                    ty: varchar(5),
+                    chars: 7
+                }
+            )
+        );
+        assert_eq!(err.sqlstate(), "22001");
+    }
+
+    #[test]
+    fn encode_row_with_text_larger_than_a_tuple_should_be_too_large() {
+        let schema = Schema::new(vec![Column::new("body", DataType::VARCHAR_MAX)]).unwrap();
+        // 20,000 characters fit VARCHAR(65535), but take 80,000 bytes of UTF-8.
+        let row = [text(&"🦀".repeat(20_000))];
+
+        let err = schema.encode_row(&row).unwrap_err();
+
+        assert!(
+            matches!(err, SchemaError::RowTooLarge { size, max } if size > 80_000 && max == MAX_TUPLE_SIZE),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), "54000");
+    }
+
+    #[test]
+    fn decode_row_with_invalid_utf8_in_a_varchar_column_should_be_corrupted_text() {
+        let schema = profiles();
+        let mut tuple = schema
+            .encode_row(&[Value::Integer(1), text("abc")])
+            .unwrap();
+        *tuple.last_mut().unwrap() = 0xFF;
+
+        let err = schema.decode_row(&tuple).unwrap_err();
+
+        assert_eq!(
+            err,
+            type_error(
+                "name",
+                TypeError::CorruptedText {
+                    ty: varchar(5),
+                    reason: "text is not valid UTF-8"
+                }
+            )
+        );
+        assert_eq!(err.sqlstate(), "XX001");
+    }
+
+    #[test]
+    fn decode_row_with_text_longer_than_the_column_should_fail() {
+        let wide = Schema::new(vec![Column::new("name", varchar(10))]).unwrap();
+        let narrow = Schema::new(vec![Column::new("name", varchar(3))]).unwrap();
+        let tuple = wide.encode_row(&[text("abcdef")]).unwrap();
+
+        let err = narrow.decode_column(&tuple, 0).unwrap_err();
+
+        assert_eq!(
+            err,
+            type_error(
+                "name",
+                TypeError::CorruptedText {
+                    ty: varchar(3),
+                    reason: "text is longer than its column"
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn encode_row_across_type_families_should_be_a_datatype_mismatch() {
+        let schema = profiles();
+        let cases = [
+            (
+                [text("1"), Value::Null],
+                type_error(
+                    "id",
+                    TypeError::DatatypeMismatch {
+                        value: DataType::VARCHAR_MAX,
+                        target: Integer,
+                    },
+                ),
+            ),
+            (
+                [Value::Integer(1), Value::Integer(2)],
+                type_error(
+                    "name",
+                    TypeError::DatatypeMismatch {
+                        value: Integer,
+                        target: varchar(5),
+                    },
+                ),
+            ),
+        ];
+
+        for (row, expected) in cases {
+            let err = schema.encode_row(&row).unwrap_err();
+
+            assert_eq!(err, expected);
+            assert_eq!(err.sqlstate(), "42804");
+        }
     }
 
     #[test]
@@ -904,23 +1097,49 @@ mod tests {
         }
     }
 
-    const ALL_TYPES: [DataType; 3] = [SmallInt, Integer, BigInt];
+    const INTEGERS: [DataType; 3] = [SmallInt, Integer, BigInt];
+
+    /// Integers of every width and short VARCHARs, so text hits its limit often.
+    fn random_type(rng: &mut Rng) -> DataType {
+        match rng.below(4) {
+            0 => varchar(1 + rng.below(8) as u16),
+            _ => INTEGERS[rng.below(3)],
+        }
+    }
+
+    /// Multibyte characters and trailing spaces: where bytes and characters differ, and
+    /// where store assignment cuts instead of failing.
+    fn random_text(rng: &mut Rng) -> String {
+        let alphabet = ['a', 'Z', ' ', 'é', '名', '🦀'];
+        let len = rng.below(10);
+        let mut text: String = (0..len)
+            .map(|_| alphabet[rng.below(alphabet.len())])
+            .collect();
+        if rng.below(3) == 0 {
+            text.push_str(&" ".repeat(rng.below(8)));
+        }
+        text
+    }
 
     fn random_schema(rng: &mut Rng) -> Schema {
         let columns = (0..1 + rng.below(20))
             .map(|i| Column {
                 name: format!("c{i}"),
-                data_type: ALL_TYPES[rng.below(3)],
+                data_type: random_type(rng),
                 nullable: rng.below(2) == 0,
             })
             .collect();
         Schema::new(columns).unwrap()
     }
 
-    /// Any width, biased toward the limits where narrowing fails; about 15% NULL.
+    /// Integers of any width, biased toward the limits where narrowing fails, and text;
+    /// about 15% NULL.
     fn random_value(rng: &mut Rng) -> Value {
         if rng.below(7) == 0 {
             return Value::Null;
+        }
+        if rng.below(4) == 0 {
+            return Value::Text(random_text(rng));
         }
         let raw = match rng.below(3) {
             0 => [
@@ -944,44 +1163,76 @@ mod tests {
         }
     }
 
-    fn as_i128(value: &Value) -> Option<i128> {
+    fn as_i128(value: &Value) -> i128 {
         match *value {
-            Value::Null => None,
-            Value::SmallInt(v) => Some(v.into()),
-            Value::Integer(v) => Some(v.into()),
-            Value::BigInt(v) => Some(v.into()),
+            Value::SmallInt(v) => v.into(),
+            Value::Integer(v) => v.into(),
+            Value::BigInt(v) => v.into(),
+            Value::Null | Value::Text(_) => unreachable!("integers only"),
         }
     }
 
-    /// The assignment rules computed independently of `Value::cast`.
+    fn expected_integer(column: &Column, number: i128) -> Result<Value, SchemaError> {
+        let fitted = match column.data_type {
+            SmallInt => i16::try_from(number).ok().map(Value::SmallInt),
+            Integer => i32::try_from(number).ok().map(Value::Integer),
+            BigInt => i64::try_from(number).ok().map(Value::BigInt),
+            DataType::Varchar(_) => unreachable!("integer columns only"),
+        };
+        fitted.ok_or_else(|| {
+            type_error(
+                &column.name,
+                TypeError::OutOfRange {
+                    ty: column.data_type,
+                },
+            )
+        })
+    }
+
+    /// Store assignment on a `Vec<char>`: past `n` characters, only spaces may be cut.
+    fn expected_text(column: &Column, text: &str, max_chars: usize) -> Result<Value, SchemaError> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= max_chars || chars[max_chars..].iter().all(|&c| c == ' ') {
+            Ok(Value::Text(chars.iter().take(max_chars).collect()))
+        } else {
+            Err(type_error(
+                &column.name,
+                TypeError::StringTooLong {
+                    ty: column.data_type,
+                    chars: chars.len(),
+                },
+            ))
+        }
+    }
+
+    /// The assignment rules computed independently of `Value::assign`.
     fn expected_assignment(schema: &Schema, row: &[Value]) -> Result<Vec<Value>, SchemaError> {
         schema
             .columns()
             .iter()
             .zip(row)
             .map(|(column, value)| {
-                let Some(number) = as_i128(value) else {
-                    return if column.nullable {
-                        Ok(Value::Null)
-                    } else {
-                        Err(SchemaError::NullViolation {
-                            column: column.name.clone(),
-                        })
-                    };
-                };
-                let fitted = match column.data_type {
-                    SmallInt => i16::try_from(number).ok().map(Value::SmallInt),
-                    Integer => i32::try_from(number).ok().map(Value::Integer),
-                    BigInt => i64::try_from(number).ok().map(Value::BigInt),
-                };
-                fitted.ok_or_else(|| {
-                    type_error(
+                let mismatch = |value| {
+                    Err(type_error(
                         &column.name,
-                        TypeError::OutOfRange {
-                            ty: column.data_type,
+                        TypeError::DatatypeMismatch {
+                            value,
+                            target: column.data_type,
                         },
-                    )
-                })
+                    ))
+                };
+                match (value, column.data_type) {
+                    (Value::Null, _) if column.nullable => Ok(Value::Null),
+                    (Value::Null, _) => Err(SchemaError::NullViolation {
+                        column: column.name.clone(),
+                    }),
+                    (Value::Text(text), DataType::Varchar(max_chars)) => {
+                        expected_text(column, text, usize::from(max_chars.get()))
+                    }
+                    (Value::Text(_), _) => mismatch(DataType::VARCHAR_MAX),
+                    (number, DataType::Varchar(_)) => mismatch(number.data_type().unwrap()),
+                    (number, _) => expected_integer(column, as_i128(number)),
+                }
             })
             .collect()
     }
@@ -1026,9 +1277,15 @@ mod tests {
             .iter()
             .map(|column| match (rng.below(4), column.nullable) {
                 (0, true) => Value::Null,
-                _ => Value::BigInt(rng.below(100) as i64)
-                    .cast(column.data_type)
-                    .unwrap(),
+                _ => match column.data_type {
+                    DataType::Varchar(max_chars) => Value::Text(
+                        random_text(rng)
+                            .chars()
+                            .take(usize::from(max_chars.get()))
+                            .collect(),
+                    ),
+                    integer => Value::BigInt(rng.below(100) as i64).cast(integer).unwrap(),
+                },
             })
             .collect()
     }

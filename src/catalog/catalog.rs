@@ -294,6 +294,7 @@ mod tests {
     use crate::table::{Column, SchemaError};
     use crate::types::{DataType, Value};
     use std::fs;
+    use std::num::NonZeroU16;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1030,12 +1031,24 @@ mod tests {
             }
         }
 
+        /// Integers and VARCHARs of any length, including the limits 1 and 65535.
+        fn data_type(&mut self) -> DataType {
+            match self.below(5) {
+                0 => DataType::SmallInt,
+                1 => DataType::Integer,
+                2 => DataType::BigInt,
+                _ => {
+                    let max_chars = [1, u16::MAX, self.next() as u16][self.below(3)];
+                    DataType::Varchar(NonZeroU16::new(max_chars).unwrap_or(NonZeroU16::MIN))
+                }
+            }
+        }
+
         fn schema(&mut self) -> Schema {
-            let types = [DataType::SmallInt, DataType::Integer, DataType::BigInt];
             let columns = (0..1 + self.below(30))
                 .map(|i| Column {
                     name: format!("c{i}"),
-                    data_type: types[self.below(3)],
+                    data_type: self.data_type(),
                     nullable: self.below(2) == 0,
                 })
                 .collect();

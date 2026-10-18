@@ -1,22 +1,25 @@
 //! Runtime values. A stored field is `Option<&[u8]>`, the contract of `TupleLayout::encode`
-//! and `TupleRef::field`: `None` is NULL (a bit in the tuple's NULL bitmap), `Some` holds
-//! the integer in two's complement, little-endian, `DataType::width` bytes.
+//! and `TupleRef::field`: `None` is NULL (a bit in the tuple's NULL bitmap). `Some` holds
+//! an integer in two's complement, little-endian, `DataType::fixed_width` bytes, or a
+//! VARCHAR as its UTF-8 bytes; empty text is `Some(&[])`, never NULL.
 
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::{DataType, TypeError, integer};
+use super::{DataType, TypeError, integer, text};
 
 /// `PartialEq` is structural and meant for tests: `Null == Null` and
 /// `SmallInt(1) != BigInt(1)`. SQL equality is `compare`, which yields UNKNOWN for NULL.
 ///
 /// NULL carries no type: the type of an expression is decided statically from the schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Null,
     SmallInt(i16),
     Integer(i32),
     BigInt(i64),
+    /// A VARCHAR value. The limit `n` belongs to the column, not to the value.
+    Text(String),
 }
 
 impl Value {
@@ -30,6 +33,7 @@ impl Value {
             Value::SmallInt(_) => Some(DataType::SmallInt),
             Value::Integer(_) => Some(DataType::Integer),
             Value::BigInt(_) => Some(DataType::BigInt),
+            Value::Text(_) => Some(DataType::VARCHAR_MAX),
         }
     }
 
@@ -39,6 +43,15 @@ impl Value {
             Value::SmallInt(value) => Some(value.to_le_bytes().to_vec()),
             Value::Integer(value) => Some(value.to_le_bytes().to_vec()),
             Value::BigInt(value) => Some(value.to_le_bytes().to_vec()),
+            Value::Text(text) => Some(text.as_bytes().to_vec()),
+        }
+    }
+
+    /// Like `encode`, but text gives up its bytes instead of copying them.
+    pub fn into_encoded(self) -> Option<Vec<u8>> {
+        match self {
+            Value::Text(text) => Some(text.into_bytes()),
+            other => other.encode(),
         }
     }
 
@@ -50,48 +63,93 @@ impl Value {
             DataType::SmallInt => Value::SmallInt(i16::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::Integer => Value::Integer(i32::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::BigInt => Value::BigInt(i64::from_le_bytes(fixed_width(ty, bytes)?)),
+            DataType::Varchar(max_chars) => text::decode(max_chars, bytes)?,
         })
     }
 
-    /// Text input. Never yields NULL: `NULL` is a keyword,
-    /// so the text `'NULL'` is invalid input.
-    pub fn parse(ty: DataType, text: &str) -> Result<Value, TypeError> {
-        integer::parse(ty, text)
+    /// Text input. Never yields NULL: `NULL` is a keyword, so the text `'NULL'` is
+    /// invalid input for an integer and plain text for a VARCHAR. A VARCHAR follows the
+    /// store assignment rule.
+    pub fn parse(ty: DataType, input: &str) -> Result<Value, TypeError> {
+        match ty {
+            DataType::Varchar(max_chars) => text::assign(max_chars, input),
+            integer => integer::parse(integer, input),
+        }
     }
 
+    /// Store assignment (`INSERT`/`UPDATE`): only within a type family. Text longer than
+    /// the target VARCHAR(n) is an error unless the excess is only spaces, which are cut.
+    pub fn assign(&self, target: DataType) -> Result<Value, TypeError> {
+        let Some(ty) = self.data_type() else {
+            return Ok(Value::Null);
+        };
+        if ty.is_text() != target.is_text() {
+            return Err(TypeError::DatatypeMismatch { value: ty, target });
+        }
+        match (self, target) {
+            (Value::Text(text), DataType::Varchar(max_chars)) => text::assign(max_chars, text),
+            _ => self.cast(target),
+        }
+    }
+
+    /// Explicit `CAST`: integers and text convert both ways, and text longer than the
+    /// target VARCHAR(n) is cut, whatever the excess holds.
     pub fn cast(&self, target: DataType) -> Result<Value, TypeError> {
-        match self.typed() {
-            None => Ok(Value::Null),
-            Some((_, value)) => {
-                integer::narrow(target, value).ok_or(TypeError::OutOfRange { ty: target })
+        let Some(operand) = self.operand() else {
+            return Ok(Value::Null);
+        };
+        match (operand, target) {
+            (Operand::Integer(_, value), DataType::Varchar(max_chars)) => {
+                Ok(text::truncate(max_chars, &value.to_string()))
             }
+            (Operand::Integer(_, value), integer) => {
+                integer::narrow(integer, value).ok_or(TypeError::OutOfRange { ty: integer })
+            }
+            (Operand::Text(text), DataType::Varchar(max_chars)) => {
+                Ok(text::truncate(max_chars, text))
+            }
+            (Operand::Text(text), integer) => integer::parse(integer, text),
+        }
+    }
+
+    /// `||`. The result has no column, so it must fit the widest VARCHAR.
+    pub fn concat(&self, rhs: &Value) -> Result<Value, TypeError> {
+        match (self.operand(), rhs.operand()) {
+            (Some(Operand::Text(lhs)), Some(Operand::Text(rhs))) => text::concat(lhs, rhs),
+            (Some(lhs), Some(rhs)) => Err(undefined_operator("||", &lhs, &rhs)),
+            _ => Ok(Value::Null),
         }
     }
 
     pub fn add(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, integer::add)
+        self.strict_binary(rhs, "+", integer::add)
     }
 
     pub fn sub(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, integer::sub)
+        self.strict_binary(rhs, "-", integer::sub)
     }
 
     pub fn mul(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, integer::mul)
+        self.strict_binary(rhs, "*", integer::mul)
     }
 
     pub fn div(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, integer::div)
+        self.strict_binary(rhs, "/", integer::div)
     }
 
     pub fn rem(&self, rhs: &Value) -> Result<Value, TypeError> {
-        self.strict_binary(rhs, integer::rem)
+        self.strict_binary(rhs, "%", integer::rem)
     }
 
     pub fn neg(&self) -> Result<Value, TypeError> {
-        match self.typed() {
+        match self.operand() {
             None => Ok(Value::Null),
-            Some((ty, value)) => integer::neg(ty, value),
+            Some(Operand::Integer(ty, value)) => integer::neg(ty, value),
+            Some(text) => Err(TypeError::UndefinedOperator {
+                op: "-",
+                left: None,
+                right: text.data_type(),
+            }),
         }
     }
 
@@ -100,45 +158,99 @@ impl Value {
     fn strict_binary(
         &self,
         rhs: &Value,
+        op: &'static str,
         operation: fn(DataType, i64, i64) -> Result<Value, TypeError>,
     ) -> Result<Value, TypeError> {
-        match (self.typed(), rhs.typed()) {
-            (Some((lhs_ty, lhs)), Some((rhs_ty, rhs))) => {
+        match (self.operand(), rhs.operand()) {
+            (Some(Operand::Integer(lhs_ty, lhs)), Some(Operand::Integer(rhs_ty, rhs))) => {
                 operation(lhs_ty.promote(rhs_ty), lhs, rhs)
             }
+            (Some(lhs), Some(rhs)) => Err(undefined_operator(op, &lhs, &rhs)),
             _ => Ok(Value::Null),
         }
     }
 
-    /// SQL comparison (`=`, `<`, ...): `None` is UNKNOWN, the result whenever a side is NULL.
-    pub fn compare(&self, rhs: &Value) -> Option<Ordering> {
-        let ((_, lhs), (_, rhs)) = (self.typed()?, rhs.typed()?);
-        Some(lhs.cmp(&rhs))
+    /// SQL comparison (`=`, `<`, ...): `Ok(None)` is UNKNOWN, the result whenever a side is
+    /// NULL. Text compares by its UTF-8 bytes, without padding (`'a' < 'a '`). Comparing
+    /// different families is an error naming `=`, which every comparison derives from.
+    pub fn compare(&self, rhs: &Value) -> Result<Option<Ordering>, TypeError> {
+        match (self.operand(), rhs.operand()) {
+            (Some(lhs), Some(rhs)) => lhs.compare(&rhs, "=").map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// `IS DISTINCT FROM`: NULL equals NULL and differs from every value; never UNKNOWN.
-    pub fn is_distinct_from(&self, rhs: &Value) -> bool {
-        self.sort_cmp(rhs) != Ordering::Equal
+    pub fn is_distinct_from(&self, rhs: &Value) -> Result<bool, TypeError> {
+        match (self.operand(), rhs.operand()) {
+            (Some(lhs), Some(rhs)) => Ok(lhs.compare(&rhs, "IS DISTINCT FROM")?.is_ne()),
+            (lhs, rhs) => Ok(lhs.is_some() != rhs.is_some()),
+        }
     }
 
-    /// Total order for `ORDER BY` and indexes. `compare` is not one because of UNKNOWN;
-    /// NULL sorts after every value (`NULLS LAST` for `ASC`).
+    /// Total order for `ORDER BY` and indexes. `compare` is not one because of UNKNOWN and
+    /// of the families it refuses to mix; here integers sort before text and NULL after
+    /// every value (`NULLS LAST` for `ASC`).
     pub fn sort_cmp(&self, rhs: &Value) -> Ordering {
-        match (self.typed(), rhs.typed()) {
-            (Some((_, lhs)), Some((_, rhs))) => lhs.cmp(&rhs),
+        match (self.operand(), rhs.operand()) {
+            (Some(lhs), Some(rhs)) => lhs.sort_cmp(&rhs),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
         }
     }
 
-    fn typed(&self) -> Option<(DataType, i64)> {
-        match *self {
+    /// `None` is NULL.
+    fn operand(&self) -> Option<Operand<'_>> {
+        match self {
             Value::Null => None,
-            Value::SmallInt(value) => Some((DataType::SmallInt, value.into())),
-            Value::Integer(value) => Some((DataType::Integer, value.into())),
-            Value::BigInt(value) => Some((DataType::BigInt, value)),
+            Value::SmallInt(value) => Some(Operand::Integer(DataType::SmallInt, (*value).into())),
+            Value::Integer(value) => Some(Operand::Integer(DataType::Integer, (*value).into())),
+            Value::BigInt(value) => Some(Operand::Integer(DataType::BigInt, *value)),
+            Value::Text(text) => Some(Operand::Text(text)),
         }
+    }
+}
+
+/// A non-NULL value as the operators see it: every integer widened to `i64`, so one
+/// implementation covers all widths, and text borrowed.
+enum Operand<'a> {
+    Integer(DataType, i64),
+    Text(&'a str),
+}
+
+impl Operand<'_> {
+    fn data_type(&self) -> DataType {
+        match self {
+            Operand::Integer(ty, _) => *ty,
+            Operand::Text(_) => DataType::VARCHAR_MAX,
+        }
+    }
+
+    fn compare(&self, rhs: &Operand, op: &'static str) -> Result<Ordering, TypeError> {
+        if self.data_type().is_text() != rhs.data_type().is_text() {
+            return Err(undefined_operator(op, self, rhs));
+        }
+        Ok(self.sort_cmp(rhs))
+    }
+
+    /// `str` orders by its UTF-8 bytes, which is also code point order. A column never
+    /// mixes families; putting integers first only makes the order total.
+    fn sort_cmp(&self, rhs: &Operand) -> Ordering {
+        match (self, rhs) {
+            (Operand::Integer(_, lhs), Operand::Integer(_, rhs)) => lhs.cmp(rhs),
+            (Operand::Text(lhs), Operand::Text(rhs)) => lhs.cmp(rhs),
+            (Operand::Integer(..), Operand::Text(_)) => Ordering::Less,
+            (Operand::Text(_), Operand::Integer(..)) => Ordering::Greater,
+        }
+    }
+}
+
+fn undefined_operator(op: &'static str, lhs: &Operand, rhs: &Operand) -> TypeError {
+    TypeError::UndefinedOperator {
+        op,
+        left: Some(lhs.data_type()),
+        right: rhs.data_type(),
     }
 }
 
@@ -149,6 +261,7 @@ impl fmt::Display for Value {
             Value::SmallInt(value) => write!(f, "{value}"),
             Value::Integer(value) => write!(f, "{value}"),
             Value::BigInt(value) => write!(f, "{value}"),
+            Value::Text(text) => f.write_str(text),
         }
     }
 }
@@ -156,7 +269,7 @@ impl fmt::Display for Value {
 fn fixed_width<const N: usize>(ty: DataType, bytes: &[u8]) -> Result<[u8; N], TypeError> {
     bytes.try_into().map_err(|_| TypeError::InvalidEncoding {
         ty,
-        expected: ty.width(),
+        expected: ty.fixed_width().unwrap_or_default(),
         actual: bytes.len(),
     })
 }
@@ -226,7 +339,7 @@ mod tests {
         for value in limits() {
             let ty = value.data_type().unwrap();
 
-            assert_eq!(value.encode().unwrap().len(), ty.width());
+            assert_eq!(value.encode().unwrap().len(), ty.fixed_width().unwrap());
         }
     }
 
@@ -251,7 +364,11 @@ mod tests {
     #[test]
     fn decode_with_wrong_width_should_fail() {
         for ty in ALL_TYPES {
-            for actual in [0, ty.width() - 1, ty.width() + 1] {
+            for actual in [
+                0,
+                ty.fixed_width().unwrap() - 1,
+                ty.fixed_width().unwrap() + 1,
+            ] {
                 let bytes = vec![0; actual];
 
                 let err = Value::decode(ty, Some(&bytes)).unwrap_err();
@@ -260,7 +377,7 @@ mod tests {
                     err,
                     TypeError::InvalidEncoding {
                         ty,
-                        expected: ty.width(),
+                        expected: ty.fixed_width().unwrap(),
                         actual
                     }
                 );
@@ -360,6 +477,447 @@ mod tests {
         assert_eq!(Value::Integer(0).to_string(), "0");
         assert_eq!(Value::BigInt(i64::MIN).to_string(), "-9223372036854775808");
         assert_eq!(Value::Null.to_string(), "NULL");
+    }
+
+    fn varchar(max_chars: u16) -> DataType {
+        DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Text(value.to_string())
+    }
+
+    fn too_long(max_chars: u16, chars: usize) -> TypeError {
+        TypeError::StringTooLong {
+            ty: varchar(max_chars),
+            chars,
+        }
+    }
+
+    fn corrupted(max_chars: u16, reason: &'static str) -> TypeError {
+        TypeError::CorruptedText {
+            ty: varchar(max_chars),
+            reason,
+        }
+    }
+
+    #[test]
+    fn text_should_have_the_widest_varchar_type() {
+        assert_eq!(text("abc").data_type(), Some(DataType::VARCHAR_MAX));
+        assert!(!text("").is_null());
+    }
+
+    #[test]
+    fn encode_of_text_should_be_its_utf8_bytes() {
+        assert_eq!(text("abc").encode().unwrap(), b"abc");
+        assert_eq!(text("ação").encode().unwrap(), "ação".as_bytes());
+        assert_eq!(text("🦀").encode().unwrap(), [0xF0, 0x9F, 0xA6, 0x80]);
+    }
+
+    #[test]
+    fn into_encoded_should_match_encode() {
+        let mut values = limits();
+        values.extend([Value::Null, text(""), text("ação 🦀")]);
+
+        for value in values {
+            assert_eq!(value.clone().into_encoded(), value.encode(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn encode_of_empty_text_should_be_an_empty_field_not_null() {
+        assert_eq!(text("").encode(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn decode_should_round_trip_text() {
+        let cases = [
+            (varchar(1), ""),
+            (varchar(10), "abc"),
+            (varchar(4), "ação"),
+            (varchar(2), "🦀🦀"),
+            (varchar(3), "a b"),
+            (DataType::VARCHAR_MAX, "NULL"),
+        ];
+
+        for (ty, value) in cases {
+            let decoded = Value::decode(ty, text(value).encode().as_deref()).unwrap();
+
+            assert_eq!(decoded, text(value), "{ty} {value:?}");
+        }
+    }
+
+    #[test]
+    fn decode_of_invalid_utf8_should_be_corrupted_text() {
+        for bytes in [
+            &[0xFF][..],
+            &[0xC3],
+            &[b'a', 0xF0, 0x9F, 0xA6],
+            &[0xED, 0xA0, 0x80],
+        ] {
+            let err = Value::decode(varchar(10), Some(bytes)).unwrap_err();
+
+            assert_eq!(err, corrupted(10, "text is not valid UTF-8"), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn decode_of_text_longer_than_the_column_should_be_corrupted_text() {
+        let err = Value::decode(varchar(3), Some("ação".as_bytes())).unwrap_err();
+
+        assert_eq!(err, corrupted(3, "text is longer than its column"));
+    }
+
+    #[test]
+    fn parse_of_varchar_should_accept_up_to_n_characters() {
+        assert_eq!(Value::parse(varchar(3), "").unwrap(), text(""));
+        assert_eq!(Value::parse(varchar(3), "abc").unwrap(), text("abc"));
+        assert_eq!(Value::parse(varchar(4), "ação").unwrap(), text("ação"));
+        assert_eq!(Value::parse(varchar(1), "🦀").unwrap(), text("🦀"));
+    }
+
+    #[test]
+    fn parse_of_varchar_should_keep_the_text_as_is() {
+        let value = "  NULL\t 42 ";
+
+        assert_eq!(Value::parse(varchar(20), value).unwrap(), text(value));
+    }
+
+    #[test]
+    fn parse_of_varchar_past_n_characters_should_be_too_long() {
+        assert_eq!(
+            Value::parse(varchar(3), "abcd").unwrap_err(),
+            too_long(3, 4)
+        );
+        assert_eq!(
+            Value::parse(varchar(3), "ação").unwrap_err(),
+            too_long(3, 4)
+        );
+        assert_eq!(
+            Value::parse(varchar(1), "🦀🦀").unwrap_err(),
+            too_long(1, 2)
+        );
+    }
+
+    #[test]
+    fn parse_of_varchar_should_cut_an_excess_made_only_of_spaces() {
+        assert_eq!(Value::parse(varchar(3), "abc   ").unwrap(), text("abc"));
+        assert_eq!(Value::parse(varchar(3), "a    ").unwrap(), text("a  "));
+        assert_eq!(Value::parse(varchar(1), "    ").unwrap(), text(" "));
+    }
+
+    #[test]
+    fn parse_of_varchar_should_reject_an_excess_with_other_characters() {
+        assert_eq!(
+            Value::parse(varchar(3), "abc d").unwrap_err(),
+            too_long(3, 5)
+        );
+        assert_eq!(
+            Value::parse(varchar(3), "abc\t").unwrap_err(),
+            too_long(3, 4)
+        );
+        assert_eq!(
+            Value::parse(varchar(3), "abc\u{A0}").unwrap_err(),
+            too_long(3, 4)
+        );
+    }
+
+    #[test]
+    fn cast_of_an_integer_to_varchar_should_be_its_decimal_text() {
+        assert_eq!(Value::Integer(42).cast(varchar(10)).unwrap(), text("42"));
+        assert_eq!(
+            Value::BigInt(i64::MIN).cast(DataType::VARCHAR_MAX).unwrap(),
+            text("-9223372036854775808")
+        );
+        assert_eq!(Value::SmallInt(-7).cast(varchar(2)).unwrap(), text("-7"));
+    }
+
+    #[test]
+    fn cast_of_an_integer_to_a_short_varchar_should_truncate() {
+        assert_eq!(
+            Value::Integer(-12345).cast(varchar(3)).unwrap(),
+            text("-12")
+        );
+    }
+
+    #[test]
+    fn cast_of_text_to_an_integer_should_parse_it() {
+        assert_eq!(text(" 42 ").cast(Integer).unwrap(), Value::Integer(42));
+        assert_eq!(text("-7").cast(SmallInt).unwrap(), Value::SmallInt(-7));
+        assert_eq!(
+            text("abc").cast(BigInt).unwrap_err(),
+            invalid_text(BigInt, "abc")
+        );
+        assert_eq!(
+            text("40000").cast(SmallInt).unwrap_err(),
+            text_out_of_range(SmallInt, "40000")
+        );
+    }
+
+    #[test]
+    fn cast_of_text_to_varchar_should_truncate_to_n_characters() {
+        let cases = [
+            ("abcdef", 3, "abc"),
+            ("ação", 2, "aç"),
+            ("🦀🦀", 1, "🦀"),
+            ("ab", 3, "ab"),
+            ("abc   ", 4, "abc "),
+            ("", 1, ""),
+        ];
+
+        for (value, max_chars, expected) in cases {
+            assert_eq!(
+                text(value).cast(varchar(max_chars)).unwrap(),
+                text(expected),
+                "{value:?} as varchar({max_chars})"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_of_null_should_be_null_for_varchar() {
+        assert_eq!(Value::Null.cast(varchar(1)).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn assign_between_integers_should_behave_like_cast() {
+        for value in limits() {
+            for target in ALL_TYPES {
+                assert_eq!(
+                    value.assign(target),
+                    value.cast(target),
+                    "{value:?} {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assign_of_text_to_varchar_should_follow_the_store_assignment_rule() {
+        assert_eq!(text("ação").assign(varchar(4)).unwrap(), text("ação"));
+        assert_eq!(text("abc  ").assign(varchar(3)).unwrap(), text("abc"));
+        assert_eq!(text("abcd").assign(varchar(3)).unwrap_err(), too_long(3, 4));
+    }
+
+    #[test]
+    fn assign_across_families_should_be_a_datatype_mismatch() {
+        assert_eq!(
+            Value::Integer(1).assign(varchar(10)).unwrap_err(),
+            TypeError::DatatypeMismatch {
+                value: Integer,
+                target: varchar(10)
+            }
+        );
+        assert_eq!(
+            text("1").assign(SmallInt).unwrap_err(),
+            TypeError::DatatypeMismatch {
+                value: DataType::VARCHAR_MAX,
+                target: SmallInt
+            }
+        );
+    }
+
+    #[test]
+    fn assign_of_null_should_be_null_for_every_type() {
+        for ty in [SmallInt, Integer, BigInt, varchar(1)] {
+            assert_eq!(Value::Null.assign(ty).unwrap(), Value::Null);
+        }
+    }
+
+    fn undefined(op: &'static str, left: Option<DataType>, right: DataType) -> TypeError {
+        TypeError::UndefinedOperator { op, left, right }
+    }
+
+    #[test]
+    fn concat_should_join_texts() {
+        assert_eq!(text("ab").concat(&text("cd")).unwrap(), text("abcd"));
+        assert_eq!(text("").concat(&text("x")).unwrap(), text("x"));
+        assert_eq!(text("ação").concat(&text("🦀")).unwrap(), text("ação🦀"));
+        assert_eq!(text("a ").concat(&text("")).unwrap(), text("a "));
+    }
+
+    #[test]
+    fn concat_with_null_should_be_null() {
+        assert_eq!(text("a").concat(&Value::Null).unwrap(), Value::Null);
+        assert_eq!(Value::Null.concat(&text("a")).unwrap(), Value::Null);
+        assert_eq!(Value::Null.concat(&Value::Null).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn concat_of_null_with_an_integer_should_be_null_before_the_type_check() {
+        assert_eq!(Value::Null.concat(&Value::Integer(1)).unwrap(), Value::Null);
+        assert_eq!(Value::BigInt(1).concat(&Value::Null).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn concat_with_an_integer_should_be_an_undefined_operator() {
+        let text_type = Some(DataType::VARCHAR_MAX);
+
+        assert_eq!(
+            text("a").concat(&Value::Integer(1)).unwrap_err(),
+            undefined("||", text_type, Integer)
+        );
+        assert_eq!(
+            Value::SmallInt(1).concat(&text("a")).unwrap_err(),
+            undefined("||", Some(SmallInt), DataType::VARCHAR_MAX)
+        );
+        assert_eq!(
+            Value::BigInt(1).concat(&Value::BigInt(2)).unwrap_err(),
+            undefined("||", Some(BigInt), BigInt)
+        );
+    }
+
+    #[test]
+    fn concat_up_to_the_widest_varchar_should_work() {
+        let widest = "é".repeat(usize::from(u16::MAX) - 1);
+
+        let joined = text(&widest).concat(&text("🦀")).unwrap();
+
+        assert_eq!(joined, text(&format!("{widest}🦀")));
+    }
+
+    #[test]
+    fn concat_past_the_widest_varchar_should_be_too_long() {
+        let widest = text(&"a".repeat(usize::from(u16::MAX)));
+
+        assert_eq!(
+            widest.concat(&text("b")).unwrap_err(),
+            too_long(u16::MAX, usize::from(u16::MAX) + 1)
+        );
+        assert_eq!(widest.concat(&text("  ")).unwrap(), widest);
+    }
+
+    #[test]
+    fn arithmetic_with_text_should_be_an_undefined_operator() {
+        let (one, digit) = (Value::Integer(1), text("1"));
+        let text_type = DataType::VARCHAR_MAX;
+
+        for (name, op) in BINARY_OPS {
+            assert_eq!(
+                op(&digit, &one).unwrap_err(),
+                undefined(name, Some(text_type), Integer)
+            );
+            assert_eq!(
+                op(&one, &digit).unwrap_err(),
+                undefined(name, Some(Integer), text_type)
+            );
+            assert_eq!(
+                op(&digit, &digit).unwrap_err(),
+                undefined(name, Some(text_type), text_type)
+            );
+        }
+        assert_eq!(digit.neg().unwrap_err(), undefined("-", None, text_type));
+    }
+
+    #[test]
+    fn arithmetic_with_null_and_text_should_be_null() {
+        for (_, op) in BINARY_OPS {
+            assert_eq!(op(&Value::Null, &text("1")).unwrap(), Value::Null);
+            assert_eq!(op(&text("1"), &Value::Null).unwrap(), Value::Null);
+        }
+    }
+
+    #[test]
+    fn compare_of_text_should_follow_the_utf8_bytes_without_padding() {
+        let cases = [
+            ("a", "a", Ordering::Equal),
+            ("", "a", Ordering::Less),
+            ("Z", "a", Ordering::Less),
+            ("a", "a ", Ordering::Less),
+            ("é", "z", Ordering::Greater),
+            ("ábaco", "banana", Ordering::Greater),
+            ("🦀", "\u{FFFF}", Ordering::Greater),
+            ("10", "9", Ordering::Less),
+        ];
+
+        for (lhs, rhs, expected) in cases {
+            assert_eq!(
+                text(lhs).compare(&text(rhs)),
+                Ok(Some(expected)),
+                "{lhs:?} vs {rhs:?}"
+            );
+            assert_eq!(text(rhs).compare(&text(lhs)), Ok(Some(expected.reverse())));
+        }
+    }
+
+    #[test]
+    fn compare_of_text_with_null_should_be_unknown() {
+        assert_eq!(text("a").compare(&Value::Null), Ok(None));
+        assert_eq!(Value::Null.compare(&text("")), Ok(None));
+    }
+
+    #[test]
+    fn compare_across_families_should_be_an_undefined_operator() {
+        assert_eq!(
+            text("1").compare(&Value::Integer(1)),
+            Err(undefined("=", Some(DataType::VARCHAR_MAX), Integer))
+        );
+        assert_eq!(
+            Value::BigInt(1).compare(&text("1")),
+            Err(undefined("=", Some(BigInt), DataType::VARCHAR_MAX))
+        );
+    }
+
+    #[test]
+    fn is_distinct_from_should_compare_text() {
+        let cases = [
+            (text("a"), text("a"), false),
+            (text("a"), text("a "), true),
+            (text(""), Value::Null, true),
+            (Value::Null, text("a"), true),
+        ];
+
+        for (lhs, rhs, is_distinct) in cases {
+            assert_eq!(
+                lhs.is_distinct_from(&rhs),
+                Ok(is_distinct),
+                "{lhs:?}, {rhs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_distinct_from_across_families_should_be_an_undefined_operator() {
+        assert_eq!(
+            text("1").is_distinct_from(&Value::Integer(1)),
+            Err(undefined(
+                "IS DISTINCT FROM",
+                Some(DataType::VARCHAR_MAX),
+                Integer
+            ))
+        );
+    }
+
+    #[test]
+    fn sort_cmp_should_put_integers_before_text_and_null_last() {
+        let mut values = vec![
+            Value::Null,
+            text("b"),
+            Value::BigInt(i64::MAX),
+            text(""),
+            Value::SmallInt(-1),
+            text("B"),
+        ];
+
+        values.sort_by(Value::sort_cmp);
+
+        assert_eq!(
+            values,
+            [
+                Value::SmallInt(-1),
+                Value::BigInt(i64::MAX),
+                text(""),
+                text("B"),
+                text("b"),
+                Value::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn display_of_text_should_print_it_unquoted() {
+        assert_eq!(text("ação 🦀").to_string(), "ação 🦀");
+        assert_eq!(text("").to_string(), "");
     }
 
     #[test]
@@ -611,28 +1169,28 @@ mod tests {
     fn compare_should_order_values_of_the_same_type() {
         let (one, two) = (Value::Integer(1), Value::Integer(2));
 
-        assert_eq!(one.compare(&two), Some(Ordering::Less));
-        assert_eq!(two.compare(&one), Some(Ordering::Greater));
-        assert_eq!(one.compare(&one), Some(Ordering::Equal));
+        assert_eq!(one.compare(&two), Ok(Some(Ordering::Less)));
+        assert_eq!(two.compare(&one), Ok(Some(Ordering::Greater)));
+        assert_eq!(one.compare(&one), Ok(Some(Ordering::Equal)));
     }
 
     #[test]
     fn compare_should_use_the_numeric_value_across_widths() {
         assert_eq!(
             Value::SmallInt(-1).compare(&Value::BigInt(0)),
-            Some(Ordering::Less)
+            Ok(Some(Ordering::Less))
         );
         assert_eq!(
             Value::Integer(5).compare(&Value::BigInt(5)),
-            Some(Ordering::Equal)
+            Ok(Some(Ordering::Equal))
         );
         assert_eq!(
             Value::SmallInt(i16::MAX).compare(&Value::Integer(i32::MIN)),
-            Some(Ordering::Greater)
+            Ok(Some(Ordering::Greater))
         );
         assert_eq!(
             Value::BigInt(i64::MIN).compare(&Value::SmallInt(i16::MIN)),
-            Some(Ordering::Less)
+            Ok(Some(Ordering::Less))
         );
     }
 
@@ -640,9 +1198,9 @@ mod tests {
     fn compare_with_null_should_be_unknown() {
         let one = Value::Integer(1);
 
-        assert_eq!(one.compare(&Value::Null), None);
-        assert_eq!(Value::Null.compare(&one), None);
-        assert_eq!(Value::Null.compare(&Value::Null), None);
+        assert_eq!(one.compare(&Value::Null), Ok(None));
+        assert_eq!(Value::Null.compare(&one), Ok(None));
+        assert_eq!(Value::Null.compare(&Value::Null), Ok(None));
     }
 
     #[test]
@@ -657,7 +1215,11 @@ mod tests {
         ];
 
         for (lhs, rhs, is_distinct) in cases {
-            assert_eq!(lhs.is_distinct_from(&rhs), is_distinct, "{lhs:?}, {rhs:?}");
+            assert_eq!(
+                lhs.is_distinct_from(&rhs),
+                Ok(is_distinct),
+                "{lhs:?}, {rhs:?}"
+            );
         }
     }
 
@@ -678,7 +1240,7 @@ mod tests {
     fn sort_cmp_should_agree_with_compare_for_non_null_values() {
         for lhs in limits() {
             for rhs in limits() {
-                assert_eq!(Some(lhs.sort_cmp(&rhs)), lhs.compare(&rhs));
+                assert_eq!(Ok(Some(lhs.sort_cmp(&rhs))), lhs.compare(&rhs));
             }
         }
     }
@@ -743,7 +1305,8 @@ mod tests {
                 Value::SmallInt(i16::MAX),
                 Value::Integer(i32::MIN),
                 Value::Integer(i32::MAX),
-            ][rng.below(4)],
+            ][rng.below(4)]
+            .clone(),
         }
     }
 
@@ -753,6 +1316,7 @@ mod tests {
             Value::SmallInt(v) => Some(v.into()),
             Value::Integer(v) => Some(v.into()),
             Value::BigInt(v) => Some(v.into()),
+            Value::Text(_) => unreachable!("integer model only"),
         }
     }
 
@@ -762,6 +1326,7 @@ mod tests {
             SmallInt => Value::SmallInt(i16::try_from(value).map_err(out_of_range)?),
             Integer => Value::Integer(i32::try_from(value).map_err(out_of_range)?),
             BigInt => Value::BigInt(i64::try_from(value).map_err(out_of_range)?),
+            DataType::Varchar(_) => unreachable!("integer model only"),
         })
     }
 
@@ -808,13 +1373,13 @@ mod tests {
             assert_eq!(lhs.neg(), expected_neg, "-{lhs:?}");
             assert_eq!(
                 lhs.compare(&rhs),
-                model(&lhs).zip(model(&rhs)).map(|(l, r)| l.cmp(&r))
+                Ok(model(&lhs).zip(model(&rhs)).map(|(l, r)| l.cmp(&r)))
             );
             assert_eq!(
                 lhs.sort_cmp(&rhs),
                 model_sort_key(&lhs).cmp(&model_sort_key(&rhs))
             );
-            assert_eq!(lhs.is_distinct_from(&rhs), model(&lhs) != model(&rhs));
+            assert_eq!(lhs.is_distinct_from(&rhs), Ok(model(&lhs) != model(&rhs)));
         }
     }
 
@@ -826,9 +1391,70 @@ mod tests {
             let value = random_value(&mut rng);
             let ty = value.data_type().unwrap_or(ALL_TYPES[rng.below(3)]);
 
-            assert_eq!(Value::decode(ty, value.encode().as_deref()), Ok(value));
+            assert_eq!(
+                Value::decode(ty, value.encode().as_deref()).as_ref(),
+                Ok(&value)
+            );
             if !value.is_null() {
-                assert_eq!(Value::parse(ty, &value.to_string()), Ok(value));
+                assert_eq!(Value::parse(ty, &value.to_string()).as_ref(), Ok(&value));
+            }
+        }
+    }
+
+    /// Multibyte characters, tabs and trailing spaces: where bytes and characters differ,
+    /// and where store assignment cuts instead of failing.
+    fn random_text(rng: &mut Rng) -> String {
+        let alphabet = ['a', 'Z', ' ', '\t', 'é', '名', '🦀'];
+        let len = rng.below(12);
+        let mut text: String = (0..len)
+            .map(|_| alphabet[rng.below(alphabet.len())])
+            .collect();
+        if rng.below(3) == 0 {
+            text.push_str(&" ".repeat(rng.below(6)));
+        }
+        text
+    }
+
+    fn model_assign(input: &str, max_chars: u16) -> Result<Value, TypeError> {
+        let chars: Vec<char> = input.chars().collect();
+        let n = usize::from(max_chars);
+        if chars.len() <= n || chars[n..].iter().all(|&c| c == ' ') {
+            Ok(Value::Text(chars.iter().take(n).collect()))
+        } else {
+            Err(too_long(max_chars, chars.len()))
+        }
+    }
+
+    fn model_cast(input: &str, max_chars: u16) -> Value {
+        Value::Text(input.chars().take(usize::from(max_chars)).collect())
+    }
+
+    #[test]
+    fn random_text_operations_should_match_the_char_model() {
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+
+        for _ in 0..10_000 {
+            let (lhs, rhs) = (random_text(&mut rng), random_text(&mut rng));
+            let max_chars = 1 + rng.below(12) as u16;
+            let ty = varchar(max_chars);
+            let (value, other) = (text(&lhs), text(&rhs));
+
+            assert_eq!(value.assign(ty), model_assign(&lhs, max_chars), "{lhs:?}");
+            assert_eq!(Value::parse(ty, &lhs), model_assign(&lhs, max_chars));
+            assert_eq!(value.cast(ty), Ok(model_cast(&lhs, max_chars)));
+            assert_eq!(value.concat(&other), Ok(text(&format!("{lhs}{rhs}"))));
+            assert_eq!(
+                value.compare(&other),
+                Ok(Some(lhs.chars().cmp(rhs.chars()))),
+                "{lhs:?} vs {rhs:?}"
+            );
+            assert_eq!(value.is_distinct_from(&other), Ok(lhs != rhs));
+            if let Ok(stored) = value.assign(ty) {
+                assert_eq!(
+                    Value::decode(ty, stored.encode().as_deref()).as_ref(),
+                    Ok(&stored)
+                );
+                assert_eq!(Value::parse(ty, &stored.to_string()).as_ref(), Ok(&stored));
             }
         }
     }
@@ -838,7 +1464,10 @@ mod tests {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
 
         for _ in 0..10_000 {
-            let [a, b, c] = [(); 3].map(|_| random_value(&mut rng));
+            let [a, b, c] = [(); 3].map(|_| match rng.below(4) {
+                0 => text(&random_text(&mut rng)),
+                _ => random_value(&mut rng),
+            });
 
             assert_eq!(a.sort_cmp(&a), Ordering::Equal);
             assert_eq!(a.sort_cmp(&b), b.sort_cmp(&a).reverse());

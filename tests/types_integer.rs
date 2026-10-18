@@ -128,7 +128,7 @@ fn integer_rows_should_survive_reopen() {
 fn null_fields_should_only_set_the_bitmap() {
     let zeroed_fixed_part = vec![0; 2 + 4 + 8];
 
-    let all_null = encode(&[Value::Null; 3]);
+    let all_null = encode(&[Value::Null, Value::Null, Value::Null]);
 
     assert_eq!(all_null.len(), layout().min_tuple_size());
     assert_eq!(all_null[..3], [3, 0, 0b111]);

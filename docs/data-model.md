@@ -5,6 +5,7 @@ This document is the authoritative description of what ferroDB stores on top of 
 Dependencies always point downward: `catalog` → `table` → `types` → `storage`.
 
 - [Data Types: Integers and NULL](#data-types-integers-and-null)
+- [Data Types: VARCHAR](#data-types-varchar)
 - [Schema](#schema)
 - [Catalog](#catalog)
 - [Deviations from the SQL Standard](#deviations-from-the-sql-standard)
@@ -13,20 +14,21 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 
 ## Data Types: Integers and NULL
 
-The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. Only the SQL standard integers exist so far: `SMALLINT`, `INTEGER` and `BIGINT`. The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
+The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text is in [Data Types: VARCHAR](#data-types-varchar). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
 
 | File | Responsibility |
 |---|---|
-| `data_type.rs` | `DataType`: SQL name, width, `ColumnLayout`, promotion |
-| `value.rs` | `Value`: `NULL`, encode/decode, parse, `Display`, cast, operators, comparison |
+| `data_type.rs` | `DataType`: SQL name, fixed width, `ColumnLayout`, family, integer promotion |
+| `value.rs` | `Value`: `NULL`, encode/decode, parse, `Display`, cast and assignment, operators, comparison |
 | `integer.rs` | integer semantics in `i64` + narrowing to the target type (private) |
+| `text.rs` | `VARCHAR(n)` semantics: length in characters, truncation, trailing-space rule, UTF-8 validation (private) |
 | `error.rs` | `TypeError` with message and PostgreSQL-compatible `SQLSTATE` |
 
 ### Types and bytes
 
 ```rust
-pub enum DataType { SmallInt, Integer, BigInt }
-pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
+pub enum DataType { SmallInt, Integer, BigInt, Varchar(NonZeroU16) }
+pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Text(String) }
 ```
 
 | Type | Rust | `ColumnLayout` | Field in the tuple | `-2` |
@@ -36,13 +38,13 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
 | `BIGINT` | `i64` | `Fixed(8)` | two's complement, LE | `FE FF FF FF FF FF FF FF` |
 | `NULL` | — | the column's | `None`: bit set in the NULL bitmap, fixed part zeroed | — |
 
-`Value::decode(ty, field)` rejects a field whose width differs from `ty.width()` (`InvalidEncoding`).
+`Value::decode(ty, field)` rejects a field whose width differs from `ty.fixed_width()` (`InvalidEncoding`).
 
 ### Operations
 
 - **Text** (`Value::parse`, like PostgreSQL's `int4in`): surrounding whitespace (including `\t\n\r\v\f`), optional sign and ASCII digits. Empty, sign only, `1.0`, `0x10`, `1_000`, the text `'NULL'` → `22P02`. Does not fit the type → `22003`. Accumulates in the negative range (like `pg_strtoint64`), so `-9223372036854775808` works.
 - **`Display`:** decimal, and `NULL` as `"NULL"`.
-- **Cast:** widening never fails; narrowing is range-checked → `OutOfRange` (`22003`). `CAST(NULL AS T)` is `NULL`.
+- **Cast and assignment:** widening never fails; narrowing is range-checked → `OutOfRange` (`22003`). `CAST(NULL AS T)` is `NULL`. Between integers, `Value::cast` (explicit `CAST`) and `Value::assign` (store assignment, used by `INSERT`/`UPDATE`) behave the same; they differ for text (see [VARCHAR](#cast-and-assignment)).
 - **Arithmetic** (`add`, `sub`, `mul`, `div`, `rem`, `neg`):
   - the result has the **widest** operand type; `SMALLINT + SMALLINT` is `SMALLINT` and overflows at 32767, as in PostgreSQL;
   - overflow → `OutOfRange` (`22003`), never wrap-around; includes `-MIN` and `MIN / -1`;
@@ -50,9 +52,9 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
   - `x / 0` and `x % 0` → `DivisionByZero` (`22012`); `MIN % -1 = 0`.
 - **NULL in operations:** any `NULL` operand → `NULL`, before any other check (`NULL / 0` is `NULL`).
 - **Comparison:**
-  - `compare` → `Option<Ordering>`; `None` is `UNKNOWN` whenever one side is `NULL` (including `NULL = NULL`). Compares by value regardless of width (`INTEGER 5 = BIGINT 5`).
-  - `is_distinct_from` → `IS DISTINCT FROM`: `NULL` equals `NULL`, never `UNKNOWN`.
-  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`).
+  - `compare` → `Result<Option<Ordering>, TypeError>`; `Ok(None)` is `UNKNOWN` whenever one side is `NULL` (including `NULL = NULL`). Compares by value regardless of width (`INTEGER 5 = BIGINT 5`). Comparing an integer with text → `UndefinedOperator` (`42883`).
+  - `is_distinct_from` → `Result<bool, TypeError>`, `IS DISTINCT FROM`: `NULL` equals `NULL`, never `UNKNOWN`.
+  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: integers sort before text, an order that only exists to make the function total (a column never mixes families).
 
 ### Errors
 
@@ -64,10 +66,12 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
 | `DivisionByZero` | `22012` | `division by zero` |
 | `InvalidEncoding` | `XX001` | `integer field must be 4 bytes, got 2` |
 
+The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedText`) are listed in the [VARCHAR section](#errors-1).
+
 ### Design decisions
 
 - **Three integers together:** same logic, and promotion and casts only make sense with more than one width.
-- **`Value` as an enum with native payloads** (not bytes + type, as in BusTub): no allocation per value, and the exhaustive `match` forces every new type to be handled.
+- **`Value` as an enum with native payloads** (not bytes + type, as in BusTub): no allocation for integers (only `Text` owns a buffer), and the exhaustive `match` forces every new type to be handled.
 - **Everything in `i64`, then narrow:** `i32 × i32` always fits in `i64`, and for `BIGINT` the `checked_*` operations catch overflow. One implementation covers the three widths, without macros or 3×3 combinations.
 - **Untyped `NULL`** (`Value::Null`, not `Null(DataType)`): an expression's type comes from the schema, decided by the planner; the `NULL` literal has no type until the type system resolves it from context.
 - **`NULL` = `None` in the field:** reuses the tuple NULL bitmap without changing the on-disk format.
@@ -81,6 +85,82 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64) }
 - `random_operations_should_match_the_i128_model`: 10,000 operations with random values (biased toward the extremes, ~10% `NULL`) compared with an `Option<i128>` reference. Mutation-checked by hand during development: removing the `MIN % -1` case makes it fail.
 - `random_values_should_round_trip_through_bytes_and_text` and `sort_cmp_should_be_a_total_order` (reflexive, antisymmetric, transitive).
 - Integration in [`tests/types_integer.rs`](../tests/types_integer.rs): `[SMALLINT, INTEGER, BIGINT]` rows with extremes and `NULL` survive eviction and reopening the file; an all-`NULL` row only sets the bitmap; a field read with the wrong type → `InvalidEncoding`.
+
+---
+
+## Data Types: VARCHAR
+
+`VARCHAR(n)` (`CHARACTER VARYING(n)`) is the only text type: at most `n` characters, `1 ≤ n ≤ 65535`. A character is a Unicode scalar value (Rust's `char`), not a byte: `'ação'` fits `VARCHAR(4)` although its UTF-8 takes 6 bytes. `CHAR(n)` and `TEXT` do not exist (see [ADR 0008](decisions/0008-varchar-utf8-byte-order-and-assignment.md)).
+
+```rust
+DataType::Varchar(NonZeroU16)        // VARCHAR(0) cannot be built
+DataType::VARCHAR_MAX                // VARCHAR(65535): the type of text that did not come from a column
+Value::Text(String)                  // the limit n belongs to the column, not to the value
+```
+
+`Value` is no longer `Copy`, since `Text` owns its bytes.
+
+### Bytes
+
+| Type | `ColumnLayout` | Field in the tuple |
+|---|---|---|
+| `VARCHAR(n)` | `Variable` | the UTF-8 bytes, no terminator; the tuple stores (offset, length) in its fixed part |
+| empty text `''` | `Variable` | `Some(&[])`: an empty field, **not** `NULL` |
+| `NULL` | `Variable` | `None`: bit in the NULL bitmap |
+
+`Value::decode(VARCHAR(n), field)` validates what comes from disk: invalid UTF-8 or more than `n` characters → `CorruptedText` (`XX001`). Writes go through assignment, so either means corruption or the wrong schema.
+
+### Cast and assignment
+
+The standard has two different rules, and ferroDB keeps them apart: `Value::cast` is the explicit `CAST`, `Value::assign` is store assignment (`INSERT`/`UPDATE`, used by `Schema::encode_row`).
+
+| From → to | integer | `VARCHAR(n)` |
+|---|---|---|
+| integer | range check (`22003`), same in both | `cast`: decimal text, cut to `n` characters (a deviation: the standard raises `22001`); `assign`: `DatatypeMismatch` (`42804`) |
+| text | `cast`: parsed like integer input (`22P02` / `22003`); `assign`: `DatatypeMismatch` (`42804`) | `cast`: cut to `n` characters; `assign`: `StringTooLong` (`22001`) past `n`, unless the excess is only spaces (U+0020), which are cut |
+| `NULL` | `NULL` | `NULL` |
+
+- `CAST('abcdef' AS VARCHAR(3))` = `'abc'`; assigning `'abcdef'` to a `VARCHAR(3)` column → `22001`; assigning `'abc   '` stores `'abc'`. Tabs or non-breaking spaces in the excess are data, so they still fail.
+- `Value::parse(VARCHAR(n), s)` (text input) follows the assignment rule and keeps the text as is: no trimming, and `'NULL'` is the four letters.
+- `Display` prints the text unquoted.
+
+### Operators
+
+- **`concat` (`||`):** text with text. `NULL` on either side → `NULL`. With an integer → `UndefinedOperator` (`42883`). The result has no column, so it must fit `VARCHAR(65535)`, with the same trailing-space rule as assignment; otherwise `StringTooLong` (`22001`).
+- **Arithmetic** (`+ - * / %`, unary `-`) with text → `UndefinedOperator` (`42883`); with `NULL` on either side the result is still `NULL` first.
+- **Comparison:** text compares by its **UTF-8 bytes**, which is the same as code point order, and **without padding**:
+  - `'Z' < 'a'`, `'é' > 'z'`, `'ábaco' > 'banana'`, `'10' < '9'`;
+  - `'a' < 'a '` and `'a' IS DISTINCT FROM 'a '`;
+  - comparing text with an integer → `UndefinedOperator` (`42883`). The error names `=`, the operator every comparison derives from; `is_distinct_from` names `IS DISTINCT FROM`.
+- **`sort_cmp`:** the same byte order within text; integers before text; `NULL` last.
+
+### Errors
+
+| `TypeError` | SQLSTATE | Message |
+|---|---|---|
+| `StringTooLong` | `22001` | `value too long for type varchar(5)` |
+| `UndefinedOperator` | `42883` | `operator does not exist: varchar + integer` / `operator does not exist: - varchar` |
+| `DatatypeMismatch` | `42804` | `cannot assign a value of type varchar to a column of type integer` |
+| `CorruptedText` | `XX001` | `stored varchar(3) value is corrupted: text is not valid UTF-8` |
+
+Length messages show the full type (`varchar(5)`); operator and assignment messages show only the type name, so a loose text value never appears as `varchar(65535)`.
+
+### Design decisions
+
+See [ADR 0008](decisions/0008-varchar-utf8-byte-order-and-assignment.md). Also:
+
+- **Length counted once, at the cut:** `text.rs` finds the byte index of character `n + 1` with `char_indices().nth(n)`, so the kept part, the excess and the error all come from one pass. It is O(length) on every assignment and every read, which is fine at today's sizes.
+- **`Operand` view inside `value.rs`:** operators see a non-NULL value as an integer widened to `i64` or a borrowed `&str`, so each operator is one `match` over two families instead of a combination per width.
+- ⚠️ **Characters vs. bytes:** the limit is in characters but tuples and pages are in bytes. A row above the tuple format's 65,535 bytes (possible with `VARCHAR(65535)` and multibyte text) is rejected by `Schema::encode_row` with `RowTooLarge` (`54000`); a smaller row that still does not fit an 8 KB page is rejected by the `HeapFile` with `TupleTooLarge` (both covered by tests). Values larger than a page wait for an overflow mechanism.
+- **`into_encoded`:** `encode_row` hands each assigned `Text` its own buffer for the tuple field instead of copying it again, and `||` cuts the joined string in place.
+- ⚠️ **Composed characters count as several:** an emoji with a skin tone modifier is two or more `char`s. Grapheme clusters would need a Unicode dependency.
+
+### Tests
+
+- Unit in `value.rs`, `error.rs` and `data_type.rs`: round trip of empty, ASCII, accented and 4-byte characters and of exactly `n` characters; invalid UTF-8 (lone byte, truncated sequence, surrogate) and text longer than the column on decode; `parse` at `n` and `n + 1`, excess of spaces, tabs and U+00A0; every cell of the cast/assign matrix, including `NULL`; `concat` with empty, `NULL`, integers and at the 65,535-character limit; arithmetic with text; byte-order comparison cases; `IS DISTINCT FROM`; mixed `sort_cmp`; every new error with message and SQLSTATE.
+- `random_text_operations_should_match_the_char_model`: 10,000 random strings (ASCII, multibyte, tabs, trailing spaces) with random `n`, checked against a `Vec<char>` model for `assign`, `parse`, `cast`, `concat`, `compare` (code point order) and `is_distinct_from`, plus round trips through bytes and text. `sort_cmp_should_be_a_total_order` now mixes text with integers.
+- `schema.rs`: text columns round trip, trailing spaces cut, `22001`, `42804` in both directions, a row of 80,000 bytes of text → `RowTooLarge` (`54000`), invalid UTF-8 and text longer than the reading schema's column → `Type { .., CorruptedText }`; the random assignment and corruption tests include `VARCHAR` columns. Mutation-checked by hand: making the trailing-space rule look for another character breaks the random schema test.
+- Integration in [`tests/types_string.rs`](../tests/types_string.rs): a catalog table `(id INTEGER NOT NULL, name VARCHAR(40) NOT NULL, bio VARCHAR(4000))` with empty text, `NULL`, accents, emoji and 3,000-byte values spread over many pages survives eviction with a 2-frame pool and reopening the file; `VARCHAR(1)` and `VARCHAR(65535)` come back from the catalog; a value that fits `VARCHAR(8000)` but not a page → `TupleTooLarge`.
 
 ---
 
@@ -113,11 +193,12 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 - **`encode_row`** applies SQL *assignment* column by column, and only builds the tuple if every column passes (the first error, in column order, is the one returned):
   - number of values ≠ number of columns → `ColumnCountMismatch`;
   - `NULL` in a `NOT NULL` column → `NullViolation`;
-  - the value is converted to the column type with `Value::cast`: a `SMALLINT` in a `BIGINT` column is accepted; `70000` in a `SMALLINT` column → `Type { column: "age", OutOfRange }`.
+  - the value is converted to the column type with `Value::assign`: a `SMALLINT` in a `BIGINT` column is accepted; `70000` in a `SMALLINT` column → `Type { column: "age", OutOfRange }`; text longer than a `VARCHAR(n)` column → `Type { .., StringTooLong }` unless the excess is only spaces; a value of the other family (text in an integer column or the reverse) → `Type { .., DatatypeMismatch }`;
+  - valid values whose tuple exceeds the tuple format's limit (65,535 bytes, reachable only with long text) → `RowTooLarge`, not the `Tuple` error, which means corruption.
 - **`decode_row` / `decode_column` / `decode_columns`** read bytes from disk and do not trust them: truncated or corrupted tuple, or one written with another schema → `Tuple(..)`; `NULL` stored in a `NOT NULL` column → `NullViolation`. Values come back **in the column's type** (a `SmallInt` stored in an `INTEGER` column comes back as `Integer`).
   - Every field is read with `TupleRef::field`, which returns an error: a field the tuple cannot produce is never mistaken for `NULL`.
   - `decode_columns` returns the requested columns in the requested order (repetitions allowed), checks the indexes **before** reading the tuple and validates the tuple only once.
-- Each field's width comes from the schema itself, so `Type { .. InvalidEncoding }` does not happen on read; type errors only appear in `encode_row` (a value that does not fit).
+- Each field's width comes from the schema itself, so `Type { .. InvalidEncoding }` does not happen on read; on read, the only type error is `Type { .. CorruptedText }` for a damaged text field.
 
 ### Errors
 
@@ -133,11 +214,12 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 | `ColumnOutOfRange` | `XX000` | `column 5 does not exist (table has 3)` (programming error) |
 | `Type` | the `TypeError`'s (e.g. `22003`) | `column "age": smallint out of range` |
 | `Tuple` | `XX001` | `stored row does not match the schema: expected 3 columns, got 2` |
+| `RowTooLarge` | `54000` | `row of 80007 bytes exceeds the maximum of 65535 bytes` |
 
 ### Design decisions
 
 - **`NOT NULL` already in the schema**, as a column flag checked by `encode_row`: one line of code, and it avoids changing the schema format once the catalog stores it. The **NOT NULL** constraint in the [roadmap](../ROADMAP.md#constraints) is only marked when DDL (`CREATE TABLE ... NOT NULL`) exists.
-- **Assignment with cast** instead of requiring the exact type: it is the standard semantics for `INSERT`/`UPDATE`, and `Value::cast` already does the range check.
+- **Store assignment** (`Value::assign`) instead of requiring the exact type: it is the standard semantics for `INSERT`/`UPDATE`. It accepts any width within a family and differs from `CAST` for text (no silent cut, no integer ⇄ text).
 - **A row is a `Vec<Value>`:** a `struct Row` would have no invariant of its own beyond what `Schema` validates.
 - **63-byte name limit:** fits comfortably in a 1-byte length prefix in the catalog. The standard's 128 characters can exceed 255 bytes in UTF-8.
 - **At least one column**, as in the standard. A table without columns would complicate the catalog and the executor for no benefit here.
@@ -149,7 +231,7 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 ### Tests
 
 - Unit in `schema.rs`: `Column`, every `Schema::new` rule with boundaries (1,600/1,601 columns, 63/64-byte names including multibyte, `id` vs. `ID`), every `SchemaError` with message, SQLSTATE and `source()`, `encode_row` (width cast, does not fit, `NULL` allowed and forbidden, arity, first error wins), `decode_row` / `decode_column` / `decode_columns` (round trip with boundaries and `NULL`, column types, requested order with repetition, empty list, out of range before reading the tuple, truncated, written with another schema, `NULL` on disk in a `NOT NULL` column), truncated long-name message (ASCII and multibyte).
-- `random_rows_should_follow_the_assignment_rules`: 2,000 random schemas and rows compared with rules computed by hand (without `Value::cast`), read back with `decode_row`, `decode_column` and `decode_columns` in reverse order. Mutation-checked by hand during development: disabling `NOT NULL` or the cast makes it fail.
+- `random_rows_should_follow_the_assignment_rules`: 2,000 random schemas (integers and short `VARCHAR`s) and rows (integers and text) compared with rules computed by hand (without `Value::assign`), read back with `decode_row`, `decode_column` and `decode_columns` in reverse order. Mutation-checked by hand during development: disabling `NOT NULL` or the cast makes it fail.
 - `random_corruption_should_never_panic`: 2,000 valid tuples with flipped bits or truncated.
 - Integration in [`tests/table_schema.rs`](../tests/table_schema.rs): 1,000 typed rows in a `HeapFile` survive eviction and reopening the file, `decode_column` projects one column of the stored rows, rows rejected by the schema never reach the heap, a row from a schema wider than a page is rejected by the heap with `TupleTooLarge`.
 
@@ -170,7 +252,7 @@ page 0 (DatabaseHeader)
                     TableRecord.first_page_id ──────────┴──▶ HeapFile with the table's rows
 ```
 
-Entries use their **own format** (`ByteWriter` / `ByteReader`): the catalog is not yet a regular table read through `Schema` / `Value` because the String type does not exist. When it does, the catalog can become system tables without changing the API.
+Entries use their **own format** (`ByteWriter` / `ByteReader`): the catalog was designed before text existed, so it could not be a regular table read through `Schema` / `Value`. Now that `VARCHAR` exists, it can become system tables without changing the API (not done yet).
 
 ```rust
 let mut catalog = Catalog::open(&mut bpm)?;                      // creates the database or loads it
@@ -198,9 +280,9 @@ The checksum catches flipped bytes; the magic rejects a file whose page 0 is val
 | Entry | Fields |
 |---|---|
 | `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · name |
-| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT) · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
+| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
 
-Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes.
+Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Codes `1` to `3` did not change when `VARCHAR` arrived, so older databases still open.
 
 ### Operations
 
@@ -256,9 +338,9 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 ### Tests
 
 - `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
-- `records.rs`: documented bytes, round trip (names of 1 and 63 bytes, multibyte, each type, nullable or not), every corruption reason (truncated at every length, trailing bytes, type `0`/`4`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
+- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`5`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
 - `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, data heap that accepts the schema's rows, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch) and every error with message, SQLSTATE and `source()`.
-- `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
+- `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
 - Integration in [`tests/catalog_table_metadata.rs`](../tests/catalog_table_metadata.rs): tables and rows of two tables survive reopening the file (2-frame pool), a file whose page 0 is a slotted page → `NotADatabase`, a corrupted page of the columns heap → checksum error on `open`.
 
@@ -280,3 +362,10 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Schemas (`CREATE SCHEMA`, `schema.table`) | every table belongs to a schema | a single namespace for tables |
 | Queryable catalog | `INFORMATION_SCHEMA.TABLES` / `.COLUMNS` | not exposed through SQL yet; access is through the `Catalog` API |
 | Table name length | implementation-defined, in characters | up to 63 **bytes** of UTF-8, rejected above that (`42622`), like columns |
+| Character string types | `CHARACTER(n)`, `CHARACTER VARYING(n)`, `CHARACTER LARGE OBJECT` | only `VARCHAR(n)`, `1 ≤ n ≤ 65535`; no `CHAR(n)`, `CLOB` or PostgreSQL's `TEXT` |
+| Text comparison | depends on the collation; `PAD SPACE` collations make `'a' = 'a '` | `NO PAD`, by UTF-8 bytes (code point order), like PostgreSQL's `"C"` collation; no `COLLATE` |
+| `CAST` of text to a shorter `VARCHAR(n)` | cuts and raises a *string data, right truncation* warning | cuts silently (no warnings exist yet) |
+| `CAST` of an integer to a `VARCHAR(n)` too short for its digits | error `22001` | cuts the decimal text (`CAST(-12345 AS VARCHAR(3))` = `'-12'`), as PostgreSQL does; kept on purpose, decided with the author |
+| Integer assigned to a text column | not allowed in store assignment | rejected (`42804`); PostgreSQL accepts it through an assignment cast. Only an explicit `CAST` converts |
+| Comparing text with a number | not allowed | `42883`; the error names `=` whatever the comparison operator |
+| Empty string | different from `NULL` | same (Oracle treats `''` as `NULL`; ferroDB does not) |

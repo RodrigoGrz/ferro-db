@@ -10,6 +10,7 @@ pub(crate) fn narrow(ty: DataType, value: i64) -> Option<Value> {
         DataType::SmallInt => i16::try_from(value).ok().map(Value::SmallInt),
         DataType::Integer => i32::try_from(value).ok().map(Value::Integer),
         DataType::BigInt => Some(Value::BigInt(value)),
+        DataType::Varchar(_) => None,
     }
 }
 

@@ -22,6 +22,28 @@ pub enum TypeError {
         expected: usize,
         actual: usize,
     },
+    /// Text longer than the `n` of its VARCHAR(n).
+    StringTooLong {
+        ty: DataType,
+        chars: usize,
+    },
+    /// An operator applied to types it does not accept, such as text + integer. `left` is
+    /// `None` for a prefix operator (`-text`).
+    UndefinedOperator {
+        op: &'static str,
+        left: Option<DataType>,
+        right: DataType,
+    },
+    /// A value written to a column of another type family (store assignment).
+    DatatypeMismatch {
+        value: DataType,
+        target: DataType,
+    },
+    /// A stored text field that is not valid UTF-8 or is longer than its column.
+    CorruptedText {
+        ty: DataType,
+        reason: &'static str,
+    },
 }
 
 impl TypeError {
@@ -30,7 +52,10 @@ impl TypeError {
             TypeError::OutOfRange { .. } | TypeError::TextOutOfRange { .. } => "22003",
             TypeError::InvalidTextRepresentation { .. } => "22P02",
             TypeError::DivisionByZero => "22012",
-            TypeError::InvalidEncoding { .. } => "XX001",
+            TypeError::StringTooLong { .. } => "22001",
+            TypeError::UndefinedOperator { .. } => "42883",
+            TypeError::DatatypeMismatch { .. } => "42804",
+            TypeError::InvalidEncoding { .. } | TypeError::CorruptedText { .. } => "XX001",
         }
     }
 }
@@ -38,6 +63,11 @@ impl TypeError {
 /// Error messages spell type names in lowercase.
 fn type_name(ty: DataType) -> String {
     ty.name().to_ascii_lowercase()
+}
+
+/// Like `type_name`, plus the length where the type has one: `varchar(5)`.
+fn full_type_name(ty: DataType) -> String {
+    ty.to_string().to_ascii_lowercase()
 }
 
 impl fmt::Display for TypeError {
@@ -63,6 +93,27 @@ impl fmt::Display for TypeError {
                 f,
                 "{} field must be {expected} bytes, got {actual}",
                 type_name(*ty)
+            ),
+            TypeError::StringTooLong { ty, .. } => {
+                write!(f, "value too long for type {}", full_type_name(*ty))
+            }
+            TypeError::UndefinedOperator { op, left, right } => {
+                write!(f, "operator does not exist: ")?;
+                if let Some(left) = left {
+                    write!(f, "{} ", type_name(*left))?;
+                }
+                write!(f, "{op} {}", type_name(*right))
+            }
+            TypeError::DatatypeMismatch { value, target } => write!(
+                f,
+                "cannot assign a value of type {} to a column of type {}",
+                type_name(*value),
+                full_type_name(*target)
+            ),
+            TypeError::CorruptedText { ty, reason } => write!(
+                f,
+                "stored {} value is corrupted: {reason}",
+                full_type_name(*ty)
             ),
         }
     }
@@ -146,6 +197,79 @@ mod tests {
         ];
 
         for (err, sqlstate) in cases {
+            assert_eq!(err.sqlstate(), sqlstate, "{err:?}");
+        }
+    }
+
+    fn varchar(max_chars: u16) -> DataType {
+        DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
+    }
+
+    fn text_errors() -> Vec<(TypeError, &'static str, &'static str)> {
+        vec![
+            (
+                TypeError::StringTooLong {
+                    ty: varchar(5),
+                    chars: 7,
+                },
+                "value too long for type varchar(5)",
+                "22001",
+            ),
+            (
+                TypeError::UndefinedOperator {
+                    op: "+",
+                    left: Some(DataType::VARCHAR_MAX),
+                    right: DataType::Integer,
+                },
+                "operator does not exist: varchar + integer",
+                "42883",
+            ),
+            (
+                TypeError::UndefinedOperator {
+                    op: "-",
+                    left: None,
+                    right: varchar(8),
+                },
+                "operator does not exist: - varchar",
+                "42883",
+            ),
+            (
+                TypeError::DatatypeMismatch {
+                    value: DataType::VARCHAR_MAX,
+                    target: DataType::Integer,
+                },
+                "cannot assign a value of type varchar to a column of type integer",
+                "42804",
+            ),
+            (
+                TypeError::DatatypeMismatch {
+                    value: DataType::BigInt,
+                    target: varchar(10),
+                },
+                "cannot assign a value of type bigint to a column of type varchar(10)",
+                "42804",
+            ),
+            (
+                TypeError::CorruptedText {
+                    ty: varchar(3),
+                    reason: "text is not valid UTF-8",
+                },
+                "stored varchar(3) value is corrupted: text is not valid UTF-8",
+                "XX001",
+            ),
+        ]
+    }
+
+    #[test]
+    fn text_errors_should_describe_the_problem() {
+        for (err, message, _) in text_errors() {
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn text_errors_should_map_to_sql_standard_sqlstates() {
+        for (err, _, sqlstate) in text_errors() {
             assert_eq!(err.sqlstate(), sqlstate, "{err:?}");
         }
     }

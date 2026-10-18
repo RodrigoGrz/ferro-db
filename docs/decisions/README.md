@@ -13,6 +13,7 @@ The rationale comes from the design notes written while each component was built
 | [0005](0005-in-memory-free-space-map.md) | In-memory free space map with first-fit placement | Accepted |
 | [0006](0006-catalog-on-page-zero.md) | Catalog bootstrapped from page 0, stored in two heaps with its own record format | Accepted |
 | [0007](0007-fail-without-side-effects.md) | Operations validate first and fail without side effects; disk data is never trusted | Accepted |
+| [0008](0008-varchar-utf8-byte-order-and-assignment.md) | Text is `VARCHAR(n)` in UTF-8, compared by bytes, with store assignment separate from `CAST` | Accepted |
 
 ## Adding a record
 

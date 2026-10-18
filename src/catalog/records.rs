@@ -2,13 +2,16 @@
 //!
 //! ```text
 //! TableRecord   table_id u32 | first_page_id u32 | name_len u8 | name
-//! ColumnRecord  table_id u32 | position u16 | data_type u8 | flags u8 | name_len u8 | name
+//! ColumnRecord  table_id u32 | position u16 | data_type u8 [max_chars u16] | flags u8
+//!               | name_len u8 | name
 //! ```
 //!
-//! `data_type`: 1 SMALLINT, 2 INTEGER, 3 BIGINT (0 stays invalid so a zeroed entry never
-//! decodes). `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to 63 bytes of
-//! UTF-8. Decoding rejects anything else, including missing or trailing bytes, so an entry
-//! is at most 74 bytes and always fits a page.
+//! `data_type`: 1 SMALLINT, 2 INTEGER, 3 BIGINT, 4 VARCHAR followed by its `n` (1 to 65535);
+//! 0 stays invalid so a zeroed entry never decodes. `flags`: bit 0 = nullable, the other bits
+//! must be 0. Names have 1 to 63 bytes of UTF-8. Decoding rejects anything else, including
+//! missing or trailing bytes, so an entry is at most 74 bytes and always fits a page.
+
+use std::num::NonZeroU16;
 
 use super::{CatalogError, TableId};
 use crate::serialization::ByteReader;
@@ -73,10 +76,10 @@ impl ColumnRecord {
         } else {
             0
         };
-        let mut bytes = Vec::with_capacity(9 + self.column.name.len());
+        let mut bytes = Vec::with_capacity(11 + self.column.name.len());
         bytes.extend(self.table_id.0.to_le_bytes());
         bytes.extend(self.position.to_le_bytes());
-        bytes.push(type_code(self.column.data_type));
+        write_data_type(&mut bytes, self.column.data_type);
         bytes.push(flags);
         bytes.push(name_len);
         bytes.extend(self.column.name.as_bytes());
@@ -87,7 +90,7 @@ impl ColumnRecord {
         let mut reader = ByteReader::new(bytes);
         let table_id = TableId(reader.read_u32().map_err(|_| TRUNCATED)?);
         let position = reader.read_u16().map_err(|_| TRUNCATED)?;
-        let data_type = data_type(reader.read_u8().map_err(|_| TRUNCATED)?)?;
+        let data_type = read_data_type(&mut reader)?;
         let nullable = nullable(reader.read_u8().map_err(|_| TRUNCATED)?)?;
         let name = read_name(&mut reader)?;
         expect_end(&reader)?;
@@ -103,19 +106,31 @@ impl ColumnRecord {
     }
 }
 
-fn type_code(data_type: DataType) -> u8 {
+fn write_data_type(bytes: &mut Vec<u8>, data_type: DataType) {
     match data_type {
-        DataType::SmallInt => 1,
-        DataType::Integer => 2,
-        DataType::BigInt => 3,
+        DataType::SmallInt => bytes.push(1),
+        DataType::Integer => bytes.push(2),
+        DataType::BigInt => bytes.push(3),
+        DataType::Varchar(max_chars) => {
+            bytes.push(4);
+            bytes.extend(max_chars.get().to_le_bytes());
+        }
     }
 }
 
-fn data_type(code: u8) -> Result<DataType, CatalogError> {
-    match code {
+fn read_data_type(reader: &mut ByteReader<'_>) -> Result<DataType, CatalogError> {
+    match reader.read_u8().map_err(|_| TRUNCATED)? {
         1 => Ok(DataType::SmallInt),
         2 => Ok(DataType::Integer),
         3 => Ok(DataType::BigInt),
+        4 => {
+            let max_chars = reader.read_u16().map_err(|_| TRUNCATED)?;
+            NonZeroU16::new(max_chars)
+                .map(DataType::Varchar)
+                .ok_or(CatalogError::Corrupted {
+                    reason: "varchar length must be 1 to 65535",
+                })
+        }
         _ => Err(CatalogError::Corrupted {
             reason: "unknown column type",
         }),
@@ -209,6 +224,45 @@ mod tests {
         assert_eq!(nullable[6..8], [3, 1]);
     }
 
+    fn varchar(max_chars: u16) -> DataType {
+        DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
+    }
+
+    const ALL_TYPES: [DataType; 5] = [
+        SmallInt,
+        Integer,
+        BigInt,
+        DataType::Varchar(std::num::NonZeroU16::MIN),
+        DataType::VARCHAR_MAX,
+    ];
+
+    #[test]
+    fn column_record_of_varchar_should_store_its_length() {
+        let bytes = column("bio", varchar(0x0102), true).encode().unwrap();
+
+        assert_eq!(bytes, [5, 0, 0, 0, 1, 2, 4, 2, 1, 1, 3, b'b', b'i', b'o']);
+    }
+
+    #[test]
+    fn the_largest_column_record_should_take_74_bytes() {
+        let name = "a".repeat(MAX_NAME_LEN);
+
+        let bytes = column(&name, DataType::VARCHAR_MAX, true).encode().unwrap();
+
+        assert_eq!(bytes.len(), 74);
+    }
+
+    #[test]
+    fn decode_of_a_varchar_with_length_zero_should_fail() {
+        let mut bytes = column("bio", varchar(7), true).encode().unwrap();
+        bytes[7..9].copy_from_slice(&[0, 0]);
+
+        assert_eq!(
+            corrupted(ColumnRecord::decode(&bytes).unwrap_err()),
+            "varchar length must be 1 to 65535"
+        );
+    }
+
     fn names() -> Vec<String> {
         vec![
             "a".to_string(),
@@ -232,7 +286,7 @@ mod tests {
     #[test]
     fn column_records_should_round_trip() {
         for name in names() {
-            for data_type in [SmallInt, Integer, BigInt] {
+            for data_type in ALL_TYPES {
                 for nullable in [true, false] {
                     let record = column(&name, data_type, nullable);
 
@@ -259,15 +313,17 @@ mod tests {
     #[test]
     fn decode_of_a_truncated_entry_should_fail() {
         let table_bytes = table("users").encode().unwrap();
-        let column_bytes = column("id", Integer, true).encode().unwrap();
 
         for len in 0..table_bytes.len() {
             let err = TableRecord::decode(&table_bytes[..len]).unwrap_err();
             assert_eq!(corrupted(err), "catalog entry is truncated", "len {len}");
         }
-        for len in 0..column_bytes.len() {
-            let err = ColumnRecord::decode(&column_bytes[..len]).unwrap_err();
-            assert_eq!(corrupted(err), "catalog entry is truncated", "len {len}");
+        for data_type in [Integer, varchar(300)] {
+            let column_bytes = column("id", data_type, true).encode().unwrap();
+            for len in 0..column_bytes.len() {
+                let err = ColumnRecord::decode(&column_bytes[..len]).unwrap_err();
+                assert_eq!(corrupted(err), "catalog entry is truncated", "len {len}");
+            }
         }
     }
 
@@ -293,7 +349,7 @@ mod tests {
         let valid = column("id", Integer, true).encode().unwrap();
         let cases = [
             (6, 0, "unknown column type"),
-            (6, 4, "unknown column type"),
+            (6, 5, "unknown column type"),
             (7, 0b10, "unknown column flags"),
             (7, 0xFF, "unknown column flags"),
         ];
@@ -378,7 +434,15 @@ mod tests {
             position: rng.next() as u16,
             column: Column {
                 name: rng.name(),
-                data_type: [SmallInt, Integer, BigInt][rng.below(3)],
+                data_type: match rng.below(4) {
+                    0 => ALL_TYPES[rng.below(ALL_TYPES.len())],
+                    _ => [
+                        SmallInt,
+                        Integer,
+                        BigInt,
+                        varchar((rng.next() as u16).max(1)),
+                    ][rng.below(4)],
+                },
                 nullable: rng.below(2) == 0,
             },
         };

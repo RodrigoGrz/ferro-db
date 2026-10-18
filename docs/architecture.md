@@ -13,7 +13,7 @@ flowchart TD
     subgraph upper["Typed data"]
         catalog["Catalog<br/>src/catalog/<br/>tables, columns, page 0 header"]
         schema["Schema<br/>src/table/<br/>row ⇄ tuple, NOT NULL, casts"]
-        types["Value / DataType<br/>src/types/<br/>integers, NULL, SQL semantics"]
+        types["Value / DataType<br/>src/types/<br/>integers, VARCHAR, NULL, SQL semantics"]
     end
 
     subgraph storage["Storage engine (src/storage/)"]
@@ -67,7 +67,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `SlottedPage` | Organize variable-size tuples inside one page behind stable slot ids. | Know which page a tuple should go to, or what a tuple contains. |
 | `TupleLayout` / `TupleRef` | Encode and validate a row's bytes (NULL bitmap, fixed and variable fields). | Know SQL types. |
 | `HeapFile` + `FreeSpaceMap` | Store a table's tuples across a linked list of pages; choose where inserts go; move tuples that grow out of their page. | Keep rows ordered or indexed. |
-| `Value` / `DataType` | Integer and NULL values with SQL semantics (parse, cast, arithmetic, three-valued comparison). | Store anything. |
+| `Value` / `DataType` | Integer, text and NULL values with SQL semantics (parse, cast and assignment, arithmetic, `||`, three-valued comparison). | Store anything. |
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `Catalog` | Persist which tables exist, their columns and their first data page; bootstrap from page 0. | Hold open heap handles or expose SQL. |
 
@@ -85,7 +85,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 
 ### Inserting a row
 
-1. `Schema::encode_row(&[Value])` checks arity and `NOT NULL`, casts each value to its column type and produces tuple bytes through the `TupleLayout`.
+1. `Schema::encode_row(&[Value])` checks arity and `NOT NULL`, applies store assignment (`Value::assign`) to each value and produces tuple bytes through the `TupleLayout`.
 2. `HeapFile::insert(bytes)` asks the free space map for the first page with room. If none fits, it allocates a page with `BufferPoolManager::new_page` and links it at the end of the list.
 3. The page is fetched (pinned) from the buffer pool, `SlottedPage::insert` places the tuple and returns a slot id, and the page is unpinned as dirty.
 4. The caller gets a `Rid { page_id, slot_id }`.
@@ -117,6 +117,6 @@ These are verified properties of the current code, not bugs to be fixed in passi
 - **Single-threaded.** Every buffer pool operation takes `&mut self`; there are no latches, locks or transactions.
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.
-- **Limited types.** Only `SMALLINT`, `INTEGER`, `BIGINT` and `NULL`. No strings, so the catalog uses its own record format instead of system tables.
+- **Limited types.** Only `SMALLINT`, `INTEGER`, `BIGINT`, `VARCHAR(n)` and `NULL`. Text compares by UTF-8 bytes and a value must fit in one page. The catalog still uses its own record format instead of system tables.
 - **No `DROP TABLE`, no indexes, no constraints** other than per-column `NOT NULL`.
 - **Formats are not stable.** Page and catalog formats have changed during development without migrations; database files are disposable.
