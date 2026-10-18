@@ -17,6 +17,8 @@ pub enum DataType {
     Boolean,
     /// A calendar day, 0001-01-01 to 9999-12-31.
     Date,
+    /// A date and time of day to the microsecond, in the range of DATE.
+    Timestamp,
 }
 
 /// Values of one family can be assigned and compared to each other; across families only an
@@ -27,7 +29,7 @@ pub(crate) enum TypeFamily {
     Numeric,
     Text,
     Boolean,
-    /// DATE now; TIME and TIMESTAMP will join it.
+    /// DATE and TIMESTAMP; TIME will join them.
     Datetime,
 }
 
@@ -46,6 +48,7 @@ impl DataType {
             DataType::Varchar(_) => "VARCHAR",
             DataType::Boolean => "BOOLEAN",
             DataType::Date => "DATE",
+            DataType::Timestamp => "TIMESTAMP",
         }
     }
 
@@ -59,6 +62,7 @@ impl DataType {
             DataType::Varchar(_) => None,
             DataType::Boolean => Some(size_of::<bool>()),
             DataType::Date => Some(size_of::<i32>()),
+            DataType::Timestamp => Some(size_of::<i64>()),
         }
     }
 
@@ -107,7 +111,7 @@ impl DataType {
             | DataType::Double => TypeFamily::Numeric,
             DataType::Varchar(_) => TypeFamily::Text,
             DataType::Boolean => TypeFamily::Boolean,
-            DataType::Date => TypeFamily::Datetime,
+            DataType::Date | DataType::Timestamp => TypeFamily::Datetime,
         }
     }
 
@@ -193,6 +197,16 @@ mod tests {
         for ty in [Integer, DataType::Double, varchar(3), DataType::Boolean] {
             assert!(!ty.is_datetime(), "{ty}");
         }
+    }
+
+    #[test]
+    fn timestamp_should_be_a_fixed_eight_byte_datetime() {
+        assert_eq!(DataType::Timestamp.name(), "TIMESTAMP");
+        assert_eq!(DataType::Timestamp.to_string(), "TIMESTAMP");
+        assert_eq!(DataType::Timestamp.fixed_width(), Some(8));
+        assert_eq!(DataType::Timestamp.layout(), ColumnLayout::Fixed(8));
+        assert!(DataType::Timestamp.is_datetime());
+        assert_eq!(DataType::Timestamp.family(), DataType::Date.family());
     }
 
     #[test]

@@ -9,6 +9,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 - [Data Types: BOOLEAN](#data-types-boolean)
 - [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision)
 - [Data Types: DATE](#data-types-date)
+- [Data Types: TIMESTAMP](#data-types-timestamp)
 - [Schema](#schema)
 - [Catalog](#catalog)
 - [Deviations from the SQL Standard](#deviations-from-the-sql-standard)
@@ -17,7 +18,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 
 ## Data Types: Integers and NULL
 
-The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text, booleans, floats and dates are in [Data Types: VARCHAR](#data-types-varchar), [Data Types: BOOLEAN](#data-types-boolean), [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision) and [Data Types: DATE](#data-types-date). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
+The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and implements their semantics: text parsing, casts, arithmetic, comparison and `NULL`. The SQL standard integers `SMALLINT`, `INTEGER` and `BIGINT` are described here; text, booleans, floats, dates and timestamps are in [Data Types: VARCHAR](#data-types-varchar), [Data Types: BOOLEAN](#data-types-boolean), [Data Types: REAL and DOUBLE PRECISION](#data-types-real-and-double-precision) , [Data Types: DATE](#data-types-date) and [Data Types: TIMESTAMP](#data-types-timestamp). The layer depends only on `storage` (for `ColumnLayout`), and `storage` does not know `types`.
 
 | File | Responsibility |
 |---|---|
@@ -26,6 +27,7 @@ The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and 
 | `integer.rs` | integer semantics in `i64` + narrowing to the target type (private) |
 | `text.rs` | `VARCHAR(n)` semantics: length in characters, truncation, trailing-space rule, UTF-8 validation (private) |
 | `date.rs` | `DATE`: the `Date` newtype, Hinnant's calendar conversions, ISO text input, day arithmetic (private; `Date` is re-exported) |
+| `timestamp.rs` | `TIMESTAMP`: the `Timestamp` newtype, the split into day and time of day, the text input (private; `Timestamp` is re-exported) |
 | `float.rs` | `REAL` / `DOUBLE PRECISION`: finite newtypes, text input and output, checked arithmetic, conversions, exact comparison with integers (private) |
 | `boolean.rs` | `BOOLEAN` semantics: the 1-byte format, text input, integer conversion, Kleene's `AND`/`OR` (private) |
 | `error.rs` | `TypeError` with message and PostgreSQL-compatible `SQLSTATE` |
@@ -33,8 +35,8 @@ The `src/types/` layer turns tuple fields (`Option<&[u8]>`) into SQL values and 
 ### Types and bytes
 
 ```rust
-pub enum DataType { SmallInt, Integer, BigInt, Real, Double, Varchar(NonZeroU16), Boolean, Date }
-pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32), Double(Finite64), Text(String), Boolean(bool), Date(Date) }
+pub enum DataType { SmallInt, Integer, BigInt, Real, Double, Varchar(NonZeroU16), Boolean, Date, Timestamp }
+pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32), Double(Finite64), Text(String), Boolean(bool), Date(Date), Timestamp(Timestamp) }
 ```
 
 | Type | Rust | `ColumnLayout` | Field in the tuple | `-2` |
@@ -61,7 +63,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32),
   - `compare` → `Result<Option<Ordering>, TypeError>`; `Ok(None)` is `UNKNOWN` whenever one side is `NULL` (including `NULL = NULL`). Compares by value regardless of width (`INTEGER 5 = BIGINT 5`). Comparing an integer with text → `UndefinedOperator` (`42883`).
   - `sql_eq` / `sql_lt` / ... → the same comparison as a SQL value (`Boolean` or `Null`); see [BOOLEAN](#comparison-as-sql-values).
   - `is_distinct_from` → `Result<bool, TypeError>`, `IS DISTINCT FROM`: `NULL` equals `NULL`, never `UNKNOWN`.
-  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: numbers (integers and floats, interleaved by value) sort before text, text before booleans and booleans before dates, an order that only exists to make the function total (a column never mixes families).
+  - `sort_cmp` → total order for `ORDER BY` and indexes, with `NULL` after every value (PostgreSQL's `NULLS LAST` for `ASC`). It never fails: numbers (integers and floats, interleaved by value) sort before text, text before booleans and booleans before datetimes (dates and timestamps interleaved by instant), an order that only exists to make the function total (a column never mixes families).
 
 ### Errors
 
@@ -73,7 +75,7 @@ pub enum Value { Null, SmallInt(i16), Integer(i32), BigInt(i64), Real(Finite32),
 | `DivisionByZero` | `22012` | `division by zero` |
 | `InvalidEncoding` | `XX001` | `integer field must be 4 bytes, got 2` |
 
-The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), `NotBoolean` in the [BOOLEAN section](#errors-2), `CannotCast` in the [float section](#errors-3), and the datetime SQLSTATEs (`22007`, `22008`) in the [DATE section](#errors-4).
+The text errors (`StringTooLong`, `UndefinedOperator`, `DatatypeMismatch`, `CorruptedValue`) are listed in the [VARCHAR section](#errors-1), `NotBoolean` in the [BOOLEAN section](#errors-2), `CannotCast` in the [float section](#errors-3), and the datetime SQLSTATEs (`22007`, `22008`) in the [DATE section](#errors-4), which also apply to `TIMESTAMP`.
 
 ### Design decisions
 
@@ -361,7 +363,7 @@ See [ADR 0009](decisions/0009-floats-finite-exact-comparison-numeric-family.md).
 
 ## Data Types: DATE
 
-`DATE` is a calendar day without time or time zone, from **0001-01-01 to 9999-12-31** (the range of the SQL standard), in the **proleptic Gregorian calendar**: today's leap rule (every 4 years, except centuries, except every 400) applied to every year. `TIME`, `TIMESTAMP` and `INTERVAL` are separate roadmap items.
+`DATE` is a calendar day without a time of day, from **0001-01-01 to 9999-12-31** (the range of the SQL standard), in the **proleptic Gregorian calendar**: today's leap rule (every 4 years, except centuries, except every 400) applied to every year. `TIMESTAMP` has its own section; `TIME` and `INTERVAL` are separate roadmap items.
 
 ```rust
 DataType::Date
@@ -407,7 +409,7 @@ The standard does arithmetic on datetimes only with `INTERVAL`, which does not e
 
 ### Comparison
 
-A `DATE` compares only with a `DATE`, by day number; with any other family → `42883`, naming the operator used. `sql_*`, `is_distinct_from` and `sort_cmp` follow; in `sort_cmp`, dates come after booleans, and `NULL` stays last.
+A `DATE` compares with a `DATE` by day number, and with a `TIMESTAMP` as midnight of its day (see [TIMESTAMP](#comparison-2)); with any other family → `42883`, naming the operator used. `sql_*`, `is_distinct_from` and `sort_cmp` follow; in `sort_cmp`, dates come after booleans, and `NULL` stays last.
 
 ### Cast and assignment
 
@@ -435,7 +437,7 @@ There is no new `TypeError` variant: the standard gives datetimes their own SQLS
 - **Days since 1970-01-01 in `i32`**: comparison and arithmetic are integer operations, and 4 bytes cover 0001–9999 with room to spare. Packing year, month and day would complicate both; the Unix epoch is the better known one.
 - **The standard's range and only the ISO format** (decided with the author): always a 4-digit year, no `BC` suffix, no ambiguity between `01/02` as January or February, no `DateStyle` setting.
 - **Newtype `Date`** with validating constructors, like `Finite64`: an invalid `Value::Date` cannot exist.
-- **`TypeFamily::Datetime`**, so `TIME` and `TIMESTAMP` join without new family rules; in the family order it comes last, after booleans.
+- **`TypeFamily::Datetime`**, which `TIMESTAMP` joined without new family rules (and `TIME` will); in the family order it comes last, after booleans.
 - **SQLSTATE by type** instead of date-specific variants: the message is the same, only the standard's class differs.
 
 ### Tests
@@ -446,6 +448,97 @@ There is no new `TypeError` variant: the standard gives datetimes their own SQLS
 - `value.rs`: bytes and every corrupt pattern; every accepted and rejected text, with the right SQLSTATE; comparison and the `sql_*` operators; day arithmetic at the range ends and with `i64` extremes; every refused operator; every cast/assign cell. `random_date_arithmetic_should_match_an_i64_model` and `random_dates_should_round_trip_through_bytes_and_text` (10,000 each); `sort_cmp_should_be_a_total_order` now mixes all five families.
 - `schema.rs` and `catalog`: `Fixed(4)` columns, round trip, `42804` both ways, the random assignment and corruption tests with dates, catalog code `8` and random creations with `DATE`.
 - Integration in [`tests/types_date.rs`](../tests/types_date.rs): a catalog table `(id INTEGER NOT NULL, born DATE NOT NULL, died DATE)` with 2,000 rows (range limits, leap days, the epoch, `NULL`) survives eviction with a 2-frame pool and reopening the file; `died - born` and `born > DATE '2000-01-01'` on the stored rows give the expected results; a day number past 9999-12-31 written below the schema → `Type { .., CorruptedValue }` (`XX001`).
+
+## Data Types: TIMESTAMP
+
+`TIMESTAMP` is a date and a time of day to the microsecond (`2024-03-15 14:30:00.25`), in the same range as `DATE`: **0001-01-01 00:00:00 to 9999-12-31 23:59:59.999999**. It shares the `Datetime` family with `DATE`.
+
+```rust
+DataType::Timestamp
+Value::Timestamp(Timestamp)
+Timestamp::new(date, 14, 30, 0, 250_000)  // Option: None for hour > 23, minute or second > 59, micro > 999,999
+Timestamp::at_midnight(date)
+Timestamp::from_micros_since_epoch(n)     // Option: None outside MIN..=MAX
+```
+
+`src/types/timestamp.rs` (private; `Timestamp` is re-exported) holds the newtype, the split into day and time of day, the text input and the decoding. The day part is a `Date`, so the calendar stays in `date.rs`, checked day by day.
+
+### Representation
+
+A `Timestamp` is the number of **microseconds since 1970-01-01 00:00:00** in an `i64` (`Timestamp::MIN` = -62,135,596,800,000,000, `Timestamp::MAX` = 253,402,300,799,999,999), the precision the SQL standard sets as default and the one PostgreSQL uses. The epoch is the one of `DATE`, so a day is exactly 86,400,000,000 µs.
+
+The day and the time of day are split with **floor division** (`div_euclid` / `rem_euclid`): the microsecond before 1970 is `1969-12-31 23:59:59.999999`, not a negative time on 1970-01-01.
+
+| Type | `ColumnLayout` | Field in the tuple |
+|---|---|---|
+| `TIMESTAMP` | `Fixed(8)` | `i64` LE, microseconds since 1970-01-01 00:00:00 |
+
+A value outside `MIN..=MAX` read from disk → `CorruptedValue` (`XX001`, `timestamp out of range`); a wrong width → `InvalidEncoding`.
+
+### Text
+
+- **Input** (`Value::parse`): surrounding whitespace, then one of three forms (decided with the author):
+  - `YYYY-MM-DD HH:MM:SS`, with an optional fraction of 1 to 6 digits (`.5`, `.123456`), the standard's literal;
+  - the same with an uppercase `T` instead of the space, as in ISO 8601: `2024-03-15T14:30:00`;
+  - the date alone, `YYYY-MM-DD`, which is midnight.
+
+  The date follows the rules of `DATE`; hours `00`–`23`, minutes and seconds `00`–`59`, always two digits. The whole shape is checked before any range:
+  - any other shape (`2024-03-15 14:30` without seconds, `2:30:00`, lowercase `t`, two spaces, `2024-03-15T`, more than 6 fraction digits, a suffix such as `Z` or `+01`, a time alone) → `InvalidTextRepresentation`, SQLSTATE `22007`, even if the date is also invalid (`2023-02-29 25:00` is a syntax error);
+  - the right shape for a value that does not exist (`2023-02-29 10:00:00`, `24:00:00`, minute or second `60`, year `0000`) → `TextOutOfRange`, SQLSTATE `22008`.
+- **Output** (`Display`): always `YYYY-MM-DD HH:MM:SS`, with the fraction only when it is not zero and without trailing zeros (`14:30:00.25`, `09:05:07.000001`), as PostgreSQL. `parse(display(t)) == t`.
+
+`date.rs` and `timestamp.rs` share the reading of `YYYY-MM-DD` and a small `DatetimeTextError` (`Syntax` / `OutOfRange`) that each type turns into its own `TypeError`.
+
+### Comparison
+
+- `TIMESTAMP` with `TIMESTAMP`: by microsecond.
+- `DATE` with `TIMESTAMP`: the `DATE` is **midnight of its day**, as the standard extends a date with a zero time. `DATE '2024-03-15' = TIMESTAMP '2024-03-15 00:00:00'` and `DATE '2024-03-15' < TIMESTAMP '2024-03-15 00:00:00.000001'`. The comparison is exact: days times 86,400,000,000 fit an `i64` over the whole range.
+- Any other family → `42883`, naming the operator. `sql_*`, `is_distinct_from` and `sort_cmp` follow; in `sort_cmp`, dates and timestamps interleave by instant.
+
+### Arithmetic
+
+None until `INTERVAL` exists (decided with the author): every arithmetic operator with a `TIMESTAMP` (`+`, `-`, `*`, `/`, `%`, unary `-`, with integers, dates or other timestamps) → `UndefinedOperator` (`42883`). Unlike `DATE`, there is no natural unit: days would drop the time, and in PostgreSQL `TIMESTAMP - TIMESTAMP` is an `INTERVAL`. `NULL` stays strict.
+
+### Cast and assignment
+
+| From → to | `TIMESTAMP` | `DATE` | `VARCHAR(n)` | integer, float, boolean |
+|---|---|---|---|---|
+| `TIMESTAMP` | identity | `cast`: its day (the time is dropped, floor division before 1970); `assign`: `42804` | `cast`: the text cut to `n`; `assign`: `42804` | `CannotCast` (`42846`) |
+| `DATE` | `cast` and `assign`: midnight | (`DATE`) | (`DATE`) | (`DATE`) |
+| text | `cast`: the `parse` rules; `assign`: `42804` | (`DATE`) | — | — |
+| integer, float, boolean | `CannotCast` (`42846`) | (`DATE`) | — | — |
+| `NULL` | `NULL` | `NULL` | `NULL` | `NULL` |
+
+**Assignment is asymmetric** inside the family, as integers and floats are: a `DATE` goes into a `TIMESTAMP` column (midnight, nothing lost), but a `TIMESTAMP` goes into a `DATE` column only through an explicit `CAST`, since it would drop the time silently.
+
+### Errors
+
+No new variant; the datetime SQLSTATEs of `DATE` apply to the whole family:
+
+| `TypeError` | SQLSTATE | Message |
+|---|---|---|
+| `InvalidTextRepresentation` | `22007` | `invalid input syntax for type timestamp: "2024-03-15 14:30"` |
+| `TextOutOfRange` | `22008` | `value "2024-03-15 24:00:00" is out of range for type timestamp` |
+| `CorruptedValue` | `XX001` | `stored timestamp value is corrupted: timestamp out of range` |
+| `UndefinedOperator` | `42883` | `operator does not exist: timestamp + integer` |
+| `CannotCast` | `42846` | `cannot cast type timestamp to bigint` |
+| `DatatypeMismatch` | `42804` | `cannot assign a value of type timestamp to a column of type date` |
+
+### Design decisions
+
+- **Microseconds since 1970 in `i64`** (decided with the author): the standard's default precision; the range uses about 58 of the 63 bits. Nanoseconds would not fit 0001–9999 in an `i64`; a separate date and time (12 bytes) would complicate comparing and sorting.
+- **Reusing `Date`** for the day and for `YYYY-MM-DD`: one calendar, checked on all 3,652,059 days.
+- **Three input forms, one output form**: the `T` of ISO 8601 (JSON, APIs) and a bare date are accepted to ease pasting values from elsewhere; the output stays single (with a space), so the round trip is exact.
+- **No leap seconds**: the time of day stops at `23:59:59.999999`. PostgreSQL reads `:60` as the next minute, which would give one instant two texts.
+- **No new error variant**: the SQLSTATE by family already covers `TIMESTAMP`.
+
+### Tests
+
+- Unit in `timestamp.rs`: microsecond 0 is 1970-01-01 00:00:00; the microsecond before 1970; the range limits; every time field one past its limit; `date`/`time_of_day` inverting `new`; `at_midnight`; `Display` with and without a fraction.
+- `random_instants_should_split_into_day_and_time_like_the_model`: 10,000 instants (anywhere, or next to a midnight, the epoch or the range ends) against a split with truncating `/` and `%` corrected for negatives. Mutation-checked by hand: replacing `div_euclid` with `/`, or `rem_euclid` with `%`, makes it fail.
+- `value.rs`: bytes and every corrupt pattern; the three accepted forms and a list of rejected ones with their SQLSTATE, including syntax over range; comparison with timestamps and dates; every refused operator; every cast/assign cell. `random_timestamps_should_round_trip_through_bytes_and_text` and `random_datetime_comparisons_should_match_the_instant_model` (10,000 each; comparing a date without converting it to midnight fails the latter, mutation-checked by hand); `sort_cmp_should_be_a_total_order` includes timestamps.
+- `schema.rs` and `catalog`: `Fixed(8)` columns, round trip, a date into a timestamp column, a timestamp into a date column (`42804`), the random assignment and corruption tests with timestamps, catalog code `9` and random creations with `TIMESTAMP`.
+- Integration in [`tests/types_timestamp.rs`](../tests/types_timestamp.rs): a catalog table `(id INTEGER NOT NULL, created TIMESTAMP NOT NULL, closed TIMESTAMP, due DATE)` with 2,000 rows (range ends, instants before 1970, fractions, `NULL`) survives eviction with a 2-frame pool and reopening the file; `created < due` and `due = CAST(due AS TIMESTAMP)` hold on the stored rows; an instant past the range written below the schema → `Type { .., CorruptedValue }` (`XX001`).
 
 ---
 
@@ -565,9 +658,9 @@ The checksum catches flipped bytes; the magic rejects a file whose page 0 is val
 | Entry | Fields |
 |---|---|
 | `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · name |
-| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
+| `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE, `9` TIMESTAMP) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
 
-Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, then `8` DATE), so older databases still open.
+Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE, then `9` TIMESTAMP), so older databases still open.
 
 ### Operations
 
@@ -623,7 +716,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 ### Tests
 
 - `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
-- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`9`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
+- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`10`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
 - `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, data heap that accepts the schema's rows, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch) and every error with message, SQLSTATE and `source()`.
 - `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
@@ -665,5 +758,9 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | `CAST` of a float to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like integers |
 | Arithmetic on dates | only with `INTERVAL` (`DATE + INTERVAL '30' DAY`) | `DATE ± integer` and `DATE - DATE` in days, as PostgreSQL, until `INTERVAL` exists (decided with the author) |
 | Date text | the literal `DATE 'YYYY-MM-DD'` | only `YYYY-MM-DD`, same as the standard (PostgreSQL also takes other styles set by `DateStyle`) |
+| Timestamp text | the literal `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.f]'` | that form, plus `T` instead of the space and a bare date as midnight (decided with the author; PostgreSQL accepts both) |
+| Seconds of a `TIMESTAMP` | `00` to `61.9…`, for leap seconds | `00` to `59.999999` (PostgreSQL reads `:60` as the next minute) |
+| `TIMESTAMP` into a `DATE` column | allowed, dropping the time | only through an explicit `CAST` (decided with the author, as float to integer) |
+| Arithmetic on timestamps | with `INTERVAL` | none until `INTERVAL` exists |
 | `CAST` of a `DATE` to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like the other types |
 | `CAST` of a `BOOLEAN` to a short `VARCHAR(n)` | `22001` when `'TRUE'`/`'FALSE'` does not fit | cut to `n`, like integers (`CAST(TRUE AS VARCHAR(1))` = `'T'`) |

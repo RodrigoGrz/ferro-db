@@ -393,6 +393,20 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_corruption_message_should_name_the_type() {
+        let err = TypeError::CorruptedValue {
+            ty: DataType::Timestamp,
+            reason: "timestamp out of range",
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "stored timestamp value is corrupted: timestamp out of range"
+        );
+        assert_eq!(err.sqlstate(), "XX001");
+    }
+
+    #[test]
     fn cannot_cast_should_name_both_types() {
         let err = TypeError::CannotCast {
             from: DataType::Double,

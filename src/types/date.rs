@@ -36,7 +36,12 @@ impl Date {
             .then_some(Date(days))
     }
 
-    pub fn days_since_epoch(self) -> i32 {
+    /// For callers whose day number is in range by construction (the day of a `Timestamp`).
+    pub(crate) const fn from_valid_days(days: i32) -> Date {
+        Date(days)
+    }
+
+    pub const fn days_since_epoch(self) -> i32 {
         self.0
     }
 
@@ -46,35 +51,49 @@ impl Date {
     }
 }
 
-/// Text input: surrounding whitespace, then exactly `YYYY-MM-DD`. A well-formed day that does
-/// not exist or is outside 0001..=9999 is out of range (22008); any other text is invalid
-/// syntax (22007).
+/// Why a text is not a datetime: the wrong shape (22007) or the right shape for a value that
+/// does not exist (22008). Shared by DATE and TIMESTAMP, which name their own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatetimeTextError {
+    Syntax,
+    OutOfRange,
+}
+
+impl DatetimeTextError {
+    pub(crate) fn for_type(self, ty: DataType, input: &str) -> TypeError {
+        let input = input.to_string();
+        match self {
+            DatetimeTextError::Syntax => TypeError::InvalidTextRepresentation { ty, input },
+            DatetimeTextError::OutOfRange => TypeError::TextOutOfRange { ty, input },
+        }
+    }
+}
+
+/// Text input: surrounding whitespace, then exactly `YYYY-MM-DD`.
 pub(crate) fn parse(input: &str) -> Result<Value, TypeError> {
-    let text = input.trim_matches(is_c_space);
+    parse_ymd(input.trim_matches(is_c_space))
+        .map(Value::Date)
+        .map_err(|error| error.for_type(DataType::Date, input))
+}
+
+/// Exactly `YYYY-MM-DD`; a well-formed day that does not exist or is outside 0001..=9999 is
+/// `OutOfRange`.
+pub(crate) fn parse_ymd(text: &str) -> Result<Date, DatetimeTextError> {
     let fields = match *text.as_bytes() {
         [y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1] => decimal(&[y0, y1, y2, y3])
             .zip(decimal(&[m0, m1]))
             .zip(decimal(&[d0, d1])),
         _ => None,
     };
-    let Some(((year, month), day)) = fields else {
-        return Err(TypeError::InvalidTextRepresentation {
-            ty: DataType::Date,
-            input: input.to_string(),
-        });
-    };
+    let ((year, month), day) = fields.ok_or(DatetimeTextError::Syntax)?;
     i32::try_from(year)
         .ok()
         .and_then(|year| Date::from_ymd(year, month, day))
-        .map(Value::Date)
-        .ok_or_else(|| TypeError::TextOutOfRange {
-            ty: DataType::Date,
-            input: input.to_string(),
-        })
+        .ok_or(DatetimeTextError::OutOfRange)
 }
 
 /// The number written by a few ASCII digits; `None` if any byte is not a digit.
-fn decimal(digits: &[u8]) -> Option<u32> {
+pub(crate) fn decimal(digits: &[u8]) -> Option<u32> {
     digits.iter().try_fold(0, |number, &byte| {
         byte.is_ascii_digit()
             .then(|| number * 10 + u32::from(byte - b'0'))

@@ -7,7 +7,7 @@ This is the authoritative implementation checklist for ferroDB. The README only 
 - `[x]` means the feature exists **and** is covered by tests (the links point to both).
 - `[ ]` means it is not done. A note says when part of it already exists.
 - Sections keep the order in which the project plans to build them. Items marked *(next)* come from the "next steps" recorded in the design notes and are the closest planned work.
-- Status was last verified against the code on 2026-10-18 (`cargo test --all-targets`: 713 tests passing).
+- Status was last verified against the code on 2026-10-18 (`cargo test --all-targets`: 761 tests passing).
 
 When an item is finished, mark it here in the same change that adds the code, and update the design notes (see the [documentation index](doc.md)).
 
@@ -34,7 +34,8 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] String: `VARCHAR(n)` in UTF-8, with CAST vs. store assignment, `||` and byte-order comparison ([`text.rs`](src/types/text.rs), [`value.rs`](src/types/value.rs), [`tests/types_string.rs`](tests/types_string.rs)). Not included: `CHAR(n)`, `TEXT`, collations and text functions.
 - [x] NULL: `Value::Null`, the tuple NULL bitmap, SQL `UNKNOWN` comparison and `IS DISTINCT FROM` ([`value.rs`](src/types/value.rs), [`tuple.rs`](src/storage/tuple.rs))
 - [x] Date: `DATE` (years 0001 to 9999, ISO `YYYY-MM-DD` text), with day arithmetic (`DATE ± integer`, `DATE - DATE`) until `INTERVAL` exists ([`date.rs`](src/types/date.rs), [`value.rs`](src/types/value.rs), [`tests/types_date.rs`](tests/types_date.rs))
-- [ ] Time and Timestamp: `TIME` and `TIMESTAMP`, with and without time zone
+- [x] Timestamp: `TIMESTAMP` to the microsecond, in the range of `DATE`, with ISO text (space or `T`, or a bare date as midnight) and comparison with `DATE` ([`timestamp.rs`](src/types/timestamp.rs), [`value.rs`](src/types/value.rs), [`tests/types_timestamp.rs`](tests/types_timestamp.rs))
+- [ ] Time: `TIME`
 - [ ] Interval: `INTERVAL` durations (year-month and day-time) and the standard datetime arithmetic (`DATE + INTERVAL '1' MONTH`, `TIMESTAMP - TIMESTAMP`)
 - [ ] UUID
 - [ ] Type System: implicit vs. explicit coercion and operator resolution across type families

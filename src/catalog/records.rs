@@ -7,10 +7,10 @@
 //! ```
 //!
 //! `data_type`: 1 SMALLINT, 2 INTEGER, 3 BIGINT, 4 VARCHAR followed by its `n` (1 to 65535),
-//! 5 BOOLEAN, 6 REAL, 7 DOUBLE PRECISION, 8 DATE; 0 stays invalid so a zeroed entry never
-//! decodes. `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to 63 bytes of
-//! UTF-8. Decoding rejects anything else, including missing or trailing bytes, so an entry is
-//! at most 74 bytes and always fits a page.
+//! 5 BOOLEAN, 6 REAL, 7 DOUBLE PRECISION, 8 DATE, 9 TIMESTAMP; 0 stays invalid so a zeroed
+//! entry never decodes. `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to
+//! 63 bytes of UTF-8. Decoding rejects anything else, including missing or trailing bytes, so
+//! an entry is at most 74 bytes and always fits a page.
 
 use std::num::NonZeroU16;
 
@@ -120,6 +120,7 @@ fn write_data_type(bytes: &mut Vec<u8>, data_type: DataType) {
         DataType::Real => bytes.push(6),
         DataType::Double => bytes.push(7),
         DataType::Date => bytes.push(8),
+        DataType::Timestamp => bytes.push(9),
     }
 }
 
@@ -140,6 +141,7 @@ fn read_data_type(reader: &mut ByteReader<'_>) -> Result<DataType, CatalogError>
         6 => Ok(DataType::Real),
         7 => Ok(DataType::Double),
         8 => Ok(DataType::Date),
+        9 => Ok(DataType::Timestamp),
         _ => Err(CatalogError::Corrupted {
             reason: "unknown column type",
         }),
@@ -237,8 +239,9 @@ mod tests {
         DataType::Varchar(std::num::NonZeroU16::new(max_chars).unwrap())
     }
 
-    const ALL_TYPES: [DataType; 9] = [
+    const ALL_TYPES: [DataType; 10] = [
         DataType::Date,
+        DataType::Timestamp,
         SmallInt,
         Integer,
         BigInt,
@@ -248,6 +251,13 @@ mod tests {
         DataType::VARCHAR_MAX,
         DataType::Boolean,
     ];
+
+    #[test]
+    fn column_record_of_timestamp_should_use_code_9() {
+        let bytes = column("at", DataType::Timestamp, false).encode().unwrap();
+
+        assert_eq!(bytes, [5, 0, 0, 0, 1, 2, 9, 0, 2, b'a', b't']);
+    }
 
     #[test]
     fn column_record_of_date_should_use_code_8() {
@@ -385,7 +395,7 @@ mod tests {
         let valid = column("id", Integer, true).encode().unwrap();
         let cases = [
             (6, 0, "unknown column type"),
-            (6, 9, "unknown column type"),
+            (6, 10, "unknown column type"),
             (7, 0b10, "unknown column flags"),
             (7, 0xFF, "unknown column flags"),
         ];
@@ -481,7 +491,8 @@ mod tests {
                         DataType::Real,
                         DataType::Double,
                         DataType::Date,
-                    ][rng.below(8)],
+                        DataType::Timestamp,
+                    ][rng.below(9)],
                 },
                 nullable: rng.below(2) == 0,
             },

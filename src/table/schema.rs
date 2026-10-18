@@ -338,7 +338,7 @@ fn check_column_names(columns: &[Column]) -> Result<(), SchemaError> {
 mod tests {
     use super::*;
     use crate::storage::tuple::{ColumnLayout, MAX_TUPLE_SIZE};
-    use crate::types::{Date, Finite32, Finite64};
+    use crate::types::{Date, Finite32, Finite64, Timestamp};
     use DataType::{BigInt, Integer, SmallInt};
 
     fn people() -> Schema {
@@ -410,6 +410,13 @@ mod tests {
             [ColumnLayout::Fixed(4), ColumnLayout::Fixed(1)]
         );
         assert_eq!(schema.min_row_size(), 2 + 1 + 4 + 1);
+    }
+
+    #[test]
+    fn timestamp_columns_should_use_eight_fixed_bytes() {
+        let schema = Schema::new(vec![Column::new("created", DataType::Timestamp)]).unwrap();
+
+        assert_eq!(schema.layout().columns(), [ColumnLayout::Fixed(8)]);
     }
 
     #[test]
@@ -1018,6 +1025,64 @@ mod tests {
         }
     }
 
+    fn events() -> Schema {
+        Schema::new(vec![
+            Column::not_null("at", DataType::Timestamp),
+            Column::new("on", DataType::Date),
+        ])
+        .unwrap()
+    }
+
+    fn instant(year: i32, month: u32, day: u32, hour: u32) -> Value {
+        let date = Date::from_ymd(year, month, day).unwrap();
+        Value::Timestamp(crate::types::Timestamp::new(date, hour, 0, 0, 0).unwrap())
+    }
+
+    #[test]
+    fn encode_row_should_round_trip_timestamps() {
+        let schema = events();
+
+        for on in [day(2024, 3, 15), Value::Null] {
+            let row = [instant(2024, 3, 15, 14), on];
+
+            let tuple = schema.encode_row(&row).unwrap();
+
+            assert_eq!(schema.decode_row(&tuple).unwrap(), row);
+        }
+    }
+
+    #[test]
+    fn encode_row_should_accept_a_date_in_a_timestamp_column_as_midnight() {
+        let schema = events();
+
+        let tuple = schema.encode_row(&[day(2024, 3, 15), Value::Null]).unwrap();
+
+        assert_eq!(
+            schema.decode_column(&tuple, 0).unwrap(),
+            instant(2024, 3, 15, 0)
+        );
+    }
+
+    #[test]
+    fn encode_row_with_a_timestamp_in_a_date_column_should_be_a_datatype_mismatch() {
+        let schema = events();
+
+        let err = schema
+            .encode_row(&[instant(2024, 3, 15, 14), instant(2024, 3, 15, 14)])
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            type_error(
+                "on",
+                TypeError::DatatypeMismatch {
+                    value: DataType::Timestamp,
+                    target: DataType::Date
+                }
+            )
+        );
+    }
+
     #[test]
     fn encode_row_across_type_families_should_be_a_datatype_mismatch() {
         let schema = profiles();
@@ -1287,12 +1352,13 @@ mod tests {
 
     /// Integers of every width and short VARCHARs, so text hits its limit often.
     fn random_type(rng: &mut Rng) -> DataType {
-        match rng.below(8) {
+        match rng.below(9) {
             0 => varchar(1 + rng.below(8) as u16),
             1 => DataType::Boolean,
             2 => DataType::Real,
             3 => DataType::Double,
             4 => DataType::Date,
+            5 => DataType::Timestamp,
             _ => INTEGERS[rng.below(3)],
         }
     }
@@ -1300,6 +1366,11 @@ mod tests {
     fn random_date(rng: &mut Rng) -> Value {
         let days = i32::try_from(rng.below(20_000)).unwrap() - 10_000;
         Value::Date(Date::from_days_since_epoch(days).unwrap())
+    }
+
+    fn random_timestamp(rng: &mut Rng) -> Value {
+        let micros = (rng.next() as i64) >> 8;
+        Value::Timestamp(Timestamp::from_micros_since_epoch(micros).unwrap())
     }
 
     /// REAL or DOUBLE PRECISION near the limits where narrowing to REAL fails, or from
@@ -1348,11 +1419,12 @@ mod tests {
         if rng.below(7) == 0 {
             return Value::Null;
         }
-        match rng.below(7) {
+        match rng.below(8) {
             0 => return Value::Text(random_text(rng)),
             1 => return Value::Boolean(rng.below(2) == 0),
             2 => return random_float(rng),
             3 => return random_date(rng),
+            4 => return random_timestamp(rng),
             _ => {}
         }
         let raw = match rng.below(3) {
@@ -1387,7 +1459,8 @@ mod tests {
             | Value::Double(_)
             | Value::Text(_)
             | Value::Boolean(_)
-            | Value::Date(_) => unreachable!("integers only"),
+            | Value::Date(_)
+            | Value::Timestamp(_) => unreachable!("integers only"),
         }
     }
 
@@ -1400,7 +1473,8 @@ mod tests {
             | DataType::Double
             | DataType::Varchar(_)
             | DataType::Boolean
-            | DataType::Date => unreachable!("integer columns only"),
+            | DataType::Date
+            | DataType::Timestamp => unreachable!("integer columns only"),
         };
         fitted.ok_or_else(|| {
             type_error(
@@ -1489,10 +1563,21 @@ mod tests {
                     (Value::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(*value)),
                     (Value::Boolean(_), _) => mismatch(DataType::Boolean),
                     (Value::Date(day), DataType::Date) => Ok(Value::Date(*day)),
-                    (Value::Date(_), _) => mismatch(DataType::Date),
-                    (number, DataType::Varchar(_) | DataType::Boolean | DataType::Date) => {
-                        mismatch(number.data_type().unwrap())
+                    (Value::Date(day), DataType::Timestamp) => {
+                        Ok(Value::Timestamp(Timestamp::at_midnight(*day)))
                     }
+                    (Value::Date(_), _) => mismatch(DataType::Date),
+                    (Value::Timestamp(instant), DataType::Timestamp) => {
+                        Ok(Value::Timestamp(*instant))
+                    }
+                    (Value::Timestamp(_), _) => mismatch(DataType::Timestamp),
+                    (
+                        number,
+                        DataType::Varchar(_)
+                        | DataType::Boolean
+                        | DataType::Date
+                        | DataType::Timestamp,
+                    ) => mismatch(number.data_type().unwrap()),
                     (number, DataType::Real | DataType::Double) => expected_float(column, number),
                     (float @ (Value::Real(_) | Value::Double(_)), _) => {
                         mismatch(float.data_type().unwrap())
@@ -1558,6 +1643,7 @@ mod tests {
                         Value::Double(Finite64::new(rng.below(1000) as f64 / 8.0).unwrap())
                     }
                     DataType::Date => random_date(rng),
+                    DataType::Timestamp => random_timestamp(rng),
                     integer => Value::BigInt(rng.below(100) as i64).cast(integer).unwrap(),
                 },
             })

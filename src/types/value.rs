@@ -3,13 +3,17 @@
 //! an integer in two's complement, little-endian, `DataType::fixed_width` bytes; a REAL or
 //! DOUBLE PRECISION as IEEE 754 little-endian, 4 or 8 bytes, never NaN, infinite or `-0.0`;
 //! a VARCHAR as its UTF-8 bytes (empty text is `Some(&[])`, never NULL); a BOOLEAN as one
-//! byte, `0` or `1`; or a DATE as an `i32` little-endian of days since 1970-01-01, within
-//! 0001-01-01..=9999-12-31.
+//! byte, `0` or `1`; a DATE as an `i32` little-endian of days since 1970-01-01, within
+//! 0001-01-01..=9999-12-31; or a TIMESTAMP as an `i64` little-endian of microseconds since
+//! 1970-01-01 00:00:00, in the same range.
 
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::{DataType, Date, Finite32, Finite64, TypeError, boolean, date, float, integer, text};
+use super::{
+    DataType, Date, Finite32, Finite64, Timestamp, TypeError, boolean, date, float, integer, text,
+    timestamp,
+};
 
 /// `PartialEq` is structural and meant for tests: `Null == Null` and
 /// `SmallInt(1) != BigInt(1)`. SQL equality is `sql_eq` (or `compare`), which yields
@@ -28,6 +32,7 @@ pub enum Value {
     Text(String),
     Boolean(bool),
     Date(Date),
+    Timestamp(Timestamp),
 }
 
 impl Value {
@@ -44,6 +49,7 @@ impl Value {
             Value::Text(_) => Some(DataType::VARCHAR_MAX),
             Value::Boolean(_) => Some(DataType::Boolean),
             Value::Date(_) => Some(DataType::Date),
+            Value::Timestamp(_) => Some(DataType::Timestamp),
             Value::Real(_) => Some(DataType::Real),
             Value::Double(_) => Some(DataType::Double),
         }
@@ -58,6 +64,7 @@ impl Value {
             Value::Text(text) => Some(text.as_bytes().to_vec()),
             Value::Boolean(value) => Some(vec![boolean::encode(*value)]),
             Value::Date(value) => Some(value.days_since_epoch().to_le_bytes().to_vec()),
+            Value::Timestamp(value) => Some(value.micros_since_epoch().to_le_bytes().to_vec()),
             Value::Real(value) => Some(value.get().to_le_bytes().to_vec()),
             Value::Double(value) => Some(value.get().to_le_bytes().to_vec()),
         }
@@ -80,6 +87,7 @@ impl Value {
             DataType::Integer => Value::Integer(i32::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::BigInt => Value::BigInt(i64::from_le_bytes(fixed_width(ty, bytes)?)),
             DataType::Date => date::decode(fixed_width(ty, bytes)?)?,
+            DataType::Timestamp => timestamp::decode(fixed_width(ty, bytes)?)?,
             DataType::Real => float::decode_real(fixed_width(ty, bytes)?)?,
             DataType::Double => float::decode_double(fixed_width(ty, bytes)?)?,
             DataType::Varchar(max_chars) => text::decode(max_chars, bytes)?,
@@ -100,19 +108,22 @@ impl Value {
             DataType::Real => float::parse_real(input),
             DataType::Double => float::parse_double(input),
             DataType::Date => date::parse(input),
+            DataType::Timestamp => timestamp::parse(input),
             integer => integer::parse(integer, input),
         }
     }
 
-    /// Store assignment (`INSERT`/`UPDATE`): only within a type family, and a float becomes
-    /// an integer only through an explicit CAST, so a fraction is never rounded away
-    /// silently. Text longer than the target VARCHAR(n) is an error unless the excess is only
-    /// spaces, which are cut.
+    /// Store assignment (`INSERT`/`UPDATE`): only within a type family, and never losing
+    /// information silently: a float becomes an integer, and a TIMESTAMP a DATE, only through
+    /// an explicit CAST. Text longer than the target VARCHAR(n) is an error unless the excess is
+    /// only spaces, which are cut.
     pub fn assign(&self, target: DataType) -> Result<Value, TypeError> {
         let Some(ty) = self.data_type() else {
             return Ok(Value::Null);
         };
-        if ty.family() != target.family() || ty.is_float() && target.is_integer() {
+        let drops_a_part = ty.is_float() && target.is_integer()
+            || ty == DataType::Timestamp && target == DataType::Date;
+        if ty.family() != target.family() || drops_a_part {
             return Err(TypeError::DatatypeMismatch { value: ty, target });
         }
         match (self, target) {
@@ -121,10 +132,11 @@ impl Value {
         }
     }
 
-    /// Explicit `CAST`: every pair of types converts except floats and booleans, and dates
-    /// with anything but text and dates (`CannotCast`). Text longer than the target VARCHAR(n) is cut, whatever the excess
-    /// holds; only `0`/`1` and `'true'`/`'false'`/`'1'`/`'0'` become booleans; floats become
-    /// integers rounding half to even.
+    /// Explicit `CAST`: every pair of types converts except floats and booleans, and datetimes
+    /// with anything but text and datetimes (`CannotCast`). Text longer than the target
+    /// VARCHAR(n) is cut, whatever the excess holds; only `0`/`1` and `'true'`/`'false'`/`'1'`/
+    /// `'0'` become booleans; floats become integers rounding half to even; a TIMESTAMP becomes
+    /// its day and a DATE its midnight.
     pub fn cast(&self, target: DataType) -> Result<Value, TypeError> {
         let Some(operand) = self.operand() else {
             return Ok(Value::Null);
@@ -132,10 +144,10 @@ impl Value {
         match (operand, target) {
             (
                 source @ (Operand::Integer(..) | Operand::Float(..) | Operand::Boolean(_)),
-                DataType::Date,
+                DataType::Date | DataType::Timestamp,
             ) => Err(TypeError::CannotCast {
                 from: source.data_type(),
-                to: DataType::Date,
+                to: target,
             }),
             (Operand::Integer(_, value), DataType::Boolean) => boolean::from_integer(value),
             (Operand::Integer(_, value), DataType::Real | DataType::Double) => {
@@ -163,6 +175,20 @@ impl Value {
             }
             // The text input of the target type: integers, floats and booleans.
             (Operand::Text(text), other) => Value::parse(other, text),
+            (Operand::Timestamp(_), DataType::Timestamp) => Ok(self.clone()),
+            (Operand::Timestamp(micros), DataType::Date) => {
+                Ok(Value::Date(timestamp::day_of(micros)))
+            }
+            (Operand::Timestamp(_), DataType::Varchar(max_chars)) => {
+                Ok(text::truncate(max_chars, &self.to_string()))
+            }
+            (Operand::Timestamp(_), other) => Err(TypeError::CannotCast {
+                from: DataType::Timestamp,
+                to: other,
+            }),
+            (Operand::Date(days), DataType::Timestamp) => Ok(Value::Timestamp(
+                Timestamp::at_midnight(Date::from_valid_days(days)),
+            )),
             (Operand::Date(_), DataType::Date) => Ok(self.clone()),
             (Operand::Date(_), DataType::Varchar(max_chars)) => {
                 Ok(text::truncate(max_chars, &self.to_string()))
@@ -368,8 +394,9 @@ impl Value {
 
     /// Total order for `ORDER BY` and indexes. `compare` is not one because of UNKNOWN and
     /// of the families it refuses to mix; here numbers (integers and floats, interleaved by
-    /// value) sort before text, text before booleans, booleans before dates, and NULL after
-    /// every value (`NULLS LAST` for `ASC`).
+    /// value) sort before text, text before booleans, booleans before datetimes (dates and
+    /// timestamps, interleaved by instant), and NULL after every value (`NULLS LAST` for
+    /// `ASC`).
     pub fn sort_cmp(&self, rhs: &Value) -> Ordering {
         match (self.operand(), rhs.operand()) {
             (Some(lhs), Some(rhs)) => lhs.sort_cmp(&rhs),
@@ -389,6 +416,7 @@ impl Value {
             Value::Text(text) => Some(Operand::Text(text)),
             Value::Boolean(value) => Some(Operand::Boolean(*value)),
             Value::Date(value) => Some(Operand::Date(value.days_since_epoch())),
+            Value::Timestamp(value) => Some(Operand::Timestamp(value.micros_since_epoch())),
             Value::Real(value) => Some(Operand::Float(DataType::Real, value.get().into())),
             Value::Double(value) => Some(Operand::Float(DataType::Double, value.get())),
         }
@@ -398,8 +426,8 @@ impl Value {
 type FloatOperation = fn(DataType, f64, f64) -> Result<Value, TypeError>;
 
 /// A non-NULL value as the operators see it: every integer widened to `i64` and every float
-/// to `f64`, so one implementation covers all widths, text borrowed, and a date as its day
-/// number.
+/// to `f64`, so one implementation covers all widths, text borrowed, a date as its day number
+/// and a timestamp as its microseconds.
 enum Operand<'a> {
     Integer(DataType, i64),
     /// REAL is widened to f64 exactly.
@@ -408,6 +436,8 @@ enum Operand<'a> {
     Boolean(bool),
     /// Days since 1970-01-01.
     Date(i32),
+    /// Microseconds since 1970-01-01 00:00:00.
+    Timestamp(i64),
 }
 
 impl Operand<'_> {
@@ -417,6 +447,7 @@ impl Operand<'_> {
             Operand::Text(_) => DataType::VARCHAR_MAX,
             Operand::Boolean(_) => DataType::Boolean,
             Operand::Date(_) => DataType::Date,
+            Operand::Timestamp(_) => DataType::Timestamp,
         }
     }
 
@@ -426,7 +457,9 @@ impl Operand<'_> {
         match *self {
             Operand::Integer(ty, value) => Some((ty, value as f64)),
             Operand::Float(ty, value) => Some((ty, value)),
-            Operand::Text(_) | Operand::Boolean(_) | Operand::Date(_) => None,
+            Operand::Text(_) | Operand::Boolean(_) | Operand::Date(_) | Operand::Timestamp(_) => {
+                None
+            }
         }
     }
 
@@ -454,6 +487,14 @@ impl Operand<'_> {
             (Operand::Text(lhs), Operand::Text(rhs)) => lhs.cmp(rhs),
             (Operand::Boolean(lhs), Operand::Boolean(rhs)) => lhs.cmp(rhs),
             (Operand::Date(lhs), Operand::Date(rhs)) => lhs.cmp(rhs),
+            (Operand::Timestamp(lhs), Operand::Timestamp(rhs)) => lhs.cmp(rhs),
+            // A DATE is midnight of its day, as the standard extends it with a zero time.
+            (Operand::Date(lhs), Operand::Timestamp(rhs)) => {
+                timestamp::midnight_micros(*lhs).cmp(rhs)
+            }
+            (Operand::Timestamp(lhs), Operand::Date(rhs)) => {
+                lhs.cmp(&timestamp::midnight_micros(*rhs))
+            }
             _ => self.data_type().family().cmp(&rhs.data_type().family()),
         }
     }
@@ -481,6 +522,7 @@ impl fmt::Display for Value {
             Value::Text(text) => f.write_str(text),
             Value::Boolean(value) => f.write_str(boolean::literal(*value)),
             Value::Date(value) => write!(f, "{value}"),
+            Value::Timestamp(value) => write!(f, "{value}"),
             Value::Real(value) => write!(f, "{value}"),
             Value::Double(value) => write!(f, "{value}"),
         }
@@ -2358,6 +2400,481 @@ mod tests {
         );
     }
 
+    fn timestamp(day: (i32, u32, u32), hour: u32, minute: u32, second: u32, micro: u32) -> Value {
+        let day = Date::from_ymd(day.0, day.1, day.2).unwrap();
+        Value::Timestamp(Timestamp::new(day, hour, minute, second, micro).unwrap())
+    }
+
+    #[test]
+    fn timestamp_should_have_the_timestamp_type() {
+        assert_eq!(
+            timestamp((2024, 3, 15), 14, 30, 0, 0).data_type(),
+            Some(DataType::Timestamp)
+        );
+    }
+
+    #[test]
+    fn encode_of_timestamp_should_be_microseconds_since_1970_little_endian() {
+        assert_eq!(
+            timestamp((1970, 1, 1), 0, 0, 0, 1).encode().unwrap(),
+            [1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            timestamp((1969, 12, 31), 23, 59, 59, 999_999)
+                .encode()
+                .unwrap(),
+            [0xFF; 8]
+        );
+    }
+
+    #[test]
+    fn decode_should_round_trip_timestamps() {
+        let values = [
+            Value::Timestamp(Timestamp::MIN),
+            Value::Timestamp(Timestamp::MAX),
+            timestamp((1970, 1, 1), 0, 0, 0, 0),
+            timestamp((2024, 3, 15), 14, 30, 0, 250_000),
+        ];
+
+        for value in values {
+            assert_eq!(
+                Value::decode(DataType::Timestamp, value.encode().as_deref()),
+                Ok(value)
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_microseconds_outside_the_range_should_be_corrupted() {
+        let min = Timestamp::MIN.micros_since_epoch();
+        let max = Timestamp::MAX.micros_since_epoch();
+
+        for micros in [min - 1, max + 1, i64::MIN, i64::MAX] {
+            assert_eq!(
+                Value::decode(DataType::Timestamp, Some(&micros.to_le_bytes())),
+                Err(TypeError::CorruptedValue {
+                    ty: DataType::Timestamp,
+                    reason: "timestamp out of range"
+                }),
+                "{micros}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_of_a_timestamp_with_the_wrong_width_should_fail() {
+        for actual in [7, 9] {
+            assert_eq!(
+                Value::decode(DataType::Timestamp, Some(&vec![0; actual])),
+                Err(TypeError::InvalidEncoding {
+                    ty: DataType::Timestamp,
+                    expected: 8,
+                    actual
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_timestamp_should_read_the_three_forms() {
+        let cases = [
+            (
+                "2024-03-15 14:30:00",
+                timestamp((2024, 3, 15), 14, 30, 0, 0),
+            ),
+            (
+                "2024-03-15T14:30:00",
+                timestamp((2024, 3, 15), 14, 30, 0, 0),
+            ),
+            ("2024-03-15", timestamp((2024, 3, 15), 0, 0, 0, 0)),
+            (
+                "2024-03-15 14:30:00.25",
+                timestamp((2024, 3, 15), 14, 30, 0, 250_000),
+            ),
+            (
+                "2024-03-15T09:05:07.000001",
+                timestamp((2024, 3, 15), 9, 5, 7, 1),
+            ),
+            (
+                " 2024-03-15 14:30:00.123456 \t",
+                timestamp((2024, 3, 15), 14, 30, 0, 123_456),
+            ),
+            (
+                "1969-12-31 23:59:59.999999",
+                timestamp((1969, 12, 31), 23, 59, 59, 999_999),
+            ),
+            ("0001-01-01 00:00:00", Value::Timestamp(Timestamp::MIN)),
+            (
+                "9999-12-31 23:59:59.999999",
+                Value::Timestamp(Timestamp::MAX),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                Value::parse(DataType::Timestamp, input),
+                Ok(expected),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_timestamp_should_reject_other_formats() {
+        let cases = [
+            "",
+            "14:30:00",
+            "2024-03-15 14:30",
+            "2024-03-15 2:30:00",
+            "2024-03-15t14:30:00",
+            "2024-03-15  14:30:00",
+            "2024-03-15T",
+            "2024-03-15_14:30:00",
+            "2024-03-15 14:30:00.",
+            "2024-03-15 14:30:00.1234567",
+            "2024-03-15 14:30:00Z",
+            "2024-03-15 14:30:00+01",
+            "2024-03-15 14-30-00",
+            "2024/03/15 14:30:00",
+            "2024-3-15 14:30:00",
+            "２０２４-03-15 14:30:00",
+            "2023-02-29 25:00",
+        ];
+
+        for input in cases {
+            let err = Value::parse(DataType::Timestamp, input).unwrap_err();
+
+            assert_eq!(err, invalid_text(DataType::Timestamp, input), "{input:?}");
+            assert_eq!(err.sqlstate(), "22007");
+        }
+    }
+
+    #[test]
+    fn parse_of_timestamp_should_reject_values_that_do_not_exist() {
+        let cases = [
+            "2023-02-29 10:00:00",
+            "2023-02-29",
+            "2024-03-15 24:00:00",
+            "2024-03-15 10:60:00",
+            "2024-03-15 10:00:60",
+            "0000-01-01 00:00:00",
+        ];
+
+        for input in cases {
+            let err = Value::parse(DataType::Timestamp, input).unwrap_err();
+
+            assert_eq!(
+                err,
+                text_out_of_range(DataType::Timestamp, input),
+                "{input:?}"
+            );
+            assert_eq!(err.sqlstate(), "22008");
+        }
+    }
+
+    #[test]
+    fn display_of_timestamp_should_use_a_space_and_trim_the_fraction() {
+        assert_eq!(
+            timestamp((2024, 3, 15), 14, 30, 0, 0).to_string(),
+            "2024-03-15 14:30:00"
+        );
+        assert_eq!(
+            timestamp((2024, 3, 15), 14, 30, 0, 250_000).to_string(),
+            "2024-03-15 14:30:00.25"
+        );
+    }
+
+    #[test]
+    fn timestamps_should_round_trip_through_their_text() {
+        for value in [
+            Value::Timestamp(Timestamp::MIN),
+            Value::Timestamp(Timestamp::MAX),
+            timestamp((1969, 12, 31), 23, 59, 59, 999_999),
+            timestamp((2024, 3, 15), 9, 5, 7, 1),
+        ] {
+            assert_eq!(
+                Value::parse(DataType::Timestamp, &value.to_string()),
+                Ok(value)
+            );
+        }
+    }
+
+    #[test]
+    fn compare_of_timestamps_should_follow_the_instant() {
+        let earlier = timestamp((2024, 3, 15), 14, 30, 0, 0);
+        let later = timestamp((2024, 3, 15), 14, 30, 0, 1);
+
+        assert_eq!(earlier.compare(&later), Ok(Some(Ordering::Less)));
+        assert_eq!(later.compare(&earlier), Ok(Some(Ordering::Greater)));
+        assert_eq!(earlier.compare(&earlier), Ok(Some(Ordering::Equal)));
+    }
+
+    #[test]
+    fn compare_of_a_date_with_a_timestamp_should_use_midnight() {
+        let cases = [
+            (
+                date(2024, 3, 15),
+                timestamp((2024, 3, 15), 0, 0, 0, 0),
+                Ordering::Equal,
+            ),
+            (
+                date(2024, 3, 15),
+                timestamp((2024, 3, 15), 0, 0, 0, 1),
+                Ordering::Less,
+            ),
+            (
+                date(2024, 3, 15),
+                timestamp((2024, 3, 14), 23, 59, 59, 999_999),
+                Ordering::Greater,
+            ),
+            (
+                date(1969, 12, 31),
+                timestamp((1969, 12, 31), 12, 0, 0, 0),
+                Ordering::Less,
+            ),
+            (
+                Value::Date(Date::MAX),
+                Value::Timestamp(Timestamp::MAX),
+                Ordering::Less,
+            ),
+            (
+                Value::Date(Date::MIN),
+                Value::Timestamp(Timestamp::MIN),
+                Ordering::Equal,
+            ),
+        ];
+
+        for (day, instant, expected) in cases {
+            assert_eq!(
+                day.compare(&instant),
+                Ok(Some(expected)),
+                "{day} vs {instant}"
+            );
+            assert_eq!(instant.compare(&day), Ok(Some(expected.reverse())));
+        }
+    }
+
+    #[test]
+    fn sql_comparisons_should_mix_dates_and_timestamps() {
+        let midnight = timestamp((2024, 3, 15), 0, 0, 0, 0);
+
+        assert_eq!(
+            date(2024, 3, 15).sql_eq(&midnight),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            timestamp((2024, 3, 15), 9, 0, 0, 0).sql_gt(&date(2024, 3, 15)),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(date(2024, 3, 15).is_distinct_from(&midnight), Ok(false));
+        assert_eq!(midnight.sql_lt(&Value::Null), Ok(Value::Null));
+    }
+
+    #[test]
+    fn compare_of_a_timestamp_with_another_family_should_be_an_undefined_operator() {
+        let instant = timestamp((2024, 3, 15), 0, 0, 0, 0);
+
+        assert_eq!(
+            instant.compare(&Value::BigInt(0)),
+            Err(undefined("=", Some(DataType::Timestamp), BigInt))
+        );
+        assert_eq!(
+            instant.sql_gt(&text("2024-03-15")),
+            Err(undefined(
+                ">",
+                Some(DataType::Timestamp),
+                DataType::VARCHAR_MAX
+            ))
+        );
+    }
+
+    #[test]
+    fn sort_cmp_should_interleave_dates_and_timestamps_by_instant() {
+        let mut values = vec![
+            timestamp((2024, 3, 15), 12, 0, 0, 0),
+            date(2024, 3, 15),
+            Value::Null,
+            Value::Boolean(true),
+            date(2024, 3, 16),
+            timestamp((2024, 3, 14), 23, 0, 0, 0),
+        ];
+
+        values.sort_by(Value::sort_cmp);
+
+        assert_eq!(
+            values,
+            [
+                Value::Boolean(true),
+                timestamp((2024, 3, 14), 23, 0, 0, 0),
+                date(2024, 3, 15),
+                timestamp((2024, 3, 15), 12, 0, 0, 0),
+                date(2024, 3, 16),
+                Value::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_with_timestamps_should_be_undefined_until_interval_exists() {
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 0);
+        let day = date(2024, 3, 15);
+        let one = Value::Integer(1);
+        let ts = DataType::Timestamp;
+
+        let cases = [
+            (instant.add(&one), undefined("+", Some(ts), Integer)),
+            (one.add(&instant), undefined("+", Some(Integer), ts)),
+            (instant.sub(&instant), undefined("-", Some(ts), ts)),
+            (instant.sub(&day), undefined("-", Some(ts), DataType::Date)),
+            (day.sub(&instant), undefined("-", Some(DataType::Date), ts)),
+            (day.add(&instant), undefined("+", Some(DataType::Date), ts)),
+            (instant.mul(&one), undefined("*", Some(ts), Integer)),
+            (
+                instant.div(&double(2.0)),
+                undefined("/", Some(ts), DataType::Double),
+            ),
+            (instant.rem(&one), undefined("%", Some(ts), Integer)),
+            (instant.neg(), undefined("-", None, ts)),
+            (
+                text("a").concat(&instant),
+                undefined("||", Some(DataType::VARCHAR_MAX), ts),
+            ),
+        ];
+
+        for (result, expected) in cases {
+            assert_eq!(result, Err(expected));
+        }
+    }
+
+    #[test]
+    fn arithmetic_with_null_and_a_timestamp_should_be_null() {
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 0);
+
+        assert_eq!(instant.add(&Value::Null), Ok(Value::Null));
+        assert_eq!(Value::Null.sub(&instant), Ok(Value::Null));
+    }
+
+    #[test]
+    fn cast_of_a_timestamp_to_a_date_should_keep_the_day() {
+        let cases = [
+            (
+                timestamp((2024, 3, 15), 23, 59, 59, 999_999),
+                date(2024, 3, 15),
+            ),
+            (timestamp((1969, 12, 31), 12, 0, 0, 0), date(1969, 12, 31)),
+            (Value::Timestamp(Timestamp::MIN), Value::Date(Date::MIN)),
+            (Value::Timestamp(Timestamp::MAX), Value::Date(Date::MAX)),
+        ];
+
+        for (instant, day) in cases {
+            assert_eq!(instant.cast(DataType::Date), Ok(day), "{instant}");
+        }
+    }
+
+    #[test]
+    fn cast_of_a_date_to_a_timestamp_should_be_midnight() {
+        assert_eq!(
+            date(2024, 3, 15).cast(DataType::Timestamp),
+            Ok(timestamp((2024, 3, 15), 0, 0, 0, 0))
+        );
+        assert_eq!(
+            Value::Date(Date::MIN).cast(DataType::Timestamp),
+            Ok(Value::Timestamp(Timestamp::MIN))
+        );
+    }
+
+    #[test]
+    fn cast_of_a_timestamp_to_varchar_should_be_its_text_cut_to_n() {
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 250_000);
+
+        assert_eq!(
+            instant.cast(DataType::VARCHAR_MAX),
+            Ok(text("2024-03-15 14:30:00.25"))
+        );
+        assert_eq!(instant.cast(varchar(10)), Ok(text("2024-03-15")));
+    }
+
+    #[test]
+    fn cast_of_text_to_a_timestamp_should_follow_the_input_rules() {
+        assert_eq!(
+            text("2024-03-15T14:30:00").cast(DataType::Timestamp),
+            Ok(timestamp((2024, 3, 15), 14, 30, 0, 0))
+        );
+        assert_eq!(
+            text("2024-03-15").cast(DataType::Timestamp),
+            Ok(timestamp((2024, 3, 15), 0, 0, 0, 0))
+        );
+        assert_eq!(
+            text("soon").cast(DataType::Timestamp),
+            Err(invalid_text(DataType::Timestamp, "soon"))
+        );
+    }
+
+    #[test]
+    fn cast_of_a_timestamp_to_a_timestamp_should_be_identity() {
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 0);
+
+        assert_eq!(instant.cast(DataType::Timestamp), Ok(instant.clone()));
+        assert_eq!(Value::Null.cast(DataType::Timestamp), Ok(Value::Null));
+    }
+
+    #[test]
+    fn cast_between_timestamps_and_numbers_or_booleans_should_be_impossible() {
+        let cannot = |from, to| Err(TypeError::CannotCast { from, to });
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 0);
+        let ts = DataType::Timestamp;
+
+        assert_eq!(instant.cast(BigInt), cannot(ts, BigInt));
+        assert_eq!(instant.cast(DataType::Double), cannot(ts, DataType::Double));
+        assert_eq!(
+            instant.cast(DataType::Boolean),
+            cannot(ts, DataType::Boolean)
+        );
+        assert_eq!(Value::BigInt(0).cast(ts), cannot(BigInt, ts));
+        assert_eq!(real(0.0).cast(ts), cannot(DataType::Real, ts));
+        assert_eq!(Value::Boolean(true).cast(ts), cannot(DataType::Boolean, ts));
+    }
+
+    #[test]
+    fn assign_should_widen_a_date_to_a_timestamp_but_not_narrow_back() {
+        let mismatch = |value, target| Err(TypeError::DatatypeMismatch { value, target });
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 0);
+
+        assert_eq!(
+            date(2024, 3, 15).assign(DataType::Timestamp),
+            Ok(timestamp((2024, 3, 15), 0, 0, 0, 0))
+        );
+        assert_eq!(
+            instant.assign(DataType::Date),
+            mismatch(DataType::Timestamp, DataType::Date)
+        );
+        assert_eq!(instant.assign(DataType::Timestamp), Ok(instant.clone()));
+        assert_eq!(
+            text("2024-03-15 14:30:00").assign(DataType::Timestamp),
+            mismatch(DataType::VARCHAR_MAX, DataType::Timestamp)
+        );
+        assert_eq!(
+            instant.assign(varchar(30)),
+            mismatch(DataType::Timestamp, varchar(30))
+        );
+    }
+
+    #[test]
+    fn logical_operators_and_tests_with_timestamps_should_fail() {
+        let instant = timestamp((2024, 3, 15), 14, 30, 0, 0);
+        let and = instant.and(&Value::Boolean(true));
+
+        assert_eq!(and, Err(not_boolean("AND", DataType::Timestamp)));
+        assert_eq!(
+            and.unwrap_err().to_string(),
+            "argument of AND must be type boolean, not type timestamp"
+        );
+        assert_eq!(
+            instant.is_true(),
+            Err(not_boolean("IS TRUE", DataType::Timestamp))
+        );
+    }
+
     #[test]
     fn logical_operators_and_tests_with_dates_should_fail() {
         let and = date(2024, 1, 1).and(&Value::Boolean(true));
@@ -3229,7 +3746,8 @@ mod tests {
             | Value::Double(_)
             | Value::Text(_)
             | Value::Boolean(_)
-            | Value::Date(_) => {
+            | Value::Date(_)
+            | Value::Timestamp(_) => {
                 unreachable!("integer model only")
             }
         }
@@ -3245,7 +3763,8 @@ mod tests {
             | DataType::Double
             | DataType::Varchar(_)
             | DataType::Boolean
-            | DataType::Date => unreachable!("integer model only"),
+            | DataType::Date
+            | DataType::Timestamp => unreachable!("integer model only"),
         })
     }
 
@@ -3380,12 +3899,77 @@ mod tests {
 
     /// Integers (with NULL), text and booleans, so operators meet every family pair.
     fn random_mixed_value(rng: &mut Rng) -> Value {
-        match rng.below(7) {
+        match rng.below(8) {
             0 => text(&random_text(rng)),
             1 => Value::Boolean(rng.below(2) == 0),
             2 => random_float(rng),
             3 => random_date(rng),
+            4 => random_timestamp(rng),
             _ => random_value(rng),
+        }
+    }
+
+    /// Anywhere in the range, or a microsecond around some midnight.
+    fn random_timestamp(rng: &mut Rng) -> Value {
+        let (min, max) = (
+            Timestamp::MIN.micros_since_epoch(),
+            Timestamp::MAX.micros_since_epoch(),
+        );
+        let micros = match rng.below(2) {
+            0 => {
+                let Value::Date(day) = random_date(rng) else {
+                    unreachable!()
+                };
+                let midnight = i64::from(day.days_since_epoch()) * 86_400_000_000;
+                (midnight + rng.below(3) as i64 - 1).clamp(min, max)
+            }
+            _ => min + (rng.next() % (max - min + 1).unsigned_abs()) as i64,
+        };
+        Value::Timestamp(Timestamp::from_micros_since_epoch(micros).unwrap())
+    }
+
+    fn model_instant(value: &Value) -> i64 {
+        match value {
+            Value::Date(day) => i64::from(day.days_since_epoch()) * 86_400_000_000,
+            Value::Timestamp(instant) => instant.micros_since_epoch(),
+            other => unreachable!("datetimes only: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn random_timestamps_should_round_trip_through_bytes_and_text() {
+        let mut rng = Rng(0x1319_8A2E_0370_7344);
+
+        for _ in 0..10_000 {
+            let value = random_timestamp(&mut rng);
+
+            assert_eq!(
+                Value::decode(DataType::Timestamp, value.encode().as_deref()).as_ref(),
+                Ok(&value)
+            );
+            assert_eq!(
+                Value::parse(DataType::Timestamp, &value.to_string()).as_ref(),
+                Ok(&value),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_datetime_comparisons_should_match_the_instant_model() {
+        let mut rng = Rng(0xA409_3822_299F_31D0);
+
+        for _ in 0..10_000 {
+            let [lhs, rhs] = [(); 2].map(|_| match rng.below(2) {
+                0 => random_date(&mut rng),
+                _ => random_timestamp(&mut rng),
+            });
+
+            assert_eq!(
+                lhs.compare(&rhs),
+                Ok(Some(model_instant(&lhs).cmp(&model_instant(&rhs)))),
+                "{lhs} vs {rhs}"
+            );
         }
     }
 
@@ -3502,7 +4086,7 @@ mod tests {
             Value::BigInt(v) => Some(v as f64),
             Value::Real(v) => Some(v.get().into()),
             Value::Double(v) => Some(v.get()),
-            Value::Text(_) | Value::Boolean(_) | Value::Date(_) => {
+            Value::Text(_) | Value::Boolean(_) | Value::Date(_) | Value::Timestamp(_) => {
                 unreachable!("numeric model only")
             }
         }

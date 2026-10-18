@@ -14,7 +14,8 @@ pub(crate) fn narrow(ty: DataType, value: i64) -> Option<Value> {
         | DataType::Double
         | DataType::Varchar(_)
         | DataType::Boolean
-        | DataType::Date => None,
+        | DataType::Date
+        | DataType::Timestamp => None,
     }
 }
 
