@@ -326,7 +326,7 @@ A heap is identified by its first page. The catalog stores the `first_page_id` o
 
 - ⚠️ **Orphan page:** an I/O error between allocating the new page and writing the pointer in the previous one leaves an unreachable page (lost space, no corrupted data). Fixing this is the WAL's job.
 - ⚠️ **An update that moves is not atomic:** undo on error is best effort (if the second delete also fails, both versions remain). Real atomicity comes with the WAL.
-- ⚠️ **Several handles of the same heap:** `insert` does not lose data, but `get`/`scan` of one handle only see pages appended by another after its own next `insert` or a new `open`. The table layer should keep one handle per table.
+- ⚠️ **Several handles of the same heap:** `insert` does not lose data, but `get`/`scan` of one handle only see pages appended by another after its own next `insert` or a new `open`. The catalog keeps one handle per table (see [Table Heap](data-model.md#table-heap)).
 - ⚠️ **`get`/`scan` copy the bytes:** without a pin guard in the buffer pool, returning `&[u8]` would require keeping the page pinned between calls.
 
 **Tests**

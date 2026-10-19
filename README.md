@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine and a persistent catalog work and are tested (761 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer and a persistent catalog work and are tested (790 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -28,11 +28,12 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **Heap File + free space map** | A table's rows across a linked list of pages, first-fit placement in O(log n), moves rows that outgrow their page. |
 | **Data types** | `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`, with SQL semantics: parsing, casts and store assignment, overflow-checked arithmetic, `||`, comparisons as SQL values, three-valued `AND`/`OR`/`NOT` and PostgreSQL-compatible SQLSTATE codes. |
 | **Schema** | Column definitions, `NOT NULL`, and typed row ⇄ tuple conversion with SQL assignment rules. |
-| **Catalog** | Tables and columns persisted on disk and bootstrapped from page 0, loaded into memory on open. |
+| **Table Heap** | A table's rows as typed values: insert, get, update, delete and scan, validated by the schema before anything is written. |
+| **Catalog** | Tables and columns persisted on disk and bootstrapped from page 0, loaded into memory on open; finds a table's rows by name, keeping one open handle per table. |
 
 **Partially there:**
 
-- Rows can be inserted, updated, deleted and scanned at the storage level (`HeapFile`), but there are no `INSERT`/`SELECT`/`UPDATE`/`DELETE` statements and no typed table layer yet. That layer (Table Heap) is the next planned step.
+- Typed rows can be inserted, updated, deleted and scanned through the Rust API (`TableHeap`), but there are no `INSERT`/`SELECT`/`UPDATE`/`DELETE` statements yet.
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
@@ -44,7 +45,8 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 flowchart TD
     app["Rust API / demo binary"]
     catalog["Catalog<br/>tables and columns, page 0"]
-    schema["Schema + types<br/>typed rows, SQL semantics"]
+    tableheap["Table Heap<br/>typed rows of a table"]
+    schema["Schema + types<br/>row ⇄ tuple, SQL semantics"]
     heap["Heap File + free space map"]
     page["Slotted pages + tuple format"]
     bpm["Buffer Pool Manager + LRU-K"]
@@ -52,9 +54,11 @@ flowchart TD
     file[("Database file")]
 
     app --> catalog
-    app --> schema
-    app --> heap
+    app --> tableheap
+    catalog --> tableheap
     catalog --> heap
+    tableheap --> schema
+    tableheap --> heap
     schema --> page
     heap --> page
     heap --> bpm
@@ -121,7 +125,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 459 unit tests + 39 integration tests
+cargo test --all-targets   # 728 unit tests + 62 integration tests
 ```
 
 The suite is the main way the implementation is verified:

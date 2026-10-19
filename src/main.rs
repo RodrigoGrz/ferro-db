@@ -4,14 +4,14 @@
 
 use std::error::Error;
 
-use ferro_db::catalog::{Catalog, CatalogError, TableInfo};
+use ferro_db::catalog::{Catalog, CatalogError};
 use ferro_db::config::PAGE_SIZE;
 use ferro_db::storage::buffer_pool::BufferPoolManager;
-use ferro_db::storage::heap_file::HeapFile;
 use ferro_db::table::{Column, Schema};
 use ferro_db::types::{DataType, Value};
 
 const DATABASE_FILE: &str = "data.db";
+const ACCOUNTS: &str = "accounts";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut bpm = BufferPoolManager::new(8, PAGE_SIZE, DATABASE_FILE)?;
@@ -25,11 +25,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         result => result?,
     };
 
-    let accounts = accounts_table(&mut catalog, &mut bpm)?;
-    let mut heap = HeapFile::open(&mut bpm, accounts.first_page_id)?;
-    let next_id = heap.scan(&mut bpm).count() + 1;
-    let row = new_account(i32::try_from(next_id)?);
-    heap.insert(&mut bpm, &accounts.schema.encode_row(&row)?)?;
+    create_accounts_if_missing(&mut catalog, &mut bpm)?;
+    let accounts = catalog.table_heap(&mut bpm, ACCOUNTS)?;
+    let next_id = accounts.scan(&mut bpm).count() + 1;
+    accounts.insert(&mut bpm, &new_account(i32::try_from(next_id)?))?;
 
     println!("tables:");
     for table in catalog.tables() {
@@ -37,33 +36,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("  {} ({})", table.name, columns.join(", "));
     }
 
-    println!("rows of {}:", accounts.name);
-    for entry in heap.scan(&mut bpm) {
-        let (rid, tuple) = entry?;
-        let values: Vec<String> = accounts
-            .schema
-            .decode_row(&tuple)?
-            .iter()
-            .map(Value::to_string)
-            .collect();
+    println!("rows of {ACCOUNTS}:");
+    for entry in catalog.table_heap(&mut bpm, ACCOUNTS)?.scan(&mut bpm) {
+        let (rid, row) = entry?;
+        let values: Vec<String> = row.iter().map(Value::to_string).collect();
         println!("  {rid} -> ({})", values.join(", "));
     }
     Ok(())
 }
 
-fn accounts_table(
+fn create_accounts_if_missing(
     catalog: &mut Catalog,
     bpm: &mut BufferPoolManager,
-) -> Result<TableInfo, Box<dyn Error>> {
-    match catalog.table("accounts") {
-        Ok(table) => Ok(table.clone()),
+) -> Result<(), Box<dyn Error>> {
+    match catalog.table(ACCOUNTS) {
+        Ok(_) => Ok(()),
         Err(CatalogError::UndefinedTable { .. }) => {
             let schema = Schema::new(vec![
                 Column::not_null("id", DataType::Integer),
                 Column::new("age", DataType::SmallInt),
                 Column::new("balance", DataType::BigInt),
             ])?;
-            Ok(catalog.create_table(bpm, "accounts", schema)?.clone())
+            catalog.create_table(bpm, ACCOUNTS, schema)?;
+            Ok(())
         }
         Err(err) => Err(err.into()),
     }

@@ -1,6 +1,6 @@
 # Data Model
 
-This document is the authoritative description of what ferroDB stores on top of the storage engine: SQL values and types (`src/types/`), table schemas (`src/table/`) and the persistent catalog (`src/catalog/`). The byte formats of pages and tuples are in [storage-engine.md](storage-engine.md).
+This document is the authoritative description of what ferroDB stores on top of the storage engine: SQL values and types (`src/types/`), table schemas and typed rows (`src/table/`) and the persistent catalog (`src/catalog/`). The byte formats of pages and tuples are in [storage-engine.md](storage-engine.md).
 
 Dependencies always point downward: `catalog` → `table` → `types` → `storage`.
 
@@ -11,6 +11,7 @@ Dependencies always point downward: `catalog` → `table` → `types` → `stora
 - [Data Types: DATE](#data-types-date)
 - [Data Types: TIMESTAMP](#data-types-timestamp)
 - [Schema](#schema)
+- [Table Heap](#table-heap)
 - [Catalog](#catalog)
 - [Deviations from the SQL Standard](#deviations-from-the-sql-standard)
 
@@ -615,6 +616,64 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 
 ---
 
+## Table Heap
+
+`TableHeap` (`src/table/table_heap.rs`) is a table's rows as typed values. It joins the two pieces below it: `Schema` validates and encodes a row, and `HeapFile` stores the bytes. The executor's operators (`INSERT`, `SELECT`, `UPDATE`, `DELETE`, sequential scan) will talk only to it.
+
+```rust
+let accounts = catalog.table_heap(&mut bpm, "accounts")?;            // opened on first use, then cached
+let rid  = accounts.insert(&mut bpm, &[Value::Integer(1), Value::Null, text])?;
+let row  = accounts.get(&mut bpm, rid)?;                            // Vec<Value>, in the column types
+let rid  = accounts.update(&mut bpm, rid, &new_row)?;               // may return a different Rid
+accounts.delete(&mut bpm, rid)?;
+for entry in accounts.scan(&mut bpm) {                              // Result<(Rid, Vec<Value>), TableError>
+    let (rid, row) = entry?;
+}
+```
+
+`TableHeap::create(bpm, schema)` and `TableHeap::open(bpm, schema, first_page_id)` build one directly; the catalog uses them, and nothing above the catalog needs to.
+
+### Operations
+
+- **`insert` / `update`** run `Schema::encode_row` **before** touching the heap: arity, `NOT NULL` and store assignment (`22001`, `22003`, `42804`, ...) are checked first, so a rejected row writes nothing, and a rejected `update` leaves the old row as it was.
+- **`update` can move the row.** When the new row no longer fits its page, the heap stores it on another page and deletes the old one: the returned `Rid` is the one to use from then on, and the old `Rid` gives `TupleNotFound`.
+- **`get` / `scan`** decode through the schema and never trust the disk. Values come back in the column's type.
+- **`scan`** yields the live rows in heap order (page by page, slot by slot). A row that does not decode is an `Err` for that row (`XX001`), never skipped, and the scan goes on to the next one.
+- A `Rid` of another table, or of a deleted row, is an error, never another row.
+
+### Errors
+
+`TableError` wraps the error of the layer that failed. `Display` and `source()` show the wrapped error.
+
+| `TableError` | SQLSTATE | When |
+|---|---|---|
+| `Schema(..)` | the `SchemaError`'s (`23502`, `42601`, `22001`, `22003`, `42804`, `54000`, `XX001`, ...) | the row is rejected by the schema, or a stored row does not decode |
+| `Heap(TupleTooLarge)` | `54000` | the row fits its types but not a page: a limit of the system, not of the data |
+| `Heap(BufferPool(ChecksumMismatch \| Page \| Disk(TornPage)))` | `XX001` | bytes damaged on disk |
+| `Heap(BufferPool(Disk(..)))` (other) | `58030` | the disk failed (I/O error) |
+| `Heap(BufferPool(NoAvailableFrame))` | `53000` | every frame of the pool is pinned |
+| `Heap(BufferPool(PageIdOverflow))` | `54000` | no page ids left |
+| `Heap(CorruptedChain \| Page)` | `XX001` | damaged heap pages |
+| `Heap(TupleNotFound \| PageNotInHeap \| UnsupportedPageSize)` | `XX000` | a `Rid` of another table or of a deleted row: a mistake of the caller |
+
+### Design decisions
+
+- **A thin layer.** Validation lives in `Schema` and storage in `HeapFile`; `TableHeap` only orders the calls (encode, then write) and converts the errors. Each piece stays testable on its own.
+- **No table names here.** `TableHeap` does not know the catalog, which would be a dependency pointing up (`catalog` → `table`). Finding a table by name belongs to the catalog (see [Catalog](#catalog)).
+- **One handle per table, kept by the catalog.** Each `HeapFile` keeps its page list and free space map in memory. Two handles on the same heap work, but each only finds out late what the other wrote (see [Heap File](storage-engine.md#heap-file)). The catalog opens a table's `TableHeap` the first time it is asked for and hands out the same one after that, so whoever asks by name does not have to keep anything.
+- **The `BufferPoolManager` is a parameter of every call**, never stored, as in `HeapFile`: it keeps the borrows simple (`&mut Catalog` and `&mut BufferPoolManager` are separate).
+- **One SQLSTATE per storage failure.** `heap_sqlstate` / `buffer_pool_sqlstate` (in `table_heap.rs`) map storage errors to codes, and `CatalogError` uses the same functions, so a checksum mismatch is `XX001` whether a table or the catalog hit it. Damaged bytes are data corruption (`XX001`), not an I/O error (`58030`); running out of frames is a lack of resources (`53000`).
+- **Corrupt rows stop nobody.** `scan` returns an error for the damaged row instead of ending the iteration, so a caller can decide whether to stop or to skip it.
+
+### Tests
+
+- Unit in `table_heap.rs`: create and reopen (schema kept, the reserved page rejected), insert/get round trip, `get` of a row that does not decode (`XX001`), the assigned row stored (`SMALLINT` in an `INTEGER` column, trailing spaces cut), every rejection (`23502`, `42601`, `42804`, `22001`, `22003`) leaving the heap empty, a row that fits its types but not a page (`54000`), `get`/`update`/`delete` of a `Rid` outside the table, `update` in place and `update` that moves the row (the old `Rid` is gone), a rejected `update` keeping the old row, `delete` only once, scan of an empty table, scan across pages after deletes and updates, a row written below the schema reported as `XX001` while the scan goes on, and every error with SQLSTATE (including each storage failure: checksum, page header, torn file, I/O, no frame, no page ids) and `source()`.
+- `random_operations_should_match_model`: 2,000 random inserts, updates (including ones that move the row), deletes and gets, with rows the schema sometimes rejects, on a 2-frame pool, compared with a `HashMap<Rid, Vec<Value>>` and with a full scan every 50 steps. Mutation-checked by hand: returning the old `Rid` from `update` makes it fail.
+- `catalog.rs`: `table_heap` returns the same handle on every call, reads and writes the table's own heap, fails with `UndefinedTable` (`42P01`) for an unknown name, opens a table on first use after reopening, and keeps nothing when opening fails (the next call retries); `create_table` keeps the heap it created, and a failed `create_table` keeps none, including when the data heap itself cannot be created.
+- Integration in [`tests/table_table_heap.rs`](../tests/table_table_heap.rs): 2,000 rows with every type (`INTEGER`, `VARCHAR`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `DOUBLE PRECISION`, `REAL`, with `NULL`s) across many pages on a 2-frame pool, updates that move rows, deletes, then reopening the file and finding the table by name: scan and `get` match what was left. Rejected rows (`22001`, `23502`, `42804`, `42601`) leave no trace, not even after reopening. A data page damaged on disk is reported as `XX001`, by the scan and, after reopening, when the table is opened.
+
+---
+
 ## Catalog
 
 The catalog (`src/catalog/`) is the data dictionary: which tables exist, where their data lives and which columns they have. It solves two problems every database has:
@@ -636,7 +695,7 @@ Entries use their **own format** (`ByteWriter` / `ByteReader`): the catalog was 
 let mut catalog = Catalog::open(&mut bpm)?;                      // creates the database or loads it
 let table = catalog.create_table(&mut bpm, "accounts", schema)?; // TableInfo { id, name, schema, first_page_id }
 let table = catalog.table("accounts")?;                          // UndefinedTable if it does not exist
-let mut heap = HeapFile::open(&mut bpm, table.first_page_id)?;   // the table's data
+let rows  = catalog.table_heap(&mut bpm, "accounts")?;           // the table's rows (see Table Heap)
 ```
 
 ### Layout
@@ -672,13 +731,14 @@ Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` 
 - **`create_table`**, in this order:
   1. validates the name (empty, longer than 63 bytes, duplicate) and whether a row fits in a page (`schema.min_row_size() <= max_tuple_size_for(page_size)`, otherwise `RowTooWide`);
   2. **consumes** the table id;
-  3. creates the data `HeapFile`;
+  3. creates the table's `TableHeap` (its data heap);
   4. writes one `ColumnRecord` per column;
   5. writes the `TableRecord` **last**: it is what makes the table exist on the next `open`;
-  6. only then adds the table to the in-memory catalog.
+  6. only then adds the table to the in-memory catalog, and keeps the `TableHeap` from step 3 open.
 
   If step 4 or 5 fails, the columns already written are deleted (best effort), the table does not appear and the same name can be created again, but **with another id**: the id consumed in step 2 never comes back. If the undo also fails, the remaining columns become orphans with that id, and no new table inherits them. That is why ids can have gaps, like PostgreSQL sequences.
 - **`table(name)` / `tables()`:** in-memory lookups, no I/O. `tables()` is in creation order. Names are compared byte by byte (`users` ≠ `USERS`), like columns.
+- **`table_heap(bpm, name)`:** the table's [`TableHeap`](#table-heap). The first call opens it (`HeapFile::open` walks its pages); every later call returns the same handle, without I/O. An unknown name → `UndefinedTable`.
 
 ### Errors
 
@@ -693,7 +753,8 @@ Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` 
 | `TooManyTables` | `54000` | `no table ids left` |
 | `Corrupted` | `XX001` | `catalog is corrupted: unknown column type` |
 | `CorruptedSchema` | `XX001` | `catalog is corrupted: table "t": a table must have at least one column` |
-| `Heap` / `BufferPool` | `XX000` / `58030` | message of the wrapped error |
+| `Heap` / `BufferPool` | the storage error's, as in [Table Heap](#table-heap) (e.g. `XX001` for a checksum mismatch) | message of the wrapped error |
+| `Table` | the `TableError`'s | message of the wrapped error (opening or creating a table's heap) |
 
 ### Design decisions
 
@@ -701,7 +762,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 
 - **The whole catalog in memory**, loaded on `open`: tens of bytes per column, and lookups do no I/O.
 - **`TableId(u32)` newtype:** cannot be confused with a page id. The internal counter is a `u64`, so a `u32::MAX` id stored on disk still loads; creating the next table returns `TooManyTables`.
-- **The catalog does not keep `HeapFile` handles**, only `first_page_id`: `open` does not read data pages. Handles (one per table, see [Heap File](storage-engine.md#heap-file)) belong to the future table layer / executor.
+- **Open tables are cached** (`HashMap<TableId, TableHeap>`): one handle per table, so two callers never hold heaps that disagree about which pages exist (see [Table Heap](#table-heap)). A table is opened on first use, not on `open`, so opening the database still reads no data pages. A handle costs a few bytes per page of its heap, only for the tables used. Handles are never dropped while the catalog lives: the future `DROP TABLE` must remove the table from `open_tables` too.
 
 ### Known limitations
 
@@ -717,7 +778,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 
 - `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
 - `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`10`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
-- `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, data heap that accepts the schema's rows, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch) and every error with message, SQLSTATE and `source()`.
+- `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, the open `TableHeap` kept, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch; no frame for the data heap: no table, the id consumed), `table_heap` (same handle on every call, `UndefinedTable`, opened on first use after reopening) and every error with message, SQLSTATE and `source()`.
 - `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
 - Integration in [`tests/catalog_table_metadata.rs`](../tests/catalog_table_metadata.rs): tables and rows of two tables survive reopening the file (2-frame pool), a file whose page 0 is a slotted page → `NotADatabase`, a corrupted page of the columns heap → checksum error on `open`.

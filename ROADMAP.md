@@ -41,12 +41,12 @@ When an item is finished, mark it here in the same change that adds the code, an
 
 - [x] Schema: column definitions and typed row ⇄ tuple conversion ([`schema.rs`](src/table/schema.rs), [`tests/table_schema.rs`](tests/table_schema.rs))
 - [x] Table Metadata: tables persisted in the catalog ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
-- [ ] *(next)* Table Heap: typed `insert(row)` / `scan()` by table name, combining `Schema` and `HeapFile`, with one `HeapFile` handle per table
-- [ ] INSERT. The storage-level `HeapFile::insert` exists; there is no SQL statement.
+- [x] Table Heap: typed `insert` / `get` / `update` / `delete` / `scan`, combining `Schema` and `HeapFile`, found by table name through the catalog, which keeps one handle per table ([`table_heap.rs`](src/table/table_heap.rs), [`catalog.rs`](src/catalog/catalog.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs))
+- [ ] INSERT. The typed `TableHeap::insert` exists; there is no SQL statement.
 - [ ] SELECT
-- [ ] UPDATE. The storage-level `HeapFile::update` exists; there is no SQL statement.
-- [ ] DELETE. The storage-level `HeapFile::delete` exists; there is no SQL statement.
-- [ ] Sequential Scan. `HeapFile::scan` iterates raw tuples; there is no typed table scan or scan operator yet (see also Query Execution).
+- [ ] UPDATE. The typed `TableHeap::update` exists; there is no SQL statement.
+- [ ] DELETE. The typed `TableHeap::delete` exists; there is no SQL statement.
+- [x] Sequential Scan: typed table scan in heap order, `TableHeap::scan` ([`table_heap.rs`](src/table/table_heap.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs)). The scan operator of the executor is under Query Execution.
 - [ ] `DROP TABLE`
 
 ## Indexes

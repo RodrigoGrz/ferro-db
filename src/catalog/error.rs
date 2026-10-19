@@ -2,8 +2,9 @@ use std::fmt;
 
 use crate::storage::buffer_pool::BufferPoolError;
 use crate::storage::heap_file::HeapFileError;
-use crate::table::SchemaError;
 use crate::table::schema::prefix_within;
+use crate::table::table_heap::{buffer_pool_sqlstate, heap_sqlstate};
+use crate::table::{SchemaError, TableError};
 
 #[derive(Debug)]
 pub enum CatalogError {
@@ -38,6 +39,7 @@ pub enum CatalogError {
     },
     Heap(HeapFileError),
     BufferPool(BufferPoolError),
+    Table(TableError),
 }
 
 impl CatalogError {
@@ -51,8 +53,9 @@ impl CatalogError {
             CatalogError::NotADatabase { .. }
             | CatalogError::Corrupted { .. }
             | CatalogError::CorruptedSchema { .. } => "XX001",
-            CatalogError::Heap(_) => "XX000",
-            CatalogError::BufferPool(_) => "58030",
+            CatalogError::Heap(err) => heap_sqlstate(err),
+            CatalogError::BufferPool(err) => buffer_pool_sqlstate(err),
+            CatalogError::Table(err) => err.sqlstate(),
         }
     }
 }
@@ -82,6 +85,7 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::Heap(err) => write!(f, "{err}"),
             CatalogError::BufferPool(err) => write!(f, "{err}"),
+            CatalogError::Table(err) => write!(f, "{err}"),
         }
     }
 }
@@ -92,6 +96,7 @@ impl std::error::Error for CatalogError {
             CatalogError::CorruptedSchema { source, .. } => Some(source),
             CatalogError::Heap(err) => Some(err),
             CatalogError::BufferPool(err) => Some(err),
+            CatalogError::Table(err) => Some(err),
             _ => None,
         }
     }
@@ -100,6 +105,12 @@ impl std::error::Error for CatalogError {
 impl From<HeapFileError> for CatalogError {
     fn from(err: HeapFileError) -> Self {
         CatalogError::Heap(err)
+    }
+}
+
+impl From<TableError> for CatalogError {
+    fn from(err: TableError) -> Self {
+        CatalogError::Table(err)
     }
 }
 

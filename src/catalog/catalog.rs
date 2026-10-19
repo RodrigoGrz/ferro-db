@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use crate::storage::buffer_pool::BufferPoolManager;
@@ -5,7 +6,7 @@ use crate::storage::heap_file::HeapFile;
 use crate::storage::page::RESERVED_PAGE_ID;
 use crate::storage::rid::Rid;
 use crate::storage::slotted_page::max_tuple_size_for;
-use crate::table::{Column, Schema};
+use crate::table::{Column, Schema, TableHeap};
 
 use super::records::{ColumnRecord, TableRecord};
 use super::{CatalogError, DatabaseHeader};
@@ -30,6 +31,8 @@ pub struct Catalog {
     tables_heap: HeapFile,
     columns_heap: HeapFile,
     tables: Vec<TableInfo>,
+    /// Each table is opened once, on first use, and the same handle is handed out after that.
+    open_tables: HashMap<TableId, TableHeap>,
     /// `u64` so a stored id of `u32::MAX` still loads; creating the next table then fails.
     next_table_id: u64,
 }
@@ -61,6 +64,7 @@ impl Catalog {
             tables_heap,
             columns_heap,
             tables: Vec::new(),
+            open_tables: HashMap::new(),
             next_table_id: FIRST_TABLE_ID,
         })
     }
@@ -84,6 +88,7 @@ impl Catalog {
             tables_heap,
             columns_heap,
             tables: assemble(table_records, column_records)?,
+            open_tables: HashMap::new(),
             next_table_id,
         })
     }
@@ -93,14 +98,26 @@ impl Catalog {
         &self.tables
     }
 
-    /// Exact byte comparison, like column names: case folding is the parser's job.
+    /// The table's rows, opened on first use; every later call returns the same handle.
+    pub fn table_heap(
+        &mut self,
+        bpm: &mut BufferPoolManager,
+        name: &str,
+    ) -> Result<&mut TableHeap, CatalogError> {
+        let table = find_table(&self.tables, name)?;
+        let heap = match self.open_tables.entry(table.id) {
+            Entry::Occupied(open) => open.into_mut(),
+            Entry::Vacant(closed) => closed.insert(TableHeap::open(
+                bpm,
+                table.schema.clone(),
+                table.first_page_id,
+            )?),
+        };
+        Ok(heap)
+    }
+
     pub fn table(&self, name: &str) -> Result<&TableInfo, CatalogError> {
-        self.tables
-            .iter()
-            .find(|table| table.name == name)
-            .ok_or_else(|| CatalogError::UndefinedTable {
-                name: name.to_string(),
-            })
+        find_table(&self.tables, name)
     }
 
     /// Everything is validated before any page is touched. The table's data heap is created
@@ -132,7 +149,7 @@ impl Catalog {
         // with this id stay behind, and a new table reusing it would inherit them.
         self.next_table_id += 1;
 
-        let data_heap = HeapFile::create(bpm)?;
+        let data_heap = TableHeap::create(bpm, schema.clone())?;
         let table = TableInfo {
             id,
             name: name.to_string(),
@@ -141,6 +158,7 @@ impl Catalog {
         };
         self.persist(bpm, &table)?;
 
+        self.open_tables.insert(id, data_heap);
         let index = self.tables.len();
         self.tables.push(table);
         Ok(&self.tables[index])
@@ -187,6 +205,16 @@ impl Catalog {
         self.tables_heap.insert(bpm, &record.encode()?)?;
         Ok(())
     }
+}
+
+/// Exact byte comparison, like column names: case folding is the parser's job.
+fn find_table<'a>(tables: &'a [TableInfo], name: &str) -> Result<&'a TableInfo, CatalogError> {
+    tables
+        .iter()
+        .find(|table| table.name == name)
+        .ok_or_else(|| CatalogError::UndefinedTable {
+            name: name.to_string(),
+        })
 }
 
 fn decode_all<T>(
@@ -290,8 +318,9 @@ mod tests {
     use super::*;
     use crate::storage::buffer_pool::BufferPoolError;
     use crate::storage::heap_file::HeapFileError;
+    use crate::storage::rid::Rid;
     use crate::storage::slotted_page::SlottedPage;
-    use crate::table::{Column, SchemaError};
+    use crate::table::{Column, SchemaError, TableError};
     use crate::types::{DataType, Value};
     use std::fs;
     use std::num::NonZeroU16;
@@ -728,6 +757,7 @@ mod tests {
             CatalogError::Heap(HeapFileError::BufferPool(BufferPoolError::NoAvailableFrame))
         ));
         assert!(catalog.tables().is_empty());
+        assert!(catalog.open_tables.is_empty());
         assert_eq!(catalog.columns_heap.scan(pool.bpm()).count(), 0);
 
         pool.reopen(4);
@@ -861,23 +891,170 @@ mod tests {
         assert_eq!(catalog.table("last").unwrap().id, TableId(u32::MAX));
     }
 
+    fn account(id: i32) -> Vec<Value> {
+        vec![
+            Value::Integer(id),
+            Value::Null,
+            Value::BigInt(i64::from(id) * 10),
+        ]
+    }
+
     #[test]
-    fn the_data_heap_of_a_new_table_should_store_its_rows() {
+    fn table_heap_should_return_the_same_handle_on_every_call() {
+        let mut pool = TestPool::new(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap();
+
+        let first: *const TableHeap = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+        let second: *const TableHeap = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn table_heap_should_read_and_write_the_rows_of_the_table() {
         let mut pool = TestPool::new(4);
         let mut catalog = Catalog::open(pool.bpm()).unwrap();
         let table = catalog
             .create_table(pool.bpm(), "accounts", accounts())
             .unwrap()
             .clone();
-        let row = [Value::Integer(7), Value::Null, Value::BigInt(-1)];
 
-        let mut heap = HeapFile::open(pool.bpm(), table.first_page_id).unwrap();
-        let rid = heap
-            .insert(pool.bpm(), &table.schema.encode_row(&row).unwrap())
+        let heap = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+        let rid = heap.insert(pool.bpm(), &account(7)).unwrap();
+
+        assert_eq!(heap.first_page_id(), table.first_page_id);
+        assert_eq!(heap.schema(), &table.schema);
+        let stored = HeapFile::open(pool.bpm(), table.first_page_id)
+            .unwrap()
+            .get(pool.bpm(), rid)
+            .unwrap();
+        assert_eq!(table.schema.decode_row(&stored).unwrap(), account(7));
+    }
+
+    #[test]
+    fn create_table_should_keep_the_heap_it_created_open() {
+        let mut pool = TestPool::new(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+
+        let id = catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap()
+            .id;
+
+        assert!(catalog.open_tables.contains_key(&id));
+    }
+
+    #[test]
+    fn table_heap_of_an_unknown_table_should_fail() {
+        let mut pool = TestPool::new(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        catalog
+            .create_table(pool.bpm(), "accounts", accounts())
             .unwrap();
 
-        let stored = heap.get(pool.bpm(), rid).unwrap();
-        assert_eq!(table.schema.decode_row(&stored).unwrap(), row);
+        let err = catalog.table_heap(pool.bpm(), "Accounts").unwrap_err();
+
+        assert!(matches!(err, CatalogError::UndefinedTable { ref name } if name == "Accounts"));
+        assert_eq!(err.sqlstate(), "42P01");
+    }
+
+    #[test]
+    fn table_heap_should_open_a_table_on_first_use_after_reopening() {
+        let mut pool = TestPool::new(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap();
+        catalog
+            .create_table(pool.bpm(), "empty", accounts())
+            .unwrap();
+        let rids: Vec<Rid> = (0..40)
+            .map(|id| {
+                let heap = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+                heap.insert(pool.bpm(), &account(id)).unwrap()
+            })
+            .collect();
+        pool.reopen(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        assert!(catalog.open_tables.is_empty());
+
+        let heap = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+        let rows: Vec<(Rid, Vec<Value>)> = heap.scan(pool.bpm()).map(|row| row.unwrap()).collect();
+
+        let expected: Vec<(Rid, Vec<Value>)> = rids.into_iter().zip((0..40).map(account)).collect();
+        assert_eq!(rows, expected);
+        assert_eq!(catalog.open_tables.len(), 1);
+    }
+
+    #[test]
+    fn table_heap_should_not_keep_a_table_that_failed_to_open() {
+        let mut pool = TestPool::new(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        let first_page_id = catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap()
+            .first_page_id;
+        pool.reopen(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        pool.bpm().fail_fetch_after(first_page_id, 0);
+
+        let err = catalog.table_heap(pool.bpm(), "accounts").unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CatalogError::Table(TableError::Heap(HeapFileError::BufferPool(
+                    BufferPoolError::NoAvailableFrame
+                )))
+            ),
+            "{err:?}"
+        );
+        assert!(catalog.open_tables.is_empty());
+        let retried = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+        assert_eq!(retried.first_page_id(), first_page_id);
+    }
+
+    #[test]
+    fn create_table_failing_to_create_the_data_heap_should_leave_no_table() {
+        let mut pool = TestPool::new(3);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        // Every frame pinned: the data heap's first page gets none.
+        let pinned = [
+            RESERVED_PAGE_ID,
+            catalog.tables_heap.first_page_id(),
+            catalog.columns_heap.first_page_id(),
+        ];
+        for page_id in pinned {
+            pool.bpm().fetch_page(page_id).unwrap();
+        }
+
+        let err = catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap_err();
+
+        for page_id in pinned {
+            pool.bpm().unpin_page(page_id, false);
+        }
+        assert!(
+            matches!(
+                err,
+                CatalogError::Table(TableError::Heap(HeapFileError::BufferPool(
+                    BufferPoolError::NoAvailableFrame
+                )))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), "53000");
+        assert!(catalog.tables().is_empty());
+        assert!(catalog.open_tables.is_empty());
+        assert_eq!(catalog.columns_heap.scan(pool.bpm()).count(), 0);
+        let retried = catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap();
+        assert_eq!(retried.id, TableId(2), "the failed attempt consumed id 1");
     }
 
     #[test]
@@ -977,7 +1154,32 @@ mod tests {
             (
                 CatalogError::BufferPool(BufferPoolError::NoAvailableFrame),
                 "no available frame".to_string(),
-                "58030",
+                "53000",
+                true,
+            ),
+            (
+                CatalogError::Heap(HeapFileError::BufferPool(
+                    BufferPoolError::ChecksumMismatch { page_id: 3 },
+                )),
+                "checksum mismatch on page 3".to_string(),
+                "XX001",
+                true,
+            ),
+            (
+                CatalogError::Heap(HeapFileError::TupleTooLarge {
+                    size: 9000,
+                    max: 8164,
+                }),
+                "tuple of 9000 bytes exceeds maximum of 8164 bytes".to_string(),
+                "54000",
+                true,
+            ),
+            (
+                CatalogError::Table(TableError::Schema(SchemaError::NullViolation {
+                    column: "id".to_string(),
+                })),
+                "null value in column \"id\" violates not-null constraint".to_string(),
+                "23502",
                 true,
             ),
         ]

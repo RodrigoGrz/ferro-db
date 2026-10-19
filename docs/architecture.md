@@ -12,6 +12,7 @@ flowchart TD
 
     subgraph upper["Typed data"]
         catalog["Catalog<br/>src/catalog/<br/>tables, columns, page 0 header"]
+        tableheap["TableHeap<br/>src/table/<br/>typed insert, get, update, delete, scan"]
         schema["Schema<br/>src/table/<br/>row ⇄ tuple, NOT NULL, casts"]
         types["Value / DataType<br/>src/types/<br/>integers, floats, VARCHAR, BOOLEAN, DATE, TIMESTAMP, NULL, SQL semantics"]
     end
@@ -27,10 +28,12 @@ flowchart TD
     file[("Database file<br/>8 KB pages")]
 
     demo --> catalog
-    demo --> schema
-    demo --> heap
+    demo --> tableheap
+    catalog --> tableheap
     catalog --> heap
     catalog --> schema
+    tableheap --> schema
+    tableheap --> heap
     schema --> types
     schema --> slotted
     types --> slotted
@@ -49,7 +52,7 @@ flowchart TD
     end
     sql -.-> planner
     planner -.-> catalog
-    planner -.-> heap
+    planner -.-> tableheap
     planner -.-> index
     wal -.-> bpm
 
@@ -69,7 +72,8 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `HeapFile` + `FreeSpaceMap` | Store a table's tuples across a linked list of pages; choose where inserts go; move tuples that grow out of their page. | Keep rows ordered or indexed. |
 | `Value` / `DataType` | Integer, float, text, boolean, date, timestamp and NULL values with SQL semantics (parse, cast and assignment, arithmetic, `||`, comparisons as SQL values, three-valued logic). | Store anything. |
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
-| `Catalog` | Persist which tables exist, their columns and their first data page; bootstrap from page 0. | Hold open heap handles or expose SQL. |
+| `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
+| `Catalog` | Persist which tables exist, their columns and their first data page; bootstrap from page 0; keep one open `TableHeap` per table used. | Expose SQL. |
 
 **Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
 
@@ -81,15 +85,21 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 2. `Catalog::open` fetches page 0:
    - all zeros (never written) → new database: create the tables heap and the columns heap, write the database header last;
    - a `DatabaseHeader` page → check the magic, walk both catalog heaps, rebuild every table's `Schema` in memory.
-3. `HeapFile::open(first_page_id)` walks a table's page list and builds its in-memory free space map.
+3. The first `Catalog::table_heap(name)` for a table opens its `TableHeap`: `HeapFile::open(first_page_id)` walks the table's page list and builds its in-memory free space map. The catalog keeps that handle and returns it on every later call.
 
 ### Inserting a row
 
-1. `Schema::encode_row(&[Value])` checks arity and `NOT NULL`, applies store assignment (`Value::assign`) to each value and produces tuple bytes through the `TupleLayout`.
-2. `HeapFile::insert(bytes)` asks the free space map for the first page with room. If none fits, it allocates a page with `BufferPoolManager::new_page` and links it at the end of the list.
-3. The page is fetched (pinned) from the buffer pool, `SlottedPage::insert` places the tuple and returns a slot id, and the page is unpinned as dirty.
-4. The caller gets a `Rid { page_id, slot_id }`.
-5. Nothing has reached the disk yet. The dirty page is written when its frame is evicted, when `flush_page` is called, or when the buffer pool is dropped. Each write stamps the CRC32 checksum and calls `sync_data`.
+1. `Catalog::table_heap(name)` returns the table's `TableHeap`, and the caller calls `TableHeap::insert(&[Value])`.
+2. `Schema::encode_row(&[Value])` checks arity and `NOT NULL`, applies store assignment (`Value::assign`) to each value and produces tuple bytes through the `TupleLayout`. A rejected row stops here, before any page is touched.
+3. `HeapFile::insert(bytes)` asks the free space map for the first page with room. If none fits, it allocates a page with `BufferPoolManager::new_page` and links it at the end of the list.
+4. The page is fetched (pinned) from the buffer pool, `SlottedPage::insert` places the tuple and returns a slot id, and the page is unpinned as dirty.
+5. The caller gets a `Rid { page_id, slot_id }`.
+6. Nothing has reached the disk yet. The dirty page is written when its frame is evicted, when `flush_page` is called, or when the buffer pool is dropped. Each write stamps the CRC32 checksum and calls `sync_data`.
+
+### Scanning a table
+
+1. `TableHeap::scan` walks the heap's pages in order through `HeapFile::scan`, which yields each live tuple with its `Rid`.
+2. `Schema::decode_row` turns each tuple back into values of the column types, without trusting the bytes. A tuple that does not decode is an error for that row, and the scan goes on.
 
 ### Reading a page from disk
 
