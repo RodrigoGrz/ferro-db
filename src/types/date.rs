@@ -100,8 +100,8 @@ pub(crate) fn decimal(digits: &[u8]) -> Option<u32> {
     })
 }
 
-/// `DATE + n` (and `DATE - n` as `-n`) in days, the shorthand PostgreSQL keeps until INTERVAL
-/// exists. Computed in i64, so a huge `n` is out of range (22008), never a wrap.
+/// `DATE + n` (and `DATE - n` as `-n`) in days, as PostgreSQL also accepts. Computed in i64,
+/// so a huge `n` is out of range (22008), never a wrap.
 pub(crate) fn add_days(days: i32, offset: i64) -> Result<Value, TypeError> {
     i64::from(days)
         .checked_add(offset)

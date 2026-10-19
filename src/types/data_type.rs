@@ -29,7 +29,7 @@ pub(crate) enum TypeFamily {
     Numeric,
     Text,
     Boolean,
-    /// DATE and TIMESTAMP; TIME will join them.
+    /// DATE and TIMESTAMP.
     Datetime,
 }
 

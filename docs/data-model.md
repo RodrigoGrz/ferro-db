@@ -363,7 +363,7 @@ See [ADR 0009](decisions/0009-floats-finite-exact-comparison-numeric-family.md).
 
 ## Data Types: DATE
 
-`DATE` is a calendar day without a time of day, from **0001-01-01 to 9999-12-31** (the range of the SQL standard), in the **proleptic Gregorian calendar**: today's leap rule (every 4 years, except centuries, except every 400) applied to every year. `TIMESTAMP` has its own section; `TIME` and `INTERVAL` are separate roadmap items.
+`DATE` is a calendar day without a time of day, from **0001-01-01 to 9999-12-31** (the range of the SQL standard), in the **proleptic Gregorian calendar**: today's leap rule (every 4 years, except centuries, except every 400) applied to every year. `TIMESTAMP` has its own section.
 
 ```rust
 DataType::Date
@@ -395,7 +395,7 @@ A day number outside `MIN..=MAX` read from disk → `CorruptedValue` (`XX001`, `
 
 ### Arithmetic in days
 
-The standard does arithmetic on datetimes only with `INTERVAL`, which does not exist yet. Like PostgreSQL, ferroDB accepts a number of days meanwhile (decided with the author):
+The standard does date arithmetic through an interval type, which ferroDB does not have. Like PostgreSQL, ferroDB accepts a number of days instead (decided with the author):
 
 | Operation | Result |
 |---|---|
@@ -405,7 +405,7 @@ The standard does arithmetic on datetimes only with `INTERVAL`, which does not e
 | anything else with a `DATE` (`*`, `/`, `%`, unary `-`, `DATE + DATE`, `integer - DATE`, floats, text, booleans) | `UndefinedOperator` (`42883`) |
 
 - The sum is computed in `i64`, so even `DATE + BIGINT::MAX` is an error, never a wrap; a result outside 0001..=9999 → `OutOfRange` (`date out of range`, SQLSTATE `22008`).
-- `NULL` stays strict. Months and years (`+ 1 month`) wait for `INTERVAL`, which will sit next to this without breaking it.
+- `NULL` stays strict. Adding months or years (`+ 1 month`) is not supported.
 
 ### Comparison
 
@@ -437,7 +437,7 @@ There is no new `TypeError` variant: the standard gives datetimes their own SQLS
 - **Days since 1970-01-01 in `i32`**: comparison and arithmetic are integer operations, and 4 bytes cover 0001–9999 with room to spare. Packing year, month and day would complicate both; the Unix epoch is the better known one.
 - **The standard's range and only the ISO format** (decided with the author): always a 4-digit year, no `BC` suffix, no ambiguity between `01/02` as January or February, no `DateStyle` setting.
 - **Newtype `Date`** with validating constructors, like `Finite64`: an invalid `Value::Date` cannot exist.
-- **`TypeFamily::Datetime`**, which `TIMESTAMP` joined without new family rules (and `TIME` will); in the family order it comes last, after booleans.
+- **`TypeFamily::Datetime`**, which `TIMESTAMP` joined without new family rules; in the family order it comes last, after booleans.
 - **SQLSTATE by type** instead of date-specific variants: the message is the same, only the standard's class differs.
 
 ### Tests
@@ -497,7 +497,7 @@ A value outside `MIN..=MAX` read from disk → `CorruptedValue` (`XX001`, `times
 
 ### Arithmetic
 
-None until `INTERVAL` exists (decided with the author): every arithmetic operator with a `TIMESTAMP` (`+`, `-`, `*`, `/`, `%`, unary `-`, with integers, dates or other timestamps) → `UndefinedOperator` (`42883`). Unlike `DATE`, there is no natural unit: days would drop the time, and in PostgreSQL `TIMESTAMP - TIMESTAMP` is an `INTERVAL`. `NULL` stays strict.
+None (decided with the author): every arithmetic operator with a `TIMESTAMP` (`+`, `-`, `*`, `/`, `%`, unary `-`, with integers, dates or other timestamps) → `UndefinedOperator` (`42883`). Unlike `DATE`, there is no natural unit: days would drop the time, and in PostgreSQL `TIMESTAMP - TIMESTAMP` gives an interval, a type ferroDB does not have. `NULL` stays strict.
 
 ### Cast and assignment
 
@@ -756,11 +756,11 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Exact vs. approximate comparison | by algebraic value | exact, as the standard (PostgreSQL converts the integer to `float8`) |
 | `MOD` with approximate numbers | not defined | `%` with a float → `42883` |
 | `CAST` of a float to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like integers |
-| Arithmetic on dates | only with `INTERVAL` (`DATE + INTERVAL '30' DAY`) | `DATE ± integer` and `DATE - DATE` in days, as PostgreSQL, until `INTERVAL` exists (decided with the author) |
+| Arithmetic on dates | through an interval type (`DATE + INTERVAL '30' DAY`) | `DATE ± integer` and `DATE - DATE` in days, as PostgreSQL (decided with the author); no interval type |
 | Date text | the literal `DATE 'YYYY-MM-DD'` | only `YYYY-MM-DD`, same as the standard (PostgreSQL also takes other styles set by `DateStyle`) |
 | Timestamp text | the literal `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.f]'` | that form, plus `T` instead of the space and a bare date as midnight (decided with the author; PostgreSQL accepts both) |
 | Seconds of a `TIMESTAMP` | `00` to `61.9…`, for leap seconds | `00` to `59.999999` (PostgreSQL reads `:60` as the next minute) |
 | `TIMESTAMP` into a `DATE` column | allowed, dropping the time | only through an explicit `CAST` (decided with the author, as float to integer) |
-| Arithmetic on timestamps | with `INTERVAL` | none until `INTERVAL` exists |
+| Arithmetic on timestamps | through an interval type | none |
 | `CAST` of a `DATE` to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like the other types |
 | `CAST` of a `BOOLEAN` to a short `VARCHAR(n)` | `22001` when `'TRUE'`/`'FALSE'` does not fit | cut to `n`, like integers (`CAST(TRUE AS VARCHAR(1))` = `'T'`) |

@@ -36,7 +36,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** SQL lexer and parser, query planning and execution, B+Tree indexes, more data types (`NUMERIC`, `TIME`, `INTERVAL`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** SQL lexer and parser, query planning and execution, B+Tree indexes, more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -148,7 +148,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - **No SQL yet.** Everything is driven through the Rust API.
 - **Single-threaded.** No concurrent access, locks or transactions.
 - **No crash safety.** Without a WAL, a crash can lose pages that were not yet written, and multi-page operations (moving an updated row, creating a table) are not atomic. Errors *inside* the process return without leaving half-applied changes in a page or in the buffer pool; multi-page operations fall back to a best-effort undo.
-- **Few types:** integers, floats, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`; no `NUMERIC`, `TIME` or `INTERVAL` yet. Text compares by bytes (no collations), and a value must fit in one page.
+- **Few types:** integers, floats, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`; no `NUMERIC` yet. Text compares by bytes (no collations), and a value must fit in one page.
 - **Unstable formats.** On-disk formats change between versions without migrations; database files are disposable.
 
 ## Acknowledgements
