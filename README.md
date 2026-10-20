@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog and a B+Tree index work and are tested (879 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog and a B+Tree index work and are tested (907 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -29,13 +29,13 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **Data types** | `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`, with SQL semantics: parsing, casts and store assignment, overflow-checked arithmetic, `||`, comparisons as SQL values, three-valued `AND`/`OR`/`NOT` and PostgreSQL-compatible SQLSTATE codes. |
 | **Schema** | Column definitions, `NOT NULL`, and typed row ⇄ tuple conversion with SQL assignment rules. |
 | **Table Heap** | A table's rows as typed values: insert, get, update, delete and scan, validated by the schema before anything is written. |
-| **Catalog** | Tables and columns persisted on disk and bootstrapped from page 0, loaded into memory on open; finds a table's rows by name, keeping one open handle per table. |
+| **Catalog** | Tables, columns and indexes persisted on disk and bootstrapped from page 0, loaded into memory on open; finds a table's rows and an index's tree by name, keeping one open handle each; creates and fills indexes. |
 | **B+Tree index** | A unique index from keys of any type (text included) to row ids, with range scans; nodes of variable-size entries split, merge and redistribute by bytes, and a failed operation changes nothing. |
 
 **Partially there:**
 
 - Typed rows can be inserted, updated, deleted and scanned through the Rust API (`TableHeap`), but there are no `INSERT`/`SELECT`/`UPDATE`/`DELETE` statements yet.
-- The B+Tree works on its own, but is not linked to tables yet (no `CREATE INDEX`, no index metadata in the catalog).
+- Indexes can be created on table columns through the catalog, but are not updated when the table changes yet, and there is no `CREATE INDEX` statement.
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
@@ -130,7 +130,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 813 unit tests + 66 integration tests
+cargo test --all-targets   # 837 unit tests + 70 integration tests
 ```
 
 The suite is the main way the implementation is verified:

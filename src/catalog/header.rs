@@ -5,8 +5,13 @@
 //! [16..24)  magic                b"ferroDB\0"
 //! [24..28)  tables_first_page_id  u32, first page of the catalog's tables heap
 //! [28..32)  columns_first_page_id u32, first page of the catalog's columns heap
-//! [32..)    reserved             zeroed
+//! [32..36)  indexes_first_page_id u32, first page of the catalog's indexes heap, 0 until
+//!                                 the first index is created
+//! [36..)    reserved             zeroed
 //! ```
+//!
+//! Databases from before indexes have zeros in `32..36` (reserved then), so they open with
+//! no indexes heap.
 //!
 //! The checksum already catches flipped bytes; the magic tells a ferroDB database apart
 //! from a file of another program whose page 0 happens to be valid.
@@ -17,7 +22,7 @@ use crate::storage::page::{COMMON_HEADER_SIZE, PageHeader, PageType};
 
 const MAGIC: &[u8; 8] = b"ferroDB\0";
 const MAGIC_OFFSET: usize = COMMON_HEADER_SIZE;
-const HEADER_END: usize = MAGIC_OFFSET + MAGIC.len() + 4 + 4;
+const HEADER_END: usize = MAGIC_OFFSET + MAGIC.len() + 4 + 4 + 4;
 
 const TOO_SMALL: CatalogError = CatalogError::Corrupted {
     reason: "page too small for the database header",
@@ -27,6 +32,8 @@ const TOO_SMALL: CatalogError = CatalogError::Corrupted {
 pub struct DatabaseHeader {
     pub tables_first_page_id: u32,
     pub columns_first_page_id: u32,
+    /// `0` until the first index is created (and in databases from before indexes).
+    pub indexes_first_page_id: u32,
 }
 
 impl DatabaseHeader {
@@ -61,6 +68,7 @@ impl DatabaseHeader {
         Ok(Some(Self {
             tables_first_page_id: reader.read_u32().map_err(|_| TOO_SMALL)?,
             columns_first_page_id: reader.read_u32().map_err(|_| TOO_SMALL)?,
+            indexes_first_page_id: reader.read_u32().map_err(|_| TOO_SMALL)?,
         }))
     }
 
@@ -76,6 +84,7 @@ impl DatabaseHeader {
             .write_bytes(MAGIC)
             .and_then(|()| writer.write_u32(self.tables_first_page_id))
             .and_then(|()| writer.write_u32(self.columns_first_page_id))
+            .and_then(|()| writer.write_u32(self.indexes_first_page_id))
             .and_then(|()| writer.write_zeros(writer.remaining()))
             .map_err(|_| TOO_SMALL)
     }
@@ -96,6 +105,7 @@ mod tests {
         DatabaseHeader {
             tables_first_page_id: 0x0403_0201,
             columns_first_page_id: 7,
+            indexes_first_page_id: 0x0A0B_0C0D,
         }
     }
 
@@ -114,7 +124,8 @@ mod tests {
         assert_eq!(&page[16..24], b"ferroDB\0");
         assert_eq!(page[24..28], [1, 2, 3, 4]);
         assert_eq!(page[28..32], [7, 0, 0, 0]);
-        assert!(page[32..].iter().all(|&byte| byte == 0));
+        assert_eq!(page[32..36], [0x0D, 0x0C, 0x0B, 0x0A]);
+        assert!(page[36..].iter().all(|&byte| byte == 0));
     }
 
     #[test]
@@ -132,8 +143,20 @@ mod tests {
         header().write(&mut page).unwrap();
 
         assert_eq!(page[LSN_OFFSET], 42);
-        assert!(page[32..].iter().all(|&byte| byte == 0));
+        assert!(page[36..].iter().all(|&byte| byte == 0));
         assert_eq!(DatabaseHeader::read(&page).unwrap(), Some(header()));
+    }
+
+    #[test]
+    fn a_header_from_before_indexes_should_read_as_having_no_indexes_heap() {
+        let mut page = written(header());
+        // Those bytes were reserved and zeroed; the checksum is not part of this layer.
+        page[32..36].copy_from_slice(&[0; 4]);
+
+        let read = DatabaseHeader::read(&page).unwrap().unwrap();
+
+        assert_eq!(read.indexes_first_page_id, 0);
+        assert_eq!(read.tables_first_page_id, header().tables_first_page_id);
     }
 
     #[test]

@@ -4,6 +4,6 @@ pub mod error;
 pub mod header;
 pub mod records;
 
-pub use catalog::{Catalog, TableId, TableInfo};
+pub use catalog::{Catalog, IndexId, IndexInfo, TableId, TableInfo};
 pub use error::CatalogError;
 pub use header::DatabaseHeader;

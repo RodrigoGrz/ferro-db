@@ -1,21 +1,28 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use crate::index::BPlusTree;
 use crate::storage::buffer_pool::BufferPoolManager;
 use crate::storage::heap_file::HeapFile;
 use crate::storage::page::RESERVED_PAGE_ID;
 use crate::storage::rid::Rid;
 use crate::storage::slotted_page::max_tuple_size_for;
 use crate::table::{Column, Schema, TableHeap};
+use crate::types::Value;
 
-use super::records::{ColumnRecord, TableRecord};
+use super::records::{ColumnRecord, IndexRecord, TableRecord};
 use super::{CatalogError, DatabaseHeader};
 
 const FIRST_TABLE_ID: u64 = 1;
+const FIRST_INDEX_ID: u64 = 1;
 
 /// Identifies a table in the catalog; a newtype so it is never mixed up with a page id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableId(pub u32);
+
+/// Identifies an index in the catalog; its own space of ids, apart from tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IndexId(pub u32);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableInfo {
@@ -26,19 +33,37 @@ pub struct TableInfo {
     pub first_page_id: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexInfo {
+    pub id: IndexId,
+    pub name: String,
+    pub table_id: TableId,
+    /// Position of the key column in the table's schema.
+    pub column: u16,
+    /// The tree's header page: `BPlusTree::open` finds the tree from there.
+    pub header_page_id: u32,
+}
+
 #[derive(Debug)]
 pub struct Catalog {
     tables_heap: HeapFile,
     columns_heap: HeapFile,
+    /// `None` until the first index is created.
+    indexes_heap: Option<HeapFile>,
     tables: Vec<TableInfo>,
+    indexes: Vec<IndexInfo>,
     /// Each table is opened once, on first use, and the same handle is handed out after that.
     open_tables: HashMap<TableId, TableHeap>,
+    /// Same for the trees of the indexes.
+    open_indexes: HashMap<IndexId, BPlusTree>,
     /// `u64` so a stored id of `u32::MAX` still loads; creating the next table then fails.
     next_table_id: u64,
+    next_index_id: u64,
 }
 
 impl Catalog {
     pub const MAX_TABLE_NAME_LEN: usize = Schema::MAX_COLUMN_NAME_LEN;
+    pub const MAX_INDEX_NAME_LEN: usize = Schema::MAX_COLUMN_NAME_LEN;
 
     /// Creates the database when page 0 was never written, otherwise loads its catalog.
     pub fn open(bpm: &mut BufferPoolManager) -> Result<Self, CatalogError> {
@@ -58,14 +83,19 @@ impl Catalog {
             DatabaseHeader {
                 tables_first_page_id: tables_heap.first_page_id(),
                 columns_first_page_id: columns_heap.first_page_id(),
+                indexes_first_page_id: 0,
             },
         )?;
         Ok(Self {
             tables_heap,
             columns_heap,
+            indexes_heap: None,
             tables: Vec::new(),
+            indexes: Vec::new(),
             open_tables: HashMap::new(),
+            open_indexes: HashMap::new(),
             next_table_id: FIRST_TABLE_ID,
+            next_index_id: FIRST_INDEX_ID,
         })
     }
 
@@ -83,13 +113,30 @@ impl Catalog {
             .chain(column_records.iter().map(|record| record.table_id))
             .max();
         let next_table_id = highest_id.map_or(FIRST_TABLE_ID, |TableId(id)| u64::from(id) + 1);
+        let tables = assemble(table_records, column_records)?;
+        let indexes_heap = match header.indexes_first_page_id {
+            RESERVED_PAGE_ID => None,
+            first_page_id => Some(HeapFile::open(bpm, first_page_id)?),
+        };
+        let index_records = match &indexes_heap {
+            Some(heap) => decode_all(heap, bpm, IndexRecord::decode)?,
+            None => Vec::new(),
+        };
+        let indexes = assemble_indexes(index_records, &tables)?;
+        let next_index_id = indexes
+            .last()
+            .map_or(FIRST_INDEX_ID, |index| u64::from(index.id.0) + 1);
 
         Ok(Self {
             tables_heap,
             columns_heap,
-            tables: assemble(table_records, column_records)?,
+            indexes_heap,
+            tables,
+            indexes,
             open_tables: HashMap::new(),
+            open_indexes: HashMap::new(),
             next_table_id,
+            next_index_id,
         })
     }
 
@@ -135,6 +182,11 @@ impl Catalog {
                 name: name.to_string(),
             });
         }
+        if self.index(name).is_ok() {
+            return Err(CatalogError::DuplicateIndex {
+                name: name.to_string(),
+            });
+        }
         let max = max_tuple_size_for(bpm.page_size());
         if schema.min_row_size() > max {
             return Err(CatalogError::RowTooWide {
@@ -162,6 +214,184 @@ impl Catalog {
         let index = self.tables.len();
         self.tables.push(table);
         Ok(&self.tables[index])
+    }
+
+    /// A unique index on one column, filled with the table's rows (`NULL` keys are skipped).
+    /// Everything is validated before any page is touched; the entry is written last.
+    pub fn create_index(
+        &mut self,
+        bpm: &mut BufferPoolManager,
+        name: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<&IndexInfo, CatalogError> {
+        self.check_new_index_name(name)?;
+        let table_info = find_table(&self.tables, table)?;
+        let (column_position, key_type) = table_info
+            .schema
+            .columns()
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.name == column)
+            .map(|(position, candidate)| (position, candidate.data_type))
+            .ok_or_else(|| CatalogError::UndefinedColumn {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        let table_id = table_info.id;
+        let column = u16::try_from(column_position).map_err(|_| CatalogError::Corrupted {
+            reason: "column position does not fit u16",
+        })?;
+        let id =
+            IndexId(u32::try_from(self.next_index_id).map_err(|_| CatalogError::TooManyIndexes)?);
+        // Consumed before anything is written, like a table id.
+        self.next_index_id += 1;
+
+        let keys = self.non_null_keys(bpm, table, column_position)?;
+        let mut tree = BPlusTree::create(bpm, key_type)?;
+        for (key, rid) in keys {
+            tree.insert(bpm, &key, rid)?;
+        }
+        let index = IndexInfo {
+            id,
+            name: name.to_string(),
+            table_id,
+            column,
+            header_page_id: tree.header_page_id(),
+        };
+        self.persist_index(bpm, &index)?;
+
+        self.open_indexes.insert(id, tree);
+        let position = self.indexes.len();
+        self.indexes.push(index);
+        Ok(&self.indexes[position])
+    }
+
+    /// The key of every row whose key is not `NULL`, with its `Rid`. Read whole before the tree
+    /// is filled: the scan holds the buffer pool.
+    fn non_null_keys(
+        &mut self,
+        bpm: &mut BufferPoolManager,
+        table: &str,
+        column: usize,
+    ) -> Result<Vec<(Value, Rid)>, CatalogError> {
+        let heap = self.table_heap(bpm, table)?;
+        let mut keys = Vec::new();
+        for entry in heap.scan(bpm) {
+            let (rid, row) = entry?;
+            match row.into_iter().nth(column) {
+                Some(Value::Null) => {}
+                Some(key) => keys.push((key, rid)),
+                None => {
+                    return Err(CatalogError::Corrupted {
+                        reason: "a row has fewer values than its table's columns",
+                    });
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Creates the indexes heap on the first index (pointing the header to it first), then
+    /// writes the entry: it is what makes the index exist on the next `open`.
+    fn persist_index(
+        &mut self,
+        bpm: &mut BufferPoolManager,
+        index: &IndexInfo,
+    ) -> Result<(), CatalogError> {
+        let record = IndexRecord {
+            index_id: index.id,
+            table_id: index.table_id,
+            column: index.column,
+            header_page_id: index.header_page_id,
+            name: index.name.clone(),
+        }
+        .encode()?;
+        let heap = match &mut self.indexes_heap {
+            Some(heap) => heap,
+            None => {
+                let heap = HeapFile::create(bpm)?;
+                write_header(
+                    bpm,
+                    DatabaseHeader {
+                        tables_first_page_id: self.tables_heap.first_page_id(),
+                        columns_first_page_id: self.columns_heap.first_page_id(),
+                        indexes_first_page_id: heap.first_page_id(),
+                    },
+                )?;
+                self.indexes_heap.insert(heap)
+            }
+        };
+        heap.insert(bpm, &record)?;
+        Ok(())
+    }
+
+    /// Tables and indexes share one namespace, as relations do in PostgreSQL.
+    fn check_new_index_name(&self, name: &str) -> Result<(), CatalogError> {
+        if name.is_empty() {
+            return Err(CatalogError::EmptyIndexName);
+        }
+        if name.len() > Catalog::MAX_INDEX_NAME_LEN {
+            return Err(CatalogError::IndexNameTooLong {
+                name: name.to_string(),
+                max: Catalog::MAX_INDEX_NAME_LEN,
+            });
+        }
+        if self.index(name).is_ok() {
+            return Err(CatalogError::DuplicateIndex {
+                name: name.to_string(),
+            });
+        }
+        if self.table(name).is_ok() {
+            return Err(CatalogError::DuplicateTable {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// In creation order.
+    pub fn indexes(&self) -> &[IndexInfo] {
+        &self.indexes
+    }
+
+    pub fn index(&self, name: &str) -> Result<&IndexInfo, CatalogError> {
+        find_index(&self.indexes, name)
+    }
+
+    /// The indexes of a table, in creation order: the ones a change to the table must update.
+    pub fn table_indexes(&self, table: &str) -> Result<Vec<&IndexInfo>, CatalogError> {
+        let table_id = self.table(table)?.id;
+        Ok(self
+            .indexes
+            .iter()
+            .filter(|index| index.table_id == table_id)
+            .collect())
+    }
+
+    /// The index's tree, opened on first use; every later call returns the same handle.
+    pub fn index_tree(
+        &mut self,
+        bpm: &mut BufferPoolManager,
+        name: &str,
+    ) -> Result<&mut BPlusTree, CatalogError> {
+        let index = find_index(&self.indexes, name)?;
+        let tree = match self.open_indexes.entry(index.id) {
+            Entry::Occupied(open) => open.into_mut(),
+            Entry::Vacant(closed) => {
+                let key_type = self
+                    .tables
+                    .iter()
+                    .find(|table| table.id == index.table_id)
+                    .and_then(|table| table.schema.columns().get(usize::from(index.column)))
+                    .map(|column| column.data_type)
+                    .ok_or(CatalogError::Corrupted {
+                        reason: "an index points to a column that does not exist",
+                    })?;
+                closed.insert(BPlusTree::open(bpm, key_type, index.header_page_id)?)
+            }
+        };
+        Ok(tree)
     }
 
     /// On failure, deletes the column entries already written (best effort): without the
@@ -213,6 +443,15 @@ fn find_table<'a>(tables: &'a [TableInfo], name: &str) -> Result<&'a TableInfo, 
         .iter()
         .find(|table| table.name == name)
         .ok_or_else(|| CatalogError::UndefinedTable {
+            name: name.to_string(),
+        })
+}
+
+fn find_index<'a>(indexes: &'a [IndexInfo], name: &str) -> Result<&'a IndexInfo, CatalogError> {
+    indexes
+        .iter()
+        .find(|index| index.name == name)
+        .ok_or_else(|| CatalogError::UndefinedIndex {
             name: name.to_string(),
         })
 }
@@ -272,6 +511,51 @@ fn assemble(
     Ok(tables)
 }
 
+/// The index entries in id order (creation order), checked against the tables: each index
+/// belongs to a table and a column that exist, and no name is used by two relations.
+fn assemble_indexes(
+    mut records: Vec<IndexRecord>,
+    tables: &[TableInfo],
+) -> Result<Vec<IndexInfo>, CatalogError> {
+    records.sort_by_key(|record| record.index_id);
+    let mut names: HashSet<&str> = tables.iter().map(|table| table.name.as_str()).collect();
+    let mut indexes: Vec<IndexInfo> = Vec::with_capacity(records.len());
+    for record in &records {
+        if indexes
+            .last()
+            .is_some_and(|last| last.id == record.index_id)
+        {
+            return Err(CatalogError::Corrupted {
+                reason: "two indexes have the same id",
+            });
+        }
+        let table = tables
+            .iter()
+            .find(|table| table.id == record.table_id)
+            .ok_or(CatalogError::Corrupted {
+                reason: "an index belongs to a table that does not exist",
+            })?;
+        if usize::from(record.column) >= table.schema.columns().len() {
+            return Err(CatalogError::Corrupted {
+                reason: "an index points to a column that does not exist",
+            });
+        }
+        if !names.insert(record.name.as_str()) {
+            return Err(CatalogError::Corrupted {
+                reason: "two relations have the same name",
+            });
+        }
+        indexes.push(IndexInfo {
+            id: record.index_id,
+            name: record.name.clone(),
+            table_id: record.table_id,
+            column: record.column,
+            header_page_id: record.header_page_id,
+        });
+    }
+    Ok(indexes)
+}
+
 fn ordered_columns(mut records: Vec<ColumnRecord>) -> Result<Vec<Column>, CatalogError> {
     records.sort_by_key(|record| record.position);
     let numbered = records
@@ -315,7 +599,9 @@ fn write_header(bpm: &mut BufferPoolManager, header: DatabaseHeader) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use super::super::records::IndexRecord;
     use super::*;
+    use crate::index::IndexError;
     use crate::storage::buffer_pool::BufferPoolError;
     use crate::storage::heap_file::HeapFileError;
     use crate::storage::rid::Rid;
@@ -324,6 +610,7 @@ mod tests {
     use crate::types::{DataType, Value};
     use std::fs;
     use std::num::NonZeroU16;
+    use std::ops::Bound;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1058,6 +1345,780 @@ mod tests {
     }
 
     #[test]
+    fn create_index_should_validate_everything_first() {
+        let mut pool = TestPool::new(4);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap();
+        let too_long = "x".repeat(Catalog::MAX_INDEX_NAME_LEN + 1);
+        let cases = [
+            ("", "accounts", "id", "42602"),
+            (too_long.as_str(), "accounts", "id", "42622"),
+            ("accounts", "accounts", "id", "42P07"),
+            ("by_id", "missing", "id", "42P01"),
+            ("by_id", "accounts", "ID", "42703"),
+        ];
+
+        for (name, table, column, sqlstate) in cases {
+            let err = catalog
+                .create_index(pool.bpm(), name, table, column)
+                .unwrap_err();
+
+            assert_eq!(err.sqlstate(), sqlstate, "{err:?}");
+        }
+        let err = catalog
+            .create_index(pool.bpm(), "by_age", "accounts", "Age")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CatalogError::UndefinedColumn { ref table, ref column } if table == "accounts" && column == "Age"
+        ));
+        assert!(catalog.indexes().is_empty());
+    }
+
+    /// `accounts` with `count` rows: ids 0.., ages unique except every fifth `NULL`, and a
+    /// balance that repeats (so it cannot have a unique index).
+    fn accounts_with_rows(pool: &mut TestPool, catalog: &mut Catalog, count: i32) -> Vec<Rid> {
+        catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap();
+        (0..count)
+            .map(|id| {
+                let age = if id % 5 == 0 {
+                    Value::Null
+                } else {
+                    Value::SmallInt(id as i16)
+                };
+                let row = [Value::Integer(id), age, Value::BigInt(i64::from(id % 7))];
+                let heap = catalog.table_heap(pool.bpm(), "accounts").unwrap();
+                heap.insert(pool.bpm(), &row).unwrap()
+            })
+            .collect()
+    }
+
+    fn index_keys(pool: &mut TestPool, catalog: &mut Catalog, name: &str) -> Vec<(Value, Rid)> {
+        let tree = catalog.index_tree(pool.bpm(), name).unwrap();
+        tree.range(pool.bpm(), Bound::Unbounded, Bound::Unbounded)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn create_index_should_fill_the_index_with_the_rows_of_the_table() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        let rids = accounts_with_rows(&mut pool, &mut catalog, 300);
+
+        let index = catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+            .unwrap()
+            .clone();
+
+        assert_eq!(index.id, IndexId(1));
+        assert_eq!(index.name, "accounts_id");
+        assert_eq!(index.table_id, catalog.table("accounts").unwrap().id);
+        assert_eq!(index.column, 0);
+        assert_eq!(catalog.indexes(), [index]);
+        let expected: Vec<(Value, Rid)> = (0..300)
+            .map(|id| (Value::Integer(id), rids[id as usize]))
+            .collect();
+        assert_eq!(index_keys(&mut pool, &mut catalog, "accounts_id"), expected);
+        let rid = catalog
+            .index_tree(pool.bpm(), "accounts_id")
+            .unwrap()
+            .get(pool.bpm(), &Value::Integer(123))
+            .unwrap()
+            .unwrap();
+        let row = catalog
+            .table_heap(pool.bpm(), "accounts")
+            .unwrap()
+            .get(pool.bpm(), rid)
+            .unwrap();
+        assert_eq!(row[0], Value::Integer(123));
+    }
+
+    #[test]
+    fn create_index_should_leave_null_keys_out() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 50);
+
+        catalog
+            .create_index(pool.bpm(), "accounts_age", "accounts", "age")
+            .unwrap();
+
+        let keys: Vec<Value> = index_keys(&mut pool, &mut catalog, "accounts_age")
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let expected: Vec<Value> = (0..50)
+            .filter(|id| id % 5 != 0)
+            .map(|id| Value::SmallInt(id as i16))
+            .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn create_index_on_a_column_with_repeated_values_should_leave_no_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 50);
+
+        let err = catalog
+            .create_index(pool.bpm(), "accounts_balance", "accounts", "balance")
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CatalogError::Index(IndexError::DuplicateKey { .. })),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), "23505");
+        assert!(catalog.indexes().is_empty());
+        assert!(matches!(
+            catalog.index("accounts_balance"),
+            Err(CatalogError::UndefinedIndex { .. })
+        ));
+        let next = catalog
+            .create_index(pool.bpm(), "accounts_balance", "accounts", "id")
+            .unwrap();
+        assert_eq!(next.id, IndexId(2), "the failed attempt consumed id 1");
+    }
+
+    #[test]
+    fn create_index_on_an_empty_table_should_make_an_empty_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        catalog
+            .create_table(pool.bpm(), "accounts", accounts())
+            .unwrap();
+
+        catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+            .unwrap();
+
+        assert!(index_keys(&mut pool, &mut catalog, "accounts_id").is_empty());
+    }
+
+    #[test]
+    fn indexes_should_be_found_by_name_and_by_table() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 10);
+        catalog
+            .create_table(pool.bpm(), "empty", accounts())
+            .unwrap();
+        for (name, table, column) in [
+            ("a_id", "accounts", "id"),
+            ("e_id", "empty", "id"),
+            ("a_age", "accounts", "age"),
+        ] {
+            catalog
+                .create_index(pool.bpm(), name, table, column)
+                .unwrap();
+        }
+
+        let by_table: Vec<&str> = catalog
+            .table_indexes("accounts")
+            .unwrap()
+            .iter()
+            .map(|index| index.name.as_str())
+            .collect();
+
+        assert_eq!(by_table, ["a_id", "a_age"]);
+        assert_eq!(catalog.index("e_id").unwrap().column, 0);
+        assert_eq!(catalog.index("a_age").unwrap().column, 1);
+        let missing = catalog.index("A_ID").unwrap_err();
+        assert!(matches!(missing, CatalogError::UndefinedIndex { ref name } if name == "A_ID"));
+        assert_eq!(missing.sqlstate(), "42704");
+        assert!(matches!(
+            catalog.table_indexes("missing"),
+            Err(CatalogError::UndefinedTable { .. })
+        ));
+    }
+
+    #[test]
+    fn index_tree_should_return_the_same_handle_with_the_column_type() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 10);
+        catalog
+            .create_index(pool.bpm(), "accounts_age", "accounts", "age")
+            .unwrap();
+
+        let first: *const BPlusTree = catalog.index_tree(pool.bpm(), "accounts_age").unwrap();
+        let second: *const BPlusTree = catalog.index_tree(pool.bpm(), "accounts_age").unwrap();
+        let missing = catalog.index_tree(pool.bpm(), "nope").unwrap_err();
+
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(
+            catalog
+                .index_tree(pool.bpm(), "accounts_age")
+                .unwrap()
+                .key_type(),
+            DataType::SmallInt
+        );
+        assert!(matches!(missing, CatalogError::UndefinedIndex { .. }));
+    }
+
+    #[test]
+    fn tables_and_indexes_should_share_one_namespace() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 10);
+        catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+            .unwrap();
+
+        let as_table = catalog
+            .create_table(pool.bpm(), "accounts_id", accounts())
+            .unwrap_err();
+        let as_index = catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "age")
+            .unwrap_err();
+
+        for err in [as_table, as_index] {
+            assert!(
+                matches!(err, CatalogError::DuplicateIndex { ref name } if name == "accounts_id"),
+                "{err:?}"
+            );
+            assert_eq!(err.sqlstate(), "42P07");
+        }
+        assert_eq!(catalog.indexes().len(), 1);
+    }
+
+    #[test]
+    fn create_index_should_work_on_every_column_type() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        let mut random = Rng(7);
+        let columns: Vec<Column> = (0..10)
+            .map(|i| Column::new(format!("c{i}"), random.data_type()))
+            .collect();
+        let types: Vec<DataType> = columns.iter().map(|column| column.data_type).collect();
+        catalog
+            .create_table(pool.bpm(), "all_types", Schema::new(columns).unwrap())
+            .unwrap();
+        let row = all_types_row(&types);
+        let rid = catalog
+            .table_heap(pool.bpm(), "all_types")
+            .unwrap()
+            .insert(pool.bpm(), &row)
+            .unwrap();
+
+        for (position, key) in row.iter().enumerate() {
+            let name = format!("by_c{position}");
+            catalog
+                .create_index(pool.bpm(), &name, "all_types", &format!("c{position}"))
+                .unwrap();
+
+            let tree = catalog.index_tree(pool.bpm(), &name).unwrap();
+            assert_eq!(tree.key_type(), types[position]);
+            assert_eq!(tree.get(pool.bpm(), key).unwrap(), Some(rid), "{key:?}");
+        }
+    }
+
+    /// One value of each column type (a short text for VARCHAR).
+    fn all_types_row(types: &[DataType]) -> Vec<Value> {
+        use crate::types::{Date, Finite32, Finite64, Timestamp};
+        types
+            .iter()
+            .map(|data_type| match data_type {
+                DataType::SmallInt => Value::SmallInt(-3),
+                DataType::Integer => Value::Integer(42),
+                DataType::BigInt => Value::BigInt(i64::MIN),
+                DataType::Boolean => Value::Boolean(true),
+                DataType::Real => Value::Real(Finite32::new(-1.5).unwrap()),
+                DataType::Double => Value::Double(Finite64::new(2.25).unwrap()),
+                DataType::Date => Value::Date(Date::from_ymd(2024, 2, 29).unwrap()),
+                DataType::Timestamp => Value::Timestamp(Timestamp::at_midnight(Date::MIN)),
+                DataType::Varchar(_) => Value::Text("k".to_string()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_indexes_heap_should_be_created_by_the_first_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 10);
+        let before = stored_header(pool.bpm()).unwrap();
+
+        catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+            .unwrap();
+        let after_first = stored_header(pool.bpm()).unwrap();
+        catalog
+            .create_index(pool.bpm(), "accounts_age", "accounts", "age")
+            .unwrap();
+
+        assert_eq!(before.indexes_first_page_id, 0);
+        assert_ne!(after_first.indexes_first_page_id, 0);
+        assert_eq!(stored_header(pool.bpm()).unwrap(), after_first);
+        assert_eq!(
+            after_first.tables_first_page_id,
+            before.tables_first_page_id
+        );
+        assert_eq!(
+            after_first.columns_first_page_id,
+            before.columns_first_page_id
+        );
+    }
+
+    #[test]
+    fn indexes_should_come_back_after_reopening() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        let rids = accounts_with_rows(&mut pool, &mut catalog, 100);
+        catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+            .unwrap();
+        catalog
+            .create_index(pool.bpm(), "accounts_age", "accounts", "age")
+            .unwrap();
+        let created = catalog.indexes().to_vec();
+        pool.reopen(16);
+
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+
+        assert_eq!(catalog.indexes(), created);
+        assert!(catalog.open_indexes.is_empty(), "trees open on first use");
+        let tree = catalog.index_tree(pool.bpm(), "accounts_id").unwrap();
+        assert_eq!(
+            tree.get(pool.bpm(), &Value::Integer(42)).unwrap(),
+            Some(rids[42])
+        );
+        let next = catalog
+            .create_index(pool.bpm(), "accounts_id_2", "accounts", "id")
+            .unwrap();
+        assert_eq!(next.id, IndexId(3));
+    }
+
+    fn index_entry(index_id: u32, table_id: u32, column: u16, name: &str) -> Vec<u8> {
+        IndexRecord {
+            index_id: IndexId(index_id),
+            table_id: TableId(table_id),
+            column,
+            header_page_id: 1_000,
+            name: name.to_string(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// A database with table "accounts" (id 1) and index "accounts_id" (id 1), plus a raw index
+    /// entry written behind the catalog's back. Returns the catalog reopened.
+    fn reopen_with_index_entry(pool: &mut TestPool, entry: &[u8]) -> Result<Catalog, CatalogError> {
+        {
+            let mut catalog = Catalog::open(pool.bpm()).unwrap();
+            catalog
+                .create_table(pool.bpm(), "accounts", accounts())
+                .unwrap();
+            catalog
+                .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+                .unwrap();
+            catalog
+                .indexes_heap
+                .as_mut()
+                .unwrap()
+                .insert(pool.bpm(), entry)
+                .unwrap();
+        }
+        pool.reopen(16);
+        Catalog::open(pool.bpm())
+    }
+
+    #[test]
+    fn index_entries_that_do_not_match_the_catalog_should_fail_the_open() {
+        let mut garbage = index_entry(5, 1, 1, "x");
+        garbage.truncate(6);
+        let cases = [
+            (
+                index_entry(5, 9, 0, "orphan"),
+                "an index belongs to a table that does not exist",
+            ),
+            (
+                index_entry(5, 1, 3, "past_the_end"),
+                "an index points to a column that does not exist",
+            ),
+            (
+                index_entry(5, 1, 1, "accounts_id"),
+                "two relations have the same name",
+            ),
+            (
+                index_entry(5, 1, 1, "accounts"),
+                "two relations have the same name",
+            ),
+            (
+                index_entry(1, 1, 1, "other"),
+                "two indexes have the same id",
+            ),
+            (garbage, "catalog entry is truncated"),
+        ];
+
+        for (entry, reason) in cases {
+            let mut pool = TestPool::new(16);
+
+            let err = reopen_with_index_entry(&mut pool, &entry).unwrap_err();
+
+            assert!(
+                matches!(err, CatalogError::Corrupted { reason: found } if found == reason),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// The injected failure, wherever it surfaced: no free frame is `53000` in every layer.
+    fn is_no_frame(err: &CatalogError) -> bool {
+        err.sqlstate() == "53000"
+    }
+
+    /// After a failed `create_index`: no index, not even after reopening, and the same name
+    /// can be created again.
+    fn assert_no_index_after_failure(pool: &mut TestPool, catalog: &mut Catalog, existing: usize) {
+        assert_eq!(catalog.indexes().len(), existing);
+        assert!(matches!(
+            catalog.index("by_id"),
+            Err(CatalogError::UndefinedIndex { .. })
+        ));
+        pool.reopen(16);
+        let mut reopened = Catalog::open(pool.bpm()).unwrap();
+        assert_eq!(reopened.indexes().len(), existing);
+        reopened
+            .create_index(pool.bpm(), "by_id", "accounts", "id")
+            .unwrap();
+        let tree = reopened.index_tree(pool.bpm(), "by_id").unwrap();
+        assert!(tree.get(pool.bpm(), &Value::Integer(3)).unwrap().is_some());
+    }
+
+    #[test]
+    fn create_index_failing_to_read_the_table_should_leave_no_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 20);
+        let data_page = catalog.table("accounts").unwrap().first_page_id;
+        pool.bpm().fail_fetch_after(data_page, 0);
+
+        let err = catalog
+            .create_index(pool.bpm(), "by_id", "accounts", "id")
+            .unwrap_err();
+
+        assert!(is_no_frame(&err), "{err:?}");
+        assert_eq!(stored_header(pool.bpm()).unwrap().indexes_first_page_id, 0);
+        assert_no_index_after_failure(&mut pool, &mut catalog, 0);
+    }
+
+    #[test]
+    fn create_index_failing_to_point_the_header_to_the_indexes_heap_should_leave_no_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 20);
+        pool.bpm().fail_fetch_after(RESERVED_PAGE_ID, 0);
+
+        let err = catalog
+            .create_index(pool.bpm(), "by_id", "accounts", "id")
+            .unwrap_err();
+
+        assert!(is_no_frame(&err), "{err:?}");
+        assert!(catalog.indexes_heap.is_none());
+        assert_eq!(stored_header(pool.bpm()).unwrap().indexes_first_page_id, 0);
+        assert_no_index_after_failure(&mut pool, &mut catalog, 0);
+    }
+
+    #[test]
+    fn create_index_failing_to_write_its_entry_should_leave_no_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 20);
+        catalog
+            .create_index(pool.bpm(), "by_age", "accounts", "age")
+            .unwrap();
+        let indexes_page = catalog.indexes_heap.as_ref().unwrap().first_page_id();
+        pool.bpm().fail_fetch_after(indexes_page, 0);
+
+        let err = catalog
+            .create_index(pool.bpm(), "by_id", "accounts", "id")
+            .unwrap_err();
+
+        assert!(is_no_frame(&err), "{err:?}");
+        assert_eq!(catalog.next_index_id, 3, "the failed attempt consumed id 2");
+        assert_no_index_after_failure(&mut pool, &mut catalog, 1);
+    }
+
+    /// Two nullable INTEGER columns, `k` and `d`, so a column has repeated values or not.
+    fn pair_schema() -> Schema {
+        Schema::new(vec![
+            Column::new("k", DataType::Integer),
+            Column::new("d", DataType::Integer),
+        ])
+        .unwrap()
+    }
+
+    #[derive(Default)]
+    struct IndexModel {
+        /// Name and rows (`None` = NULL) of every table, in creation order.
+        tables: Vec<(String, Vec<[Option<i32>; 2]>)>,
+        /// Name, table, column and the keys the index got when it was created.
+        indexes: Vec<(String, String, usize, Vec<i32>)>,
+    }
+
+    impl IndexModel {
+        fn is_taken(&self, name: &str) -> bool {
+            self.tables.iter().any(|(table, _)| table == name)
+                || self.indexes.iter().any(|(index, ..)| index == name)
+        }
+
+        /// The SQLSTATE `create_index` must fail with, or the keys of the new index.
+        fn create_index(
+            &self,
+            name: &str,
+            table: &str,
+            column: &str,
+        ) -> Result<Vec<i32>, &'static str> {
+            if self.is_taken(name) {
+                return Err("42P07");
+            }
+            let (_, rows) = self
+                .tables
+                .iter()
+                .find(|(existing, _)| existing == table)
+                .ok_or("42P01")?;
+            let position = ["k", "d"]
+                .iter()
+                .position(|existing| *existing == column)
+                .ok_or("42703")?;
+            let mut keys: Vec<i32> = rows.iter().filter_map(|row| row[position]).collect();
+            keys.sort();
+            if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err("23505");
+            }
+            Ok(keys)
+        }
+    }
+
+    fn assert_indexes_match(pool: &mut TestPool, catalog: &mut Catalog, model: &IndexModel) {
+        let names: Vec<&str> = catalog
+            .indexes()
+            .iter()
+            .map(|index| index.name.as_str())
+            .collect();
+        let expected: Vec<&str> = model
+            .indexes
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect();
+        assert_eq!(names, expected);
+        for (name, table, column, keys) in &model.indexes {
+            assert_eq!(
+                catalog
+                    .table_indexes(table)
+                    .unwrap()
+                    .iter()
+                    .filter(|index| &index.name == name)
+                    .count(),
+                1
+            );
+            assert_eq!(usize::from(catalog.index(name).unwrap().column), *column);
+            let tree = catalog.index_tree(pool.bpm(), name).unwrap();
+            let found: Vec<Value> = tree
+                .range(pool.bpm(), Bound::Unbounded, Bound::Unbounded)
+                .unwrap()
+                .map(|entry| entry.unwrap().0)
+                .collect();
+            let expected: Vec<Value> = keys.iter().map(|&key| Value::Integer(key)).collect();
+            assert_eq!(found, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn random_tables_and_indexes_should_match_model_across_reopens() {
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        let mut pool = TestPool::new(8);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        let mut model = IndexModel::default();
+        let name = |rng: &mut Rng| format!("r{}", rng.below(12));
+
+        for step in 1..=400 {
+            match rng.below(10) {
+                0..=1 => {
+                    let table = name(&mut rng);
+                    let result = catalog.create_table(pool.bpm(), &table, pair_schema());
+                    if model.is_taken(&table) {
+                        assert_eq!(result.unwrap_err().sqlstate(), "42P07", "step {step}");
+                    } else {
+                        result.unwrap();
+                        model.tables.push((table, Vec::new()));
+                    }
+                }
+                2..=6 if !model.tables.is_empty() => {
+                    let index = rng.below(model.tables.len());
+                    let value = |rng: &mut Rng| match rng.below(6) {
+                        0 => None,
+                        _ => Some(rng.below(400) as i32),
+                    };
+                    let row = [value(&mut rng), value(&mut rng)];
+                    let (table, rows) = &mut model.tables[index];
+                    let values = row.map(|value| value.map_or(Value::Null, Value::Integer));
+                    let heap = catalog.table_heap(pool.bpm(), table).unwrap();
+                    heap.insert(pool.bpm(), &values).unwrap();
+                    rows.push(row);
+                }
+                _ => {
+                    let index = name(&mut rng);
+                    let table = name(&mut rng);
+                    let column = ["k", "d", "x"][rng.below(3)];
+                    let result = catalog.create_index(pool.bpm(), &index, &table, column);
+                    match model.create_index(&index, &table, column) {
+                        Ok(keys) => {
+                            result.unwrap();
+                            let position = usize::from(column == "d");
+                            model.indexes.push((index, table, position, keys));
+                        }
+                        Err(sqlstate) => {
+                            assert_eq!(result.unwrap_err().sqlstate(), sqlstate, "step {step}");
+                        }
+                    }
+                }
+            }
+            if step % 50 == 0 {
+                pool.reopen(8);
+                catalog = Catalog::open(pool.bpm()).unwrap();
+                assert_indexes_match(&mut pool, &mut catalog, &model);
+            }
+        }
+        assert!(
+            model.indexes.len() >= 3,
+            "the test should create some indexes"
+        );
+    }
+
+    #[test]
+    fn create_index_with_a_key_too_large_for_the_tree_should_leave_no_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        let notes = Schema::new(vec![Column::new(
+            "note",
+            DataType::Varchar(NonZeroU16::new(300).unwrap()),
+        )])
+        .unwrap();
+        catalog.create_table(pool.bpm(), "notes", notes).unwrap();
+        // The middle row is longer than the 111-byte keys of 512-byte pages.
+        for note in ["a".to_string(), "b".repeat(200), "c".to_string()] {
+            let heap = catalog.table_heap(pool.bpm(), "notes").unwrap();
+            heap.insert(pool.bpm(), &[Value::Text(note)]).unwrap();
+        }
+
+        let err = catalog
+            .create_index(pool.bpm(), "notes_note", "notes", "note")
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CatalogError::Index(IndexError::KeyTooLarge {
+                    size: 200,
+                    max: 111
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.sqlstate(), "54000");
+        assert!(catalog.indexes().is_empty());
+        pool.reopen(16);
+        assert!(Catalog::open(pool.bpm()).unwrap().indexes().is_empty());
+    }
+
+    #[test]
+    fn create_index_after_the_last_id_should_fail_without_changes() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 5);
+        catalog.next_index_id = u64::from(u32::MAX);
+        catalog
+            .create_index(pool.bpm(), "last", "accounts", "id")
+            .unwrap();
+
+        let err = catalog
+            .create_index(pool.bpm(), "one_more", "accounts", "id")
+            .unwrap_err();
+        pool.reopen(16);
+        let mut reopened = Catalog::open(pool.bpm()).unwrap();
+        let after_reopening = reopened
+            .create_index(pool.bpm(), "one_more", "accounts", "id")
+            .unwrap_err();
+
+        assert!(matches!(err, CatalogError::TooManyIndexes), "{err:?}");
+        assert_eq!(err.sqlstate(), "54000");
+        assert_eq!(catalog.indexes().len(), 1);
+        assert_eq!(reopened.index("last").unwrap().id, IndexId(u32::MAX));
+        assert!(
+            matches!(after_reopening, CatalogError::TooManyIndexes),
+            "{after_reopening:?}"
+        );
+    }
+
+    #[test]
+    fn index_tree_of_an_entry_pointing_to_the_wrong_page_should_fail() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 5);
+        let integer_tree = catalog
+            .create_index(pool.bpm(), "accounts_id", "accounts", "id")
+            .unwrap()
+            .header_page_id;
+        let data_page = catalog.table("accounts").unwrap().first_page_id;
+        // Entries that load (their table and column exist) but whose tree is not right: a data
+        // page, and the INTEGER tree of another index for the SMALLINT column `age`.
+        let entries = [
+            (5, 0, data_page, "wrong_page"),
+            (6, 1, integer_tree, "wrong_type"),
+        ];
+        for (id, column, header_page_id, name) in entries {
+            let entry = IndexRecord {
+                index_id: IndexId(id),
+                table_id: TableId(1),
+                column,
+                header_page_id,
+                name: name.to_string(),
+            }
+            .encode()
+            .unwrap();
+            catalog
+                .indexes_heap
+                .as_mut()
+                .unwrap()
+                .insert(pool.bpm(), &entry)
+                .unwrap();
+        }
+        pool.reopen(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+
+        let wrong_page = catalog.index_tree(pool.bpm(), "wrong_page").unwrap_err();
+        let wrong_type = catalog.index_tree(pool.bpm(), "wrong_type").unwrap_err();
+
+        assert!(
+            matches!(
+                wrong_page,
+                CatalogError::Index(IndexError::Corrupted { .. })
+            ),
+            "{wrong_page:?}"
+        );
+        assert_eq!(wrong_page.sqlstate(), "XX001");
+        assert!(
+            matches!(
+                wrong_type,
+                CatalogError::Index(IndexError::KeyTypeMismatch {
+                    expected: DataType::Integer,
+                    found: DataType::SmallInt
+                })
+            ),
+            "{wrong_type:?}"
+        );
+        assert!(catalog.index_tree(pool.bpm(), "accounts_id").is_ok());
+    }
+
+    #[test]
     fn open_of_a_file_whose_page_0_is_not_a_header_should_fail() {
         let mut pool = TestPool::new(4);
         let page = pool.bpm().fetch_page(RESERVED_PAGE_ID).unwrap();
@@ -1172,6 +2233,60 @@ mod tests {
                 }),
                 "tuple of 9000 bytes exceeds maximum of 8164 bytes".to_string(),
                 "54000",
+                true,
+            ),
+            (
+                CatalogError::EmptyIndexName,
+                "an index name cannot be empty".to_string(),
+                "42602",
+                false,
+            ),
+            (
+                CatalogError::IndexNameTooLong {
+                    name: "accounts_by_id".to_string(),
+                    max: 3,
+                },
+                "index name \"acc…\" is longer than 3 bytes".to_string(),
+                "42622",
+                false,
+            ),
+            (
+                CatalogError::DuplicateIndex {
+                    name: "accounts_id".to_string(),
+                },
+                "index \"accounts_id\" already exists".to_string(),
+                "42P07",
+                false,
+            ),
+            (
+                CatalogError::UndefinedIndex {
+                    name: "accounts_id".to_string(),
+                },
+                "index \"accounts_id\" does not exist".to_string(),
+                "42704",
+                false,
+            ),
+            (
+                CatalogError::UndefinedColumn {
+                    table: "accounts".to_string(),
+                    column: "age".to_string(),
+                },
+                "column \"age\" of table \"accounts\" does not exist".to_string(),
+                "42703",
+                false,
+            ),
+            (
+                CatalogError::TooManyIndexes,
+                "no index ids left".to_string(),
+                "54000",
+                false,
+            ),
+            (
+                CatalogError::Index(IndexError::DuplicateKey {
+                    key: "7".to_string(),
+                }),
+                "duplicate key value (7) violates the unique index".to_string(),
+                "23505",
                 true,
             ),
             (

@@ -4,18 +4,24 @@
 //! TableRecord   table_id u32 | first_page_id u32 | name_len u8 | name
 //! ColumnRecord  table_id u32 | position u16 | data_type u8 [max_chars u16] | flags u8
 //!               | name_len u8 | name
+//! IndexRecord   index_id u32 | table_id u32 | column u16 | header_page_id u32
+//!               | name_len u8 | name
 //! ```
 //!
 //! `data_type`: 1 SMALLINT, 2 INTEGER, 3 BIGINT, 4 VARCHAR followed by its `n` (1 to 65535),
 //! 5 BOOLEAN, 6 REAL, 7 DOUBLE PRECISION, 8 DATE, 9 TIMESTAMP; 0 stays invalid so a zeroed
 //! entry never decodes. `flags`: bit 0 = nullable, the other bits must be 0. Names have 1 to
-//! 63 bytes of UTF-8. Decoding rejects anything else, including missing or trailing bytes, so
-//! an entry is at most 74 bytes and always fits a page.
+//! 63 bytes of UTF-8. Decoding rejects anything else, including missing or trailing bytes.
+//! A table or column entry has at most 74 bytes and an index entry 78: every entry fits a page.
+//!
+//! An index's `column` is the position of its key column in the table, and `header_page_id`
+//! is its tree's header page, never the reserved page 0.
 
 use std::num::NonZeroU16;
 
-use super::{CatalogError, TableId};
+use super::{CatalogError, IndexId, TableId};
 use crate::serialization::ByteReader;
+use crate::storage::page::RESERVED_PAGE_ID;
 use crate::table::{Column, Schema};
 use crate::types::DataType;
 
@@ -33,6 +39,15 @@ pub struct ColumnRecord {
     pub table_id: TableId,
     pub position: u16,
     pub column: Column,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRecord {
+    pub index_id: IndexId,
+    pub table_id: TableId,
+    pub column: u16,
+    pub header_page_id: u32,
+    pub name: String,
 }
 
 const NULLABLE_FLAG: u8 = 0b1;
@@ -103,6 +118,42 @@ impl ColumnRecord {
                 data_type,
                 nullable,
             },
+        })
+    }
+}
+
+impl IndexRecord {
+    pub fn encode(&self) -> Result<Vec<u8>, CatalogError> {
+        let name_len = name_len(&self.name)?;
+        let mut bytes = Vec::with_capacity(15 + self.name.len());
+        bytes.extend(self.index_id.0.to_le_bytes());
+        bytes.extend(self.table_id.0.to_le_bytes());
+        bytes.extend(self.column.to_le_bytes());
+        bytes.extend(self.header_page_id.to_le_bytes());
+        bytes.push(name_len);
+        bytes.extend(self.name.as_bytes());
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CatalogError> {
+        let mut reader = ByteReader::new(bytes);
+        let index_id = IndexId(reader.read_u32().map_err(|_| TRUNCATED)?);
+        let table_id = TableId(reader.read_u32().map_err(|_| TRUNCATED)?);
+        let column = reader.read_u16().map_err(|_| TRUNCATED)?;
+        let header_page_id = reader.read_u32().map_err(|_| TRUNCATED)?;
+        let name = read_name(&mut reader)?;
+        expect_end(&reader)?;
+        if header_page_id == RESERVED_PAGE_ID {
+            return Err(CatalogError::Corrupted {
+                reason: "index header is the reserved page",
+            });
+        }
+        Ok(Self {
+            index_id,
+            table_id,
+            column,
+            header_page_id,
+            name,
         })
     }
 }
@@ -206,6 +257,80 @@ mod tests {
                 data_type,
                 nullable,
             },
+        }
+    }
+
+    fn index(name: &str) -> IndexRecord {
+        IndexRecord {
+            index_id: IndexId(0x0403_0201),
+            table_id: TableId(5),
+            column: 0x0201,
+            header_page_id: 9,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn index_record_should_produce_the_documented_bytes() {
+        let bytes = index("by_id").encode().unwrap();
+
+        assert_eq!(
+            bytes,
+            [
+                1, 2, 3, 4, 5, 0, 0, 0, 1, 2, 9, 0, 0, 0, 5, b'b', b'y', b'_', b'i', b'd'
+            ]
+        );
+    }
+
+    #[test]
+    fn index_records_should_round_trip_and_take_at_most_78_bytes() {
+        let longest = "é".repeat(31) + "x";
+        for name in ["i", "índice", longest.as_str()] {
+            let record = index(name);
+
+            let bytes = record.encode().unwrap();
+
+            assert_eq!(IndexRecord::decode(&bytes).unwrap(), record);
+        }
+        assert_eq!(index(&longest).encode().unwrap().len(), 78);
+    }
+
+    #[test]
+    fn index_record_with_a_name_outside_the_limits_should_not_encode() {
+        for name in [String::new(), "x".repeat(64)] {
+            let err = index(&name).encode().unwrap_err();
+
+            assert_eq!(corrupted(err), "name must have 1 to 63 bytes");
+        }
+    }
+
+    #[test]
+    fn decode_of_a_damaged_index_record_should_fail() {
+        let bytes = index("by_id").encode().unwrap();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let mut reserved = bytes.clone();
+        reserved[10..14].copy_from_slice(&[0; 4]);
+        let mut empty_name = bytes[..14].to_vec();
+        empty_name.push(0);
+        let mut not_utf8 = bytes.clone();
+        not_utf8[15] = 0xFF;
+
+        for len in 0..bytes.len() {
+            let err = IndexRecord::decode(&bytes[..len]).unwrap_err();
+            assert_eq!(corrupted(err), "catalog entry is truncated", "{len}");
+        }
+        let cases = [
+            (trailing, "catalog entry has trailing bytes"),
+            (reserved, "index header is the reserved page"),
+            (empty_name, "name must have 1 to 63 bytes"),
+            (not_utf8, "name is not valid UTF-8"),
+        ];
+        for (damaged, reason) in cases {
+            assert_eq!(
+                corrupted(IndexRecord::decode(&damaged).unwrap_err()),
+                reason
+            );
         }
     }
 
@@ -500,6 +625,16 @@ mod tests {
         (table, column)
     }
 
+    fn random_index_record(rng: &mut Rng) -> IndexRecord {
+        IndexRecord {
+            index_id: IndexId(rng.next() as u32),
+            table_id: TableId(rng.next() as u32),
+            column: rng.next() as u16,
+            header_page_id: (rng.next() as u32).max(1),
+            name: rng.name(),
+        }
+    }
+
     #[test]
     fn random_records_should_round_trip() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -515,6 +650,11 @@ mod tests {
                 ColumnRecord::decode(&column.encode().unwrap()).unwrap(),
                 column
             );
+            let index = random_index_record(&mut rng);
+            assert_eq!(
+                IndexRecord::decode(&index.encode().unwrap()).unwrap(),
+                index
+            );
         }
     }
 
@@ -524,7 +664,12 @@ mod tests {
 
         for _ in 0..2_000 {
             let (table, column) = random_records(&mut rng);
-            for mut bytes in [table.encode().unwrap(), column.encode().unwrap()] {
+            let index = random_index_record(&mut rng);
+            for mut bytes in [
+                table.encode().unwrap(),
+                column.encode().unwrap(),
+                index.encode().unwrap(),
+            ] {
                 if rng.below(3) == 0 {
                     bytes.truncate(rng.below(bytes.len() + 1));
                 } else {
@@ -534,6 +679,7 @@ mod tests {
 
                 let _ = TableRecord::decode(&bytes);
                 let _ = ColumnRecord::decode(&bytes);
+                let _ = IndexRecord::decode(&bytes);
             }
         }
     }

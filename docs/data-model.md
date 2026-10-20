@@ -676,17 +676,19 @@ for entry in accounts.scan(&mut bpm) {                              // Result<(R
 
 ## Catalog
 
-The catalog (`src/catalog/`) is the data dictionary: which tables exist, where their data lives and which columns they have. It solves two problems every database has:
+The catalog (`src/catalog/`) is the data dictionary: which tables exist, where their data lives, which columns they have, and which indexes exist on them. It solves two problems every database has:
 
 - **Bootstrap:** the catalog also lives on disk, and something must say where. **Page 0** (reserved by the heap file) is the **database header** and points to it.
-- **Variable size:** as in PostgreSQL (`pg_class` + `pg_attribute`), tables and columns are stored in **two separate heaps**, one entry per table and one per column. A single entry with every column would exceed 100 KB with 1,600 columns and would not fit in a page.
+- **Variable size:** as in PostgreSQL (`pg_class` + `pg_attribute`), tables and columns are stored in **two separate heaps**, one entry per table and one per column. A single entry with every column would exceed 100 KB with 1,600 columns and would not fit in a page. Indexes (like `pg_index`) have a third heap, one entry per index.
 
 ```
 page 0 (DatabaseHeader)
   ├── tables_first_page_id  ──▶ tables heap    (TableRecord: id, first_page_id, name)
-  └── columns_first_page_id ──▶ columns heap   (ColumnRecord: table, position, type, NOT NULL, name)
+  ├── columns_first_page_id ──▶ columns heap   (ColumnRecord: table, position, type, NOT NULL, name)
+  └── indexes_first_page_id ──▶ indexes heap   (IndexRecord: id, table, column, header_page_id, name)
                                                         │
-                    TableRecord.first_page_id ──────────┴──▶ HeapFile with the table's rows
+                    TableRecord.first_page_id ──────────┼──▶ HeapFile with the table's rows
+                    IndexRecord.header_page_id ─────────┴──▶ BPlusTree of the index
 ```
 
 Entries use their **own format** (`ByteWriter` / `ByteReader`): the catalog was designed before text existed, so it could not be a regular table read through `Schema` / `Value`. Now that `VARCHAR` exists, it can become system tables without changing the API (not done yet).
@@ -696,6 +698,9 @@ let mut catalog = Catalog::open(&mut bpm)?;                      // creates the 
 let table = catalog.create_table(&mut bpm, "accounts", schema)?; // TableInfo { id, name, schema, first_page_id }
 let table = catalog.table("accounts")?;                          // UndefinedTable if it does not exist
 let rows  = catalog.table_heap(&mut bpm, "accounts")?;           // the table's rows (see Table Heap)
+let index = catalog.create_index(&mut bpm, "accounts_id", "accounts", "id")?; // filled with the rows
+let tree  = catalog.index_tree(&mut bpm, "accounts_id")?;        // the index's BPlusTree
+let rid   = tree.get(&mut bpm, &Value::Integer(42))?;            // → TableHeap::get
 ```
 
 ### Layout
@@ -708,9 +713,10 @@ let rows  = catalog.table_heap(&mut bpm, "accounts")?;           // the table's 
 | `16..24` | magic `b"ferroDB\0"` |
 | `24..28` | `tables_first_page_id` (`u32` LE) |
 | `28..32` | `columns_first_page_id` (`u32` LE) |
-| `32..` | zero |
+| `32..36` | `indexes_first_page_id` (`u32` LE); `0` until the first index is created |
+| `36..` | zero |
 
-The checksum catches flipped bytes; the magic rejects a file whose page 0 is valid but is not a ferroDB database.
+The checksum catches flipped bytes; the magic rejects a file whose page 0 is valid but is not a ferroDB database. Bytes `32..36` were reserved (zero) before indexes existed, so an older database opens with no indexes heap.
 
 **Entries (`catalog/records.rs`, little-endian):**
 
@@ -718,18 +724,19 @@ The checksum catches flipped bytes; the magic rejects a file whose page 0 is val
 |---|---|
 | `TableRecord` | `table_id u32` · `first_page_id u32` · `name_len u8` · name |
 | `ColumnRecord` | `table_id u32` · `position u16` · `data_type u8` (`1` SMALLINT, `2` INTEGER, `3` BIGINT, `4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE, `9` TIMESTAMP) · [`max_chars u16`, only for VARCHAR] · `flags u8` (bit 0 = nullable) · `name_len u8` · name |
+| `IndexRecord` | `index_id u32` · `table_id u32` · `column u16` (position of the key column) · `header_page_id u32` (never `0`) · `name_len u8` · name |
 
-Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. An entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name). Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE, then `9` TIMESTAMP), so older databases still open.
+Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` is invalid on purpose, so a zeroed entry never decodes), a `VARCHAR` length of `0`, names with an out-of-range length or invalid UTF-8, and missing or trailing bytes. A table or column entry has at most 74 bytes (a `VARCHAR` column with a 63-byte name), an index entry 78. Existing codes never change when a type is added (`4` VARCHAR, `5` BOOLEAN, `6` REAL, `7` DOUBLE PRECISION, `8` DATE, then `9` TIMESTAMP), so older databases still open.
 
 ### Operations
 
 - **`open`:**
   - page 0 is `Free` → new database: creates both heaps and writes the header **last** (until then, the next `open` starts over);
-  - page 0 is `DatabaseHeader` → checks the magic, opens both heaps, decodes every entry and builds each `Schema` in `position` order;
+  - page 0 is `DatabaseHeader` → checks the magic, opens the heaps, decodes every entry and builds each `Schema` in `position` order;
   - page 0 of another type or a wrong magic → `NotADatabase`.
 - **Loading and validation:** columns numbered `0..n` without gaps or repetitions, a valid `Schema::new` (`CorruptedSchema`), unique table names and ids (`Corrupted`). Columns of a `table_id` without a `TableRecord` are **orphans** (left over by a failed `create_table`) and are ignored; the next id is `1 + highest id seen in tables and columns`, so an orphan id is never reused.
 - **`create_table`**, in this order:
-  1. validates the name (empty, longer than 63 bytes, duplicate) and whether a row fits in a page (`schema.min_row_size() <= max_tuple_size_for(page_size)`, otherwise `RowTooWide`);
+  1. validates the name (empty, longer than 63 bytes, taken by a table or an index) and whether a row fits in a page (`schema.min_row_size() <= max_tuple_size_for(page_size)`, otherwise `RowTooWide`);
   2. **consumes** the table id;
   3. creates the table's `TableHeap` (its data heap);
   4. writes one `ColumnRecord` per column;
@@ -737,6 +744,19 @@ Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` 
   6. only then adds the table to the in-memory catalog, and keeps the `TableHeap` from step 3 open.
 
   If step 4 or 5 fails, the columns already written are deleted (best effort), the table does not appear and the same name can be created again, but **with another id**: the id consumed in step 2 never comes back. If the undo also fails, the remaining columns become orphans with that id, and no new table inherits them. That is why ids can have gaps, like PostgreSQL sequences.
+- **Loading indexes:** entries in id order; each must belong to a table and a column that exist, ids must be unique and no name may be used by two relations (tables and indexes together): otherwise `Corrupted`. The next index id is `1 + highest id`. The trees are not opened on `open`.
+- **`create_index(bpm, name, table, column)`**, in this order:
+  1. validates without I/O: the name (empty `42602`, longer than 63 bytes `42622`, taken by an index or a table `42P07`), the table (`42P01`) and the column (`UndefinedColumn`, `42703`);
+  2. **consumes** the index id;
+  3. reads the key of every row of the table whose key is not `NULL`, with its `Rid` (all of them first: the scan holds the buffer pool);
+  4. creates a `BPlusTree` with the column's type as key type and inserts every key; a repeated key is `Index(DuplicateKey)` (`23505`) and stops here;
+  5. on the first index, creates the indexes heap and points the header to it;
+  6. writes the `IndexRecord` **last**: it is what makes the index exist on the next `open`;
+  7. only then adds the index to the in-memory catalog and keeps its tree open.
+
+  A failure in 3–6 leaves no index (not even after reopening) and the name free. The id is consumed for the rest of the session; since a failed index leaves no entry behind, the id can come back after reopening without risk (unlike a table id, whose failed creation can leave orphan columns). Every index is **unique**, because the B+Tree only holds unique keys, and `NULL` keys stay out of it, as several `NULL`s are allowed by `UNIQUE`.
+- **`index(name)` / `indexes()` / `table_indexes(table)`:** in-memory lookups (`UndefinedIndex`, `42704`); `table_indexes` lists a table's indexes in creation order, the ones a change to the table will have to update.
+- **`index_tree(bpm, name)`:** the index's `BPlusTree`, opened on first use with the column's type (which `BPlusTree::open` checks against the type recorded in the tree) and returned as the same handle afterwards.
 - **`table(name)` / `tables()`:** in-memory lookups, no I/O. `tables()` is in creation order. Names are compared byte by byte (`users` ≠ `USERS`), like columns.
 - **`table_heap(bpm, name)`:** the table's [`TableHeap`](#table-heap). The first call opens it (`HeapFile::open` walks its pages); every later call returns the same handle, without I/O. An unknown name → `UndefinedTable`.
 
@@ -755,6 +775,13 @@ Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` 
 | `CorruptedSchema` | `XX001` | `catalog is corrupted: table "t": a table must have at least one column` |
 | `Heap` / `BufferPool` | the storage error's, as in [Table Heap](#table-heap) (e.g. `XX001` for a checksum mismatch) | message of the wrapped error |
 | `Table` | the `TableError`'s | message of the wrapped error (opening or creating a table's heap) |
+| `EmptyIndexName` | `42602` | `an index name cannot be empty` |
+| `IndexNameTooLong` | `42622` | `index name "aaa…" is longer than 63 bytes` |
+| `DuplicateIndex` | `42P07` | `index "accounts_id" already exists` (also when creating a table with that name) |
+| `UndefinedIndex` | `42704` | `index "accounts_id" does not exist` |
+| `UndefinedColumn` | `42703` | `column "age" of table "accounts" does not exist` |
+| `TooManyIndexes` | `54000` | `no index ids left` |
+| `Index` | the `IndexError`'s | message of the wrapped error (e.g. `duplicate key value (7) violates the unique index`, `23505`) |
 
 ### Design decisions
 
@@ -762,12 +789,18 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 
 - **The whole catalog in memory**, loaded on `open`: tens of bytes per column, and lookups do no I/O.
 - **`TableId(u32)` newtype:** cannot be confused with a page id. The internal counter is a `u64`, so a `u32::MAX` id stored on disk still loads; creating the next table returns `TooManyTables`.
-- **Open tables are cached** (`HashMap<TableId, TableHeap>`): one handle per table, so two callers never hold heaps that disagree about which pages exist (see [Table Heap](#table-heap)). A table is opened on first use, not on `open`, so opening the database still reads no data pages. A handle costs a few bytes per page of its heap, only for the tables used. Handles are never dropped while the catalog lives: the future `DROP TABLE` must remove the table from `open_tables` too.
+- **Open tables are cached** (`HashMap<TableId, TableHeap>`): one handle per table, so two callers never hold heaps that disagree about which pages exist (see [Table Heap](#table-heap)). A table is opened on first use, not on `open`, so opening the database still reads no data pages. A handle costs a few bytes per page of its heap, only for the tables used. Handles are never dropped while the catalog lives: the future `DROP TABLE` must remove the table from `open_tables` too. The trees of the indexes are cached the same way (`HashMap<IndexId, BPlusTree>`), since a tree keeps its root in memory.
+- **Indexes in their own heap**, with the same format and commit point as tables (the entry written last), and the heap created by the **first** `create_index`: older databases open unchanged and `open` never writes; the cost is one header write before the first entry.
+- **One namespace for tables and indexes**, as relations in PostgreSQL: a name is never ambiguous when SQL refers to a relation, so `create_table` also refuses the name of an index.
+- **`IndexInfo` keeps the column's position**, not its name: schemas never change (no `ALTER TABLE`), and the position is what extracts the key from a row.
 
 ### Known limitations
 
 - ⚠️ **Crash in the middle of `create_table` or of database creation:** the buffer pool writes pages in any order, so after a real crash "`TableRecord` last" is not guaranteed; orphan columns may remain (ignored) or, in the worst case, a `TableRecord` without columns (`CorruptedSchema` on `open`). The complete fix is the WAL.
-- ⚠️ **Orphan pages:** the data heap of a failed `create_table` and the heaps of an interrupted database creation have no owner until a future `VACUUM`.
+- ⚠️ **Indexes do not follow the table yet:** an index holds the rows that existed when it was created. Inserting, updating or deleting through `TableHeap` does not update it; keeping indexes in step is the job of the executors (INSERT/DELETE), the next step.
+- ⚠️ **Unique, single-column indexes only:** a column with repeated values cannot be indexed yet (`23505`).
+- ⚠️ **Building an index reads every key first:** `create_index` keeps all the keys of the column in memory before filling the tree (the table scan holds the buffer pool); a sorted bulk load would avoid both that and the inserts one by one.
+- ⚠️ **Orphan pages:** the data heap of a failed `create_table`, the tree of a failed `create_index` and the heaps of an interrupted database creation have no owner until a future `VACUUM`.
 - ⚠️ **Provisional format:** when the catalog becomes system tables, old databases will not open (no migration; test databases are disposable).
 
 ### Demo (`cargo run`)
@@ -776,12 +809,15 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 
 ### Tests
 
-- `header.rs`: documented bytes, round trip, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
-- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`10`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking.
+- `header.rs`: documented bytes (including `indexes_first_page_id`), round trip, a header from before indexes read as having no indexes heap, LSN preserved and reserved bytes zeroed, never-written page → `None`, slotted page or wrong magic → `NotADatabase`, page too small.
+- `records.rs`: documented bytes (including a `VARCHAR` length), round trip (names of 1 and 63 bytes, multibyte, each type including `VARCHAR(1)` and `VARCHAR(65535)`, nullable or not), the largest entry at 74 bytes, every corruption reason (truncated at every length, integer and `VARCHAR` entries, trailing bytes, type `0`/`10`, `VARCHAR` length `0`, unknown flag, name of 0/64 bytes, invalid UTF-8), 2,000 random round-trip entries and 2,000 corrupted ones without panicking, for each kind of entry. `IndexRecord`: documented bytes, round trip with names of 1, 6 and 63 bytes (78 bytes at most), names outside the limits refused, truncated at every length, trailing bytes, reserved header page, empty name, invalid UTF-8.
 - `catalog.rs`: database creation and empty reopen, page 0 that is not a header, `create_table` (lookup, order and ids, invalid or duplicate name, `id` vs. `ID`, `RowTooWide` at the exact limit, the open `TableHeap` kept, `TooManyTables`, including with a `u32::MAX` id loaded from disk), loading (every table back, ids continue, 1,000 columns across several pages with eviction, orphans ignored without reusing ids, columns with gaps or repetitions, invalid schema, table without columns, duplicate name or id, corrupted entry), injected failures (in the middle of `create_table`, on the table entry and between columns: no visible table, not even after reopening; **undo that also fails**: the id is not reused and the database still opens; failed header write: the next `open` creates the database from scratch; no frame for the data heap: no table, the id consumed), `table_heap` (same handle on every call, `UndefinedTable`, opened on first use after reopening) and every error with message, SQLSTATE and `source()`.
+- `catalog.rs`, indexes: validation before anything is created (each error, `ID` vs. `id`), filling from 300 rows over several pages, `NULL` keys left out, a column with repeated values leaving no index (and consuming the id), a key too large for the tree in the middle of the rows (`54000`, no index), `TooManyIndexes` (also with a `u32::MAX` id loaded from disk), an empty table, lookups by name and by table, the same tree handle with the column's type, one namespace for tables and indexes, an index on a column of every type, the indexes heap created by the first index, reopening (indexes back, trees opened on first use, ids continue), every corruption of an index entry (unknown table or column, a name taken by an index or a table, a repeated id, a truncated entry; an entry whose tree is a data page or a tree of another type, found when the tree is opened) and failures while reading the table, pointing the header to the indexes heap and writing the entry (no index, not even after reopening). Mutations checked by hand: keeping the indexes heap before the header points to it, and listing the index before its entry is written.
+- `random_tables_and_indexes_should_match_model_across_reopens`: 400 random table creations, rows (some keys `NULL` or repeated) and index creations (names taken, unknown tables and columns, repeated keys), compared with a model that knows each expected error and each index's keys, reopening every 50 steps. Removing the check of index names in `create_table` makes it fail.
 - `random_creations_should_match_model_across_reopens`: 300 random creations (duplicate and invalid names, 1 to 30 columns of every type, including `VARCHAR(1)` and `VARCHAR(65535)`) with a 3-frame pool, reopening every 50 and comparing with a `Vec`.
 - Mutations checked by hand during development: removing the column undo breaks the failure tests; resetting the next id to 1 after reopening breaks the model test.
 - Integration in [`tests/catalog_table_metadata.rs`](../tests/catalog_table_metadata.rs): tables and rows of two tables survive reopening the file (2-frame pool), a file whose page 0 is a slotted page → `NotADatabase`, a corrupted page of the columns heap → checksum error on `open`.
+- Integration in [`tests/catalog_index_metadata.rs`](../tests/catalog_index_metadata.rs): indexes on an `INTEGER` column and on `VARCHAR` and `SMALLINT` columns of 2,000 and 3,000 rows (8-frame pool) survive reopening and lead to their rows through `TableHeap::get`; a failed index leaves no trace after reopening; a database with no indexes heap takes its first index; a damaged page of the indexes heap is caught on `open` (`XX001`).
 
 ---
 

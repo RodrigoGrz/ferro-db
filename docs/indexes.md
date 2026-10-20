@@ -2,7 +2,7 @@
 
 This document is the authoritative description of ferroDB's index layer (`src/index/`): the B+Tree, its key encoding and page formats, operations, error handling and tests. Page headers, the buffer pool and the other storage formats are in [storage-engine.md](storage-engine.md); SQL types are in [data-model.md](data-model.md).
 
-Dependencies point downward: `index` → `types` (keys are `Value`s of a `DataType`) and `storage` (pages). Nothing uses the index yet: linking it to tables (`CREATE INDEX`, index metadata in the catalog, keeping it in step with `TableHeap`) is the next step.
+Dependencies point downward: `index` → `types` (keys are `Value`s of a `DataType`) and `storage` (pages). The catalog creates indexes on table columns and keeps their trees open ([Catalog](data-model.md#catalog)); keeping an index in step with changes to its table is the job of the executors, the next step.
 
 - [B+Tree](#btree)
 - [Keys](#keys)
@@ -166,7 +166,7 @@ See [ADR 0010](decisions/0010-b-plus-tree-variable-nodes-and-late-writes.md) for
 
 ## Limitations
 
-- ⚠️ **Not linked to tables yet:** no `CREATE INDEX`, no index metadata in the catalog and no maintenance on `TableHeap` changes.
+- ⚠️ **Not maintained yet:** `Catalog::create_index` fills a tree with a table's rows, but later changes through `TableHeap` do not reach it until the executors exist. There is no `CREATE INDEX` statement.
 - ⚠️ **Unique keys only**, of a single column. No composite keys, no `NULL`.
 - ⚠️ **No crash atomicity:** the commit step copies several pages into the buffer pool, which writes them to disk in any order; a crash in between can leave the tree inconsistent on disk. The WAL will fix it.
 - ⚠️ **Single-threaded:** no latches (no *latch crabbing*); every operation takes `&mut BufferPoolManager`.

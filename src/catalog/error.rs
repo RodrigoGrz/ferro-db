@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::index::IndexError;
 use crate::storage::buffer_pool::BufferPoolError;
 use crate::storage::heap_file::HeapFileError;
 use crate::table::schema::prefix_within;
@@ -36,25 +37,49 @@ pub enum CatalogError {
         table: String,
         source: SchemaError,
     },
+    EmptyIndexName,
+    IndexNameTooLong {
+        name: String,
+        max: usize,
+    },
+    DuplicateIndex {
+        name: String,
+    },
+    UndefinedIndex {
+        name: String,
+    },
+    UndefinedColumn {
+        table: String,
+        column: String,
+    },
+    TooManyIndexes,
     Heap(HeapFileError),
     BufferPool(BufferPoolError),
     Table(TableError),
+    Index(IndexError),
 }
 
 impl CatalogError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
-            CatalogError::EmptyTableName => "42602",
-            CatalogError::TableNameTooLong { .. } => "42622",
-            CatalogError::DuplicateTable { .. } => "42P07",
+            CatalogError::EmptyTableName | CatalogError::EmptyIndexName => "42602",
+            CatalogError::TableNameTooLong { .. } | CatalogError::IndexNameTooLong { .. } => {
+                "42622"
+            }
+            CatalogError::DuplicateTable { .. } | CatalogError::DuplicateIndex { .. } => "42P07",
             CatalogError::UndefinedTable { .. } => "42P01",
-            CatalogError::RowTooWide { .. } | CatalogError::TooManyTables => "54000",
+            CatalogError::UndefinedIndex { .. } => "42704",
+            CatalogError::UndefinedColumn { .. } => "42703",
+            CatalogError::RowTooWide { .. }
+            | CatalogError::TooManyTables
+            | CatalogError::TooManyIndexes => "54000",
             CatalogError::NotADatabase { .. }
             | CatalogError::Corrupted { .. }
             | CatalogError::CorruptedSchema { .. } => "XX001",
             CatalogError::Heap(err) => err.sqlstate(),
             CatalogError::BufferPool(err) => err.sqlstate(),
             CatalogError::Table(err) => err.sqlstate(),
+            CatalogError::Index(err) => err.sqlstate(),
         }
     }
 }
@@ -84,7 +109,20 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::Heap(err) => write!(f, "{err}"),
             CatalogError::BufferPool(err) => write!(f, "{err}"),
+            CatalogError::EmptyIndexName => write!(f, "an index name cannot be empty"),
+            CatalogError::IndexNameTooLong { name, max } => write!(
+                f,
+                "index name \"{}…\" is longer than {max} bytes",
+                prefix_within(name, *max)
+            ),
+            CatalogError::DuplicateIndex { name } => write!(f, "index \"{name}\" already exists"),
+            CatalogError::UndefinedIndex { name } => write!(f, "index \"{name}\" does not exist"),
+            CatalogError::UndefinedColumn { table, column } => {
+                write!(f, "column \"{column}\" of table \"{table}\" does not exist")
+            }
+            CatalogError::TooManyIndexes => write!(f, "no index ids left"),
             CatalogError::Table(err) => write!(f, "{err}"),
+            CatalogError::Index(err) => write!(f, "{err}"),
         }
     }
 }
@@ -96,6 +134,7 @@ impl std::error::Error for CatalogError {
             CatalogError::Heap(err) => Some(err),
             CatalogError::BufferPool(err) => Some(err),
             CatalogError::Table(err) => Some(err),
+            CatalogError::Index(err) => Some(err),
             _ => None,
         }
     }
@@ -110,6 +149,12 @@ impl From<HeapFileError> for CatalogError {
 impl From<TableError> for CatalogError {
     fn from(err: TableError) -> Self {
         CatalogError::Table(err)
+    }
+}
+
+impl From<IndexError> for CatalogError {
+    fn from(err: IndexError) -> Self {
+        CatalogError::Index(err)
     }
 }
 

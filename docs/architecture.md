@@ -44,6 +44,7 @@ flowchart TD
     heap --> slotted
     heap --> bpm
     catalog --> bpm
+    catalog --> btree
     btree --> types
     btree --> bpm
     bpm --> replacer
@@ -78,10 +79,10 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Value` / `DataType` | Integer, float, text, boolean, date, timestamp and NULL values with SQL semantics (parse, cast and assignment, arithmetic, `||`, comparisons as SQL values, three-valued logic). | Store anything. |
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
-| `Catalog` | Persist which tables exist, their columns and their first data page; bootstrap from page 0; keep one open `TableHeap` per table used. | Expose SQL. |
+| `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
-**Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`, and `index` → `types`/`storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
+**Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`, `catalog` → `index`, and `index` → `types`/`storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
 
 ## How data moves
 
@@ -141,5 +142,5 @@ These are verified properties of the current code, not bugs to be fixed in passi
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.
 - **Limited types.** Only `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`. Text compares by UTF-8 bytes and a value must fit in one page. The catalog still uses its own record format instead of system tables.
-- **No `DROP TABLE` and no constraints** other than per-column `NOT NULL`. The B+Tree is not linked to tables yet, and holds unique keys only.
+- **No `DROP TABLE` and no constraints** other than per-column `NOT NULL`. Indexes are created by the catalog but not kept in step with later changes to their table yet, and hold unique keys of one column only.
 - **Formats are not stable.** Page and catalog formats have changed during development without migrations; database files are disposable.

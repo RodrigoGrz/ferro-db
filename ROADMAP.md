@@ -7,7 +7,7 @@ This is the authoritative implementation checklist for ferroDB. The README only 
 - `[x]` means the feature exists **and** is covered by tests (the links point to both).
 - `[ ]` means it is not done. A note says when part of it already exists.
 - Sections keep the order in which the project plans to build them. Items marked *(next)* come from the "next steps" recorded in the design notes and are the closest planned work.
-- Status was last verified against the code on 2026-10-20 (`cargo test --all-targets`: 879 tests passing).
+- Status was last verified against the code on 2026-10-20 (`cargo test --all-targets`: 907 tests passing).
 
 When an item is finished, mark it here in the same change that adds the code, and update the design notes (see the [documentation index](doc.md)).
 
@@ -144,14 +144,14 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 - [x] Database Catalog: page 0 database header, persistent catalog loaded on open ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
 - [x] Table Metadata ([`records.rs`](src/catalog/records.rs))
 - [x] Column Metadata ([`records.rs`](src/catalog/records.rs))
-- [ ] Index Metadata
+- [x] Index Metadata: unique single-column indexes created and filled from a table's rows, persisted in their own catalog heap, found by name or by table, with the tree opened on demand ([`catalog.rs`](src/catalog/catalog.rs), [`records.rs`](src/catalog/records.rs), [`tests/catalog_index_metadata.rs`](tests/catalog_index_metadata.rs)). Indexes are not updated when the table changes until the executors exist.
 - [ ] Constraint Metadata
 - [ ] *(next)* String/VARCHAR-backed system tables, so the catalog can be stored as regular tables (`INFORMATION_SCHEMA`)
 
 ## Reliability
 
-- [x] Unit Tests: 813 tests, in every module
-- [x] Integration Tests: 66 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
+- [x] Unit Tests: 837 tests, in every module
+- [x] Integration Tests: 70 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
 - [ ] Concurrency Tests
 - [ ] Crash Recovery Tests
 - [ ] Fuzz Tests. Randomized model-based and corruption tests exist (for example `random_corruption_should_never_panic`), but there is no coverage-guided fuzzing harness.
