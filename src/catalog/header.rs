@@ -37,7 +37,10 @@ impl DatabaseHeader {
         })?;
         match page_header.page_type {
             PageType::Free => return Ok(None),
-            PageType::Slotted => {
+            PageType::Slotted
+            | PageType::BPlusTreeHeader
+            | PageType::BPlusTreeNode
+            | PageType::BPlusTreeFree => {
                 return Err(CatalogError::NotADatabase {
                     reason: "page 0 is not a database header",
                 });
@@ -151,6 +154,28 @@ mod tests {
                 reason: "page 0 is not a database header"
             }
         ));
+    }
+
+    #[test]
+    fn read_of_a_b_plus_tree_page_should_fail() {
+        use crate::storage::page::{PageHeader, PageType};
+        for page_type in [
+            PageType::BPlusTreeHeader,
+            PageType::BPlusTreeNode,
+            PageType::BPlusTreeFree,
+        ] {
+            let mut page = vec![0; PAGE];
+            PageHeader::format(&mut page, page_type).unwrap();
+
+            let err = DatabaseHeader::read(&page).unwrap_err();
+
+            assert!(matches!(
+                err,
+                CatalogError::NotADatabase {
+                    reason: "page 0 is not a database header"
+                }
+            ));
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Architectural Decision Records
 
-Short records of significant decisions already made in the codebase. Each one links to the code and tests that implement it. The detailed formats stay in [storage-engine.md](../storage-engine.md) and [data-model.md](../data-model.md); these records explain *why*.
+Short records of significant decisions already made in the codebase. Each one links to the code and tests that implement it. The detailed formats stay in [storage-engine.md](../storage-engine.md), [data-model.md](../data-model.md) and [indexes.md](../indexes.md); these records explain *why*.
 
 The rationale comes from the design notes written while each component was built. When a rationale was not recorded, the ADR says so instead of guessing.
 
@@ -15,6 +15,7 @@ The rationale comes from the design notes written while each component was built
 | [0007](0007-fail-without-side-effects.md) | Operations validate first and fail without side effects; disk data is never trusted | Accepted |
 | [0008](0008-varchar-utf8-byte-order-and-assignment.md) | Text is `VARCHAR(n)` in UTF-8, compared by bytes, with store assignment separate from `CAST` | Accepted |
 | [0009](0009-floats-finite-exact-comparison-numeric-family.md) | Floats are finite, compare exactly with integers and share one numeric family | Accepted |
+| [0010](0010-b-plus-tree-variable-nodes-and-late-writes.md) | B+Tree with variable-size nodes, order-preserving keys and writing last | Accepted |
 
 ## Adding a record
 

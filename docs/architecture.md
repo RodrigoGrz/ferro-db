@@ -17,6 +17,10 @@ flowchart TD
         types["Value / DataType<br/>src/types/<br/>integers, floats, VARCHAR, BOOLEAN, DATE, TIMESTAMP, NULL, SQL semantics"]
     end
 
+    subgraph indexes["Indexes"]
+        btree["BPlusTree<br/>src/index/<br/>unique keys → Rid, range scans"]
+    end
+
     subgraph storage["Storage engine (src/storage/)"]
         heap["HeapFile + FreeSpaceMap<br/>linked list of slotted pages"]
         slotted["SlottedPage + TupleLayout<br/>slots, tuples, NULL bitmap"]
@@ -40,6 +44,8 @@ flowchart TD
     heap --> slotted
     heap --> bpm
     catalog --> bpm
+    btree --> types
+    btree --> bpm
     bpm --> replacer
     bpm --> disk
     disk --> file
@@ -47,17 +53,16 @@ flowchart TD
     subgraph planned["Planned (not implemented)"]
         sql["SQL parser"]
         planner["Planner / executor"]
-        index["B+Tree indexes"]
         wal["WAL / recovery"]
     end
     sql -.-> planner
     planner -.-> catalog
     planner -.-> tableheap
-    planner -.-> index
+    planner -.-> btree
     wal -.-> bpm
 
     classDef plannedNode stroke-dasharray: 5 5,color:#777
-    class sql,planner,index,wal plannedNode
+    class sql,planner,wal plannedNode
 ```
 
 An arrow means "uses". Dashed nodes and arrows are planned work from the [roadmap](../ROADMAP.md), not current capabilities.
@@ -74,8 +79,9 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables exist, their columns and their first data page; bootstrap from page 0; keep one open `TableHeap` per table used. | Expose SQL. |
+| `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
-**Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
+**Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`, and `index` → `types`/`storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
 
 ## How data moves
 
@@ -108,6 +114,13 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 3. The buffer pool verifies the checksum and the header (type and format version). A failure returns an error and leaves the pool untouched.
 4. A frame is taken from the free list or from the replacer's victim (written back first if dirty), and only then are the free list, replacer and page table updated.
 
+### Looking up a key in an index
+
+1. `BPlusTree::get(&Value)` encodes the key into bytes whose order is the SQL order of the key type.
+2. From the root, each internal node is read through the buffer pool, binary-searched for the child to follow and unpinned; each child must be one level below its parent.
+3. In the leaf, a binary search finds the key and its `Rid`, which a caller can pass to `TableHeap::get`.
+4. An insert or remove computes every page it changes in memory, pins them, encodes them and only then copies them into the frames, so a failure leaves the tree as it was ([indexes.md](indexes.md#failing-without-side-effects)).
+
 ## Testing strategy
 
 Every module has unit tests next to the code; [`tests/`](../tests/) holds integration tests named `<layer>_<component>.rs`. Recurring kinds of tests, all present in the code today:
@@ -117,7 +130,7 @@ Every module has unit tests next to the code; [`tests/`](../tests/) holds integr
 - **Persistence:** data survives eviction with tiny pools (2–3 frames) and reopening the file.
 - **Corruption:** bytes changed on disk are caught by the checksum or by validation, never by a panic.
 - **Randomized model tests:** thousands of random operations compared with a simple in-memory model (`HashMap`, `Vec`, `i128` arithmetic), with invariants checked along the way. They use a small deterministic PRNG defined in the tests.
-- **Injected failures:** a test-only hook in the buffer pool makes a fetch fail in the middle of a heap or catalog operation, to check that nothing half-done becomes visible.
+- **Injected failures:** a test-only hook in the buffer pool makes a fetch fail in the middle of a heap, catalog or index operation, to check that nothing half-done becomes visible.
 
 ## Limitations
 
@@ -128,5 +141,5 @@ These are verified properties of the current code, not bugs to be fixed in passi
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.
 - **Limited types.** Only `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`. Text compares by UTF-8 bytes and a value must fit in one page. The catalog still uses its own record format instead of system tables.
-- **No `DROP TABLE`, no indexes, no constraints** other than per-column `NOT NULL`.
+- **No `DROP TABLE` and no constraints** other than per-column `NOT NULL`. The B+Tree is not linked to tables yet, and holds unique keys only.
 - **Formats are not stable.** Page and catalog formats have changed during development without migrations; database files are disposable.

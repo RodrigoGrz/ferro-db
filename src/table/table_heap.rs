@@ -4,8 +4,7 @@
 
 use std::fmt;
 
-use crate::storage::buffer_pool::{BufferPoolError, BufferPoolManager};
-use crate::storage::disk_manager::DiskError;
+use crate::storage::buffer_pool::BufferPoolManager;
 use crate::storage::heap_file::{HeapFile, HeapFileError, HeapScan};
 use crate::storage::rid::Rid;
 use crate::types::Value;
@@ -113,37 +112,8 @@ impl TableError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             TableError::Schema(err) => err.sqlstate(),
-            TableError::Heap(err) => heap_sqlstate(err),
+            TableError::Heap(err) => err.sqlstate(),
         }
-    }
-}
-
-/// The SQLSTATE of a storage error, shared by every layer that wraps one, so the same failure
-/// always gets the same code.
-pub(crate) fn heap_sqlstate(err: &HeapFileError) -> &'static str {
-    match err {
-        HeapFileError::BufferPool(err) => buffer_pool_sqlstate(err),
-        // The row fits its types but not a page: a limit of the system, not of the data.
-        HeapFileError::TupleTooLarge { .. } => "54000",
-        HeapFileError::CorruptedChain { .. } | HeapFileError::Page { .. } => "XX001",
-        // A `Rid` of another table or of a deleted row: a mistake of the caller.
-        HeapFileError::TupleNotFound { .. }
-        | HeapFileError::PageNotInHeap { .. }
-        | HeapFileError::UnsupportedPageSize { .. } => "XX000",
-    }
-}
-
-/// Damaged bytes are data corruption (`XX001`), not the disk failing (`58030`).
-pub(crate) fn buffer_pool_sqlstate(err: &BufferPoolError) -> &'static str {
-    match err {
-        BufferPoolError::ChecksumMismatch { .. }
-        | BufferPoolError::Page(_)
-        | BufferPoolError::Disk(DiskError::TornPage { .. }) => "XX001",
-        BufferPoolError::Disk(_) => "58030",
-        // Every frame pinned: out of a resource, nothing is wrong with the data.
-        BufferPoolError::NoAvailableFrame => "53000",
-        BufferPoolError::PageIdOverflow => "54000",
-        BufferPoolError::InvalidPoolSize | BufferPoolError::InvalidPageSize => "XX000",
     }
 }
 

@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer and a persistent catalog work and are tested (790 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog and a B+Tree index work and are tested (879 tests). Typed rows can be stored in tables that survive restarts, through the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -30,14 +30,16 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **Schema** | Column definitions, `NOT NULL`, and typed row ⇄ tuple conversion with SQL assignment rules. |
 | **Table Heap** | A table's rows as typed values: insert, get, update, delete and scan, validated by the schema before anything is written. |
 | **Catalog** | Tables and columns persisted on disk and bootstrapped from page 0, loaded into memory on open; finds a table's rows by name, keeping one open handle per table. |
+| **B+Tree index** | A unique index from keys of any type (text included) to row ids, with range scans; nodes of variable-size entries split, merge and redistribute by bytes, and a failed operation changes nothing. |
 
 **Partially there:**
 
 - Typed rows can be inserted, updated, deleted and scanned through the Rust API (`TableHeap`), but there are no `INSERT`/`SELECT`/`UPDATE`/`DELETE` statements yet.
+- The B+Tree works on its own, but is not linked to tables yet (no `CREATE INDEX`, no index metadata in the catalog).
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** SQL lexer and parser, query planning and execution, B+Tree indexes, more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** SQL lexer and parser, query planning and execution, indexes on tables, more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -46,6 +48,7 @@ flowchart TD
     app["Rust API / demo binary"]
     catalog["Catalog<br/>tables and columns, page 0"]
     tableheap["Table Heap<br/>typed rows of a table"]
+    btree["B+Tree index<br/>keys → row ids"]
     schema["Schema + types<br/>row ⇄ tuple, SQL semantics"]
     heap["Heap File + free space map"]
     page["Slotted pages + tuple format"]
@@ -55,6 +58,8 @@ flowchart TD
 
     app --> catalog
     app --> tableheap
+    app --> btree
+    btree --> bpm
     catalog --> tableheap
     catalog --> heap
     tableheap --> schema
@@ -125,7 +130,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 728 unit tests + 62 integration tests
+cargo test --all-targets   # 813 unit tests + 66 integration tests
 ```
 
 The suite is the main way the implementation is verified:
@@ -134,7 +139,7 @@ The suite is the main way the implementation is verified:
 - **Integration tests** in [`tests/`](tests/), one file per component: data survives eviction with tiny buffer pools and reopening the file.
 - **Corruption tests:** bytes changed on disk are detected by checksums and validation, never by a panic.
 - **Randomized model tests:** thousands of random operations compared against a simple in-memory model (`HashMap`, `Vec`, `i128` arithmetic), with invariants checked along the way.
-- **Injected failures:** a test-only hook makes the buffer pool fail in the middle of a heap or catalog operation, to check that nothing half-done becomes visible.
+- **Injected failures:** a test-only hook makes the buffer pool fail in the middle of a heap, catalog or index operation, to check that nothing half-done becomes visible.
 
 CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on every push and pull request.
 
@@ -144,6 +149,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - [docs/architecture.md](docs/architecture.md): components, data flow, testing strategy, limitations
 - [docs/storage-engine.md](docs/storage-engine.md): disk manager, buffer pool, LRU-K, page and tuple formats, heap file, free space management
 - [docs/data-model.md](docs/data-model.md): integers, floats, VARCHAR, BOOLEAN, DATE, TIMESTAMP and NULL, schema, catalog, deviations from the SQL standard
+- [docs/indexes.md](docs/indexes.md): the B+Tree, key encoding, node format, splits and merges
 - [docs/decisions/](docs/decisions/README.md): architectural decision records
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and conventions
 

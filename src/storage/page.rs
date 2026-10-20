@@ -45,6 +45,12 @@ pub enum PageType {
     Slotted = 1,
     /// Page 0: the database header that points to the catalog.
     DatabaseHeader = 2,
+    /// The fixed entry page of a B+Tree: its root and its list of free pages.
+    BPlusTreeHeader = 3,
+    /// A leaf or internal node of a B+Tree (the node stores its level).
+    BPlusTreeNode = 4,
+    /// A page a B+Tree freed and will reuse.
+    BPlusTreeFree = 5,
 }
 
 impl TryFrom<u8> for PageType {
@@ -55,6 +61,9 @@ impl TryFrom<u8> for PageType {
             0 => Ok(PageType::Free),
             1 => Ok(PageType::Slotted),
             2 => Ok(PageType::DatabaseHeader),
+            3 => Ok(PageType::BPlusTreeHeader),
+            4 => Ok(PageType::BPlusTreeNode),
+            5 => Ok(PageType::BPlusTreeFree),
             _ => Err(SerializationError::InvalidValue {
                 field: "page_type",
                 value: value.into(),
@@ -407,14 +416,14 @@ mod tests {
 
     #[test]
     fn page_type_should_round_trip_through_u8() {
-        for page_type in [PageType::Free, PageType::Slotted, PageType::DatabaseHeader] {
-            assert_eq!(PageType::try_from(page_type as u8).unwrap(), page_type);
+        for value in 0..=5 {
+            assert_eq!(PageType::try_from(value).unwrap() as u8, value);
         }
     }
 
     #[test]
     fn page_type_from_unknown_byte_should_fail() {
-        for value in [3, u8::MAX] {
+        for value in [6, u8::MAX] {
             let err = PageType::try_from(value).unwrap_err();
 
             assert_eq!(

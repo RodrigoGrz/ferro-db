@@ -7,7 +7,7 @@ This is the authoritative implementation checklist for ferroDB. The README only 
 - `[x]` means the feature exists **and** is covered by tests (the links point to both).
 - `[ ]` means it is not done. A note says when part of it already exists.
 - Sections keep the order in which the project plans to build them. Items marked *(next)* come from the "next steps" recorded in the design notes and are the closest planned work.
-- Status was last verified against the code on 2026-10-19 (`cargo test --all-targets`: 790 tests passing).
+- Status was last verified against the code on 2026-10-20 (`cargo test --all-targets`: 879 tests passing).
 
 When an item is finished, mark it here in the same change that adds the code, and update the design notes (see the [documentation index](doc.md)).
 
@@ -51,10 +51,10 @@ When an item is finished, mark it here in the same change that adds the code, an
 
 ## Indexes
 
-- [ ] B+Tree. Note: little-endian integers are not byte-orderable, so keys must be compared with `Value::sort_cmp` or use an order-preserving encoding.
+- [x] B+Tree: unique keys of any type (text included) to `Rid`, order-preserving key encoding, variable-size nodes with split, merge and redistribution by bytes, a free list for freed pages ([`src/index/`](src/index/), [`tests/index_b_plus_tree.rs`](tests/index_b_plus_tree.rs), [docs](docs/indexes.md))
 - [ ] Index Scan
-- [ ] Range Scan
-- [ ] Unique Index
+- [ ] Range Scan. `BPlusTree::range` iterates the keys within bounds; there is no scan operator yet (see also Query Execution).
+- [ ] Unique Index. The B+Tree only holds unique keys (`23505` on a duplicate); there is no `CREATE UNIQUE INDEX` nor an index linked to a table.
 - [ ] Composite Index
 
 ## SQL
@@ -150,8 +150,8 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 
 ## Reliability
 
-- [x] Unit Tests: 728 tests, in every module
-- [x] Integration Tests: 62 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
+- [x] Unit Tests: 813 tests, in every module
+- [x] Integration Tests: 66 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
 - [ ] Concurrency Tests
 - [ ] Crash Recovery Tests
 - [ ] Fuzz Tests. Randomized model-based and corruption tests exist (for example `random_corruption_should_never_panic`), but there is no coverage-guided fuzzing harness.

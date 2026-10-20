@@ -21,6 +21,22 @@ pub enum BufferPoolError {
     Page(PageError),
 }
 
+impl BufferPoolError {
+    /// Damaged bytes are data corruption (`XX001`), not the disk failing (`58030`).
+    pub fn sqlstate(&self) -> &'static str {
+        match self {
+            BufferPoolError::ChecksumMismatch { .. }
+            | BufferPoolError::Page(_)
+            | BufferPoolError::Disk(DiskError::TornPage { .. }) => "XX001",
+            BufferPoolError::Disk(_) => "58030",
+            // Every frame pinned: out of a resource, nothing is wrong with the data.
+            BufferPoolError::NoAvailableFrame => "53000",
+            BufferPoolError::PageIdOverflow => "54000",
+            BufferPoolError::InvalidPoolSize | BufferPoolError::InvalidPageSize => "XX000",
+        }
+    }
+}
+
 impl fmt::Display for BufferPoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -744,6 +760,26 @@ mod tests {
                 if found == version
         ));
         assert!(bpm.page_table.is_empty());
+    }
+
+    #[test]
+    fn pages_of_the_b_plus_tree_should_load() {
+        let path = TempPath(temp_path());
+        for page_id in 0..3 {
+            let page_type = 3 + page_id as u8;
+            write_raw_page(
+                &path.0,
+                page_id,
+                &stamped_page(page_type, PAGE_FORMAT_VERSION),
+            );
+        }
+        let mut bpm = BufferPoolManager::new(3, TEST_PAGE_SIZE, &path.0).unwrap();
+
+        for page_id in 0..3 {
+            let page = bpm.fetch_page(page_id).unwrap();
+
+            assert_eq!(page.data()[PAGE_TYPE_OFFSET], 3 + page_id as u8);
+        }
     }
 
     #[test]

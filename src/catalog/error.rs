@@ -3,7 +3,6 @@ use std::fmt;
 use crate::storage::buffer_pool::BufferPoolError;
 use crate::storage::heap_file::HeapFileError;
 use crate::table::schema::prefix_within;
-use crate::table::table_heap::{buffer_pool_sqlstate, heap_sqlstate};
 use crate::table::{SchemaError, TableError};
 
 #[derive(Debug)]
@@ -53,8 +52,8 @@ impl CatalogError {
             CatalogError::NotADatabase { .. }
             | CatalogError::Corrupted { .. }
             | CatalogError::CorruptedSchema { .. } => "XX001",
-            CatalogError::Heap(err) => heap_sqlstate(err),
-            CatalogError::BufferPool(err) => buffer_pool_sqlstate(err),
+            CatalogError::Heap(err) => err.sqlstate(),
+            CatalogError::BufferPool(err) => err.sqlstate(),
             CatalogError::Table(err) => err.sqlstate(),
         }
     }

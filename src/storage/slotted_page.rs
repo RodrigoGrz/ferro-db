@@ -124,7 +124,10 @@ impl<B: AsRef<[u8]>> SlottedPage<B> {
         match PageHeader::read(data.as_ref())?.page_type {
             PageType::Free => return Err(SlottedPageError::Uninitialized),
             PageType::Slotted => {}
-            found @ PageType::DatabaseHeader => {
+            found @ (PageType::DatabaseHeader
+            | PageType::BPlusTreeHeader
+            | PageType::BPlusTreeNode
+            | PageType::BPlusTreeFree) => {
                 return Err(SlottedPageError::WrongPageType { found });
             }
         }
@@ -546,6 +549,19 @@ mod tests {
         assert_eq!(get_u16(&page.data, 18), (SMALL - 3) as u16);
         assert_eq!(get_u16(&page.data, HEADER_SIZE), (SMALL - 3) as u16);
         assert_eq!(get_u16(&page.data, HEADER_SIZE + 2), 3);
+    }
+
+    #[test]
+    fn new_on_a_page_of_the_b_plus_tree_should_fail() {
+        for value in 3..=5 {
+            let mut page = empty(SMALL);
+            page.data[PAGE_TYPE_OFFSET] = value;
+
+            let err = SlottedPage::new(page.data).unwrap_err();
+
+            let found = PageType::try_from(value).unwrap();
+            assert_eq!(err, SlottedPageError::WrongPageType { found });
+        }
     }
 
     #[test]

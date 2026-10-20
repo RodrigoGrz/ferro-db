@@ -85,7 +85,7 @@ pub struct BufferPoolManager {
 
 **Fail without side effects.** Installing a page only *peeks* at the frame it will use (`free_list.last()`, `replacer.select_victim()`); the free list, the replacer and the page table are updated only after the read, the checksum, the header check, the write-back and the load have all succeeded. A failure at any step leaves the pool unchanged and usable.
 
-**Errors:** `BufferPoolError` (`InvalidPoolSize`, `InvalidPageSize`, `NoAvailableFrame`, `PageIdOverflow`, `ChecksumMismatch { page_id }`, `Disk(..)`, `Page(..)`).
+**Errors:** `BufferPoolError` (`InvalidPoolSize`, `InvalidPageSize`, `NoAvailableFrame`, `PageIdOverflow`, `ChecksumMismatch { page_id }`, `Disk(..)`, `Page(..)`). `BufferPoolError::sqlstate()` gives the code the upper layers report, the same in every layer: damaged bytes (`ChecksumMismatch`, `Page(..)`, a torn file) are `XX001`, other disk errors `58030`, `NoAvailableFrame` `53000`, `PageIdOverflow` `54000`, an invalid configuration `XX000`. `HeapFileError::sqlstate()` builds on it (`TupleTooLarge` `54000`, a damaged page list or page `XX001`, a `Rid` outside the heap `XX000`).
 
 **Not supported yet:** concurrent access (every operation takes `&mut self`), and RAII pin guards (callers must pair every fetch with an unpin; the heap file does this through helpers that unpin on every path).
 
@@ -129,12 +129,12 @@ Every page starts with a 16-byte header understood by the buffer pool, independe
 |---|---|---|
 | `0..8` | LSN (`u64`) | reserved for the WAL / recovery; preserved, not assigned yet |
 | `8..12` | checksum (`u32`) | CRC32 of the page computed with this field set to zero |
-| `12` | page_type (`u8`) | `0` Free (never formatted), `1` Slotted, `2` DatabaseHeader (page 0 only, see [catalog](data-model.md#catalog)) |
+| `12` | page_type (`u8`) | `0` Free (never formatted), `1` Slotted, `2` DatabaseHeader (page 0 only, see [catalog](data-model.md#catalog)), `3` BPlusTreeHeader, `4` BPlusTreeNode, `5` BPlusTreeFree (see [indexes](indexes.md#page-formats)) |
 | `13` | version (`u8`) | `PAGE_FORMAT_VERSION` (currently `1`) |
 | `14..16` | reserved | zero |
 
 ```rust
-pub enum PageType { Free = 0, Slotted = 1, DatabaseHeader = 2 }
+pub enum PageType { Free = 0, Slotted = 1, DatabaseHeader = 2, BPlusTreeHeader = 3, BPlusTreeNode = 4, BPlusTreeFree = 5 }
 
 pub struct PageHeader { pub lsn: u64, pub checksum: u32, pub page_type: PageType, pub version: u8 }
 ```
@@ -144,7 +144,7 @@ pub struct PageHeader { pub lsn: u64, pub checksum: u32, pub page_type: PageType
 - An **all-zero** page is accepted without a checksum: it is a new page (`PageType::Free`) that was never written.
 - `PageHeader::read(page)`: decodes and validates. Unknown type → `PageError::Serialization(InvalidValue { field: "page_type", .. })`; formatted page with a version ≠ `PAGE_FORMAT_VERSION` → `PageError::UnsupportedVersion`. A `Free` page has no version check.
 - `PageHeader::format(page, page_type)`: writes the type, the current version and zeroes the reserved bytes, **keeping the LSN and the checksum**.
-- `SlottedPage::init` calls `format(.., Slotted)`. `SlottedPage::new` rejects a `Free` page (`Uninitialized`), an invalid header (`SlottedPageError::InvalidHeader`) and a page of another formatted type (`DatabaseHeader` → `WrongPageType`). The `match` on `PageType` is exhaustive, so every new page type forces that decision.
+- `SlottedPage::init` calls `format(.., Slotted)`. `SlottedPage::new` rejects a `Free` page (`Uninitialized`), an invalid header (`SlottedPageError::InvalidHeader`) and a page of another formatted type (`DatabaseHeader` or a B+Tree page → `WrongPageType`). The `match` on `PageType` is exhaustive, so every new page type forces that decision.
 
 The checksum detects accidental corruption (bad sectors, partial writes). It is not a security mechanism: anyone who can modify the file can recompute it.
 

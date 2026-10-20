@@ -53,6 +53,23 @@ pub enum HeapFileError {
     },
 }
 
+impl HeapFileError {
+    /// Shared by every layer that wraps a heap error, so the same failure always gets the
+    /// same code.
+    pub fn sqlstate(&self) -> &'static str {
+        match self {
+            HeapFileError::BufferPool(err) => err.sqlstate(),
+            // The row fits its types but not a page: a limit of the system, not of the data.
+            HeapFileError::TupleTooLarge { .. } => "54000",
+            HeapFileError::CorruptedChain { .. } | HeapFileError::Page { .. } => "XX001",
+            // A `Rid` of another table or of a deleted row: a mistake of the caller.
+            HeapFileError::TupleNotFound { .. }
+            | HeapFileError::PageNotInHeap { .. }
+            | HeapFileError::UnsupportedPageSize { .. } => "XX000",
+        }
+    }
+}
+
 impl fmt::Display for HeapFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
