@@ -52,8 +52,8 @@ When an item is finished, mark it here in the same change that adds the code, an
 ## Indexes
 
 - [x] B+Tree: unique keys of any type (text included) to `Rid`, order-preserving key encoding, variable-size nodes with split, merge and redistribution by bytes, a free list for freed pages ([`src/index/`](src/index/), [`tests/index_b_plus_tree.rs`](tests/index_b_plus_tree.rs), [docs](docs/indexes.md))
-- [ ] Index Scan
-- [ ] Range Scan. `BPlusTree::range` iterates the keys within bounds; there is no scan operator yet (see also Query Execution).
+- [x] Index Scan: the `IndexScan` executor reads a table through a B+Tree, fetching each row by `Rid` ([`scan.rs`](src/execution/scan.rs), [`tests/execution_index_scan.rs`](tests/execution_index_scan.rs), [docs](docs/execution.md#index-scan)). The operator is under Query Execution.
+- [x] Range Scan: `BPlusTree::range` and `IndexScan` over inclusive, exclusive and open bounds, converted to the key type ([`key_bounds.rs`](src/execution/key_bounds.rs), [`b_plus_tree.rs`](src/index/b_plus_tree.rs), [docs](docs/execution.md#bounds-in-the-keys-type))
 - [ ] Unique Index. Every index is unique, and the Insert and Update executors refuse a repeated key (`23505`); there is no `CREATE UNIQUE INDEX` statement yet.
 - [ ] Composite Index
 
@@ -74,7 +74,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 ## Query Execution
 
 - [x] Sequential Scan: iterator-model `SeqScan` with a heap cursor ([`scan.rs`](src/execution/scan.rs), [`tests/execution_executors.rs`](tests/execution_executors.rs), [docs](docs/execution.md))
-- [ ] Index Scan
+- [x] Index Scan: iterator-model `IndexScan` by point or range, in key order, with the last key as cursor ([`scan.rs`](src/execution/scan.rs), [`tests/execution_index_scan.rs`](tests/execution_index_scan.rs), [docs](docs/execution.md#index-scan))
 - [x] Filter: keeps the rows whose predicate is TRUE, over expressions with SQL semantics ([`filter.rs`](src/execution/filter.rs), [`expression.rs`](src/execution/expression.rs))
 - [x] Projection ([`projection.rs`](src/execution/projection.rs)). Insert, Update and Delete executors also exist ([`modify.rs`](src/execution/modify.rs))
 - [ ] Sort

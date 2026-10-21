@@ -22,7 +22,7 @@ flowchart TD
     end
 
     subgraph execution["Query execution"]
-        exec["Executors + Expr<br/>src/execution/<br/>scan, filter, projection, insert, update, delete"]
+        exec["Executors + Expr<br/>src/execution/<br/>seq and index scan, filter, projection, insert, update, delete"]
     end
 
     subgraph storage["Storage engine (src/storage/)"]
@@ -129,6 +129,12 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 2. `SeqScan` asks `TableHeap::next_after(last_rid)` for one row at a time: the heap reads the page, copies the next live tuple, unpins the page and the schema decodes it.
 3. `Filter` evaluates its predicate (`Expr::eval`) and passes the row on only when the result is TRUE; `Projection` computes its expressions over the row.
 
+### Reading through an index
+
+1. On its first call, `IndexScan` evaluates its bounds, finds the index and its table in the catalog and converts each bound to the key's type; a bound that empties the range ends the scan without touching the tree.
+2. Each call asks `BPlusTree::range(Excluded(last key), upper)` for its first entry: the tree goes down from the root to the leaf, copies it, unpins it and hands out the entry. The iterator is dropped, so no page stays pinned.
+3. `TableHeap::get(rid)` fetches the row, and the scan remembers its key as the new cursor. Rows come out in key order.
+
 ### Changing rows
 
 1. Insert, Update and Delete first read all of their child's rows.
@@ -162,5 +168,5 @@ These are verified properties of the current code, not bugs to be fixed in passi
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.
 - **Limited types.** Only `SMALLINT`, `INTEGER`, `BIGINT`, `REAL`, `DOUBLE PRECISION`, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`. Text compares by UTF-8 bytes and a value must fit in one page. The catalog still uses its own record format instead of system tables.
-- **No `DROP TABLE` and no constraints** other than per-column `NOT NULL`. Indexes are created by the catalog but not kept in step with later changes to their table yet, and hold unique keys of one column only.
+- **No `DROP TABLE` and no constraints** other than per-column `NOT NULL`. Indexes are created by the catalog and kept in step by the executors only (not by writes through `TableHeap`), and hold unique keys of one column only.
 - **Formats are not stable.** Page and catalog formats have changed during development without migrations; database files are disposable.

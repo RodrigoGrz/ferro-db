@@ -2,7 +2,7 @@
 
 This document is the authoritative description of ferroDB's index layer (`src/index/`): the B+Tree, its key encoding and page formats, operations, error handling and tests. Page headers, the buffer pool and the other storage formats are in [storage-engine.md](storage-engine.md); SQL types are in [data-model.md](data-model.md).
 
-Dependencies point downward: `index` → `types` (keys are `Value`s of a `DataType`) and `storage` (pages). The catalog creates indexes on table columns and keeps their trees open ([Catalog](data-model.md#catalog)); keeping an index in step with changes to its table is the job of the executors, the next step.
+Dependencies point downward: `index` → `types` (keys are `Value`s of a `DataType`) and `storage` (pages). The catalog creates indexes on table columns and keeps their trees open ([Catalog](data-model.md#catalog)); keeping an index in step with changes to its table is the job of the executors, and the `IndexScan` executor reads tables through it ([execution.md](execution.md#index-scan)).
 
 - [B+Tree](#btree)
 - [Keys](#keys)
@@ -53,7 +53,7 @@ The tree is identified by its **header page**, which points to the root. The roo
 - Two's complement sorts negative numbers after positive ones; flipping the sign bit moves them first. IEEE floats are sign + magnitude; flipping every bit of a negative one also reverses its magnitude order.
 - Floats are finite and never `-0.0` (`Finite32`/`Finite64` normalize it), so equal values have equal bytes.
 - Text compares by bytes without padding (`'a' < 'a '`), the order of the rest of ferroDB ([ADR 0008](decisions/0008-varchar-utf8-byte-order-and-assignment.md)).
-- A key must already be of the tree's type (`KeyTypeMismatch` otherwise): converting, for example a `SMALLINT` literal for an `INTEGER` index, is the caller's job. A `VARCHAR(n)` tree accepts any text; *n* belongs to the column.
+- A key must already be of the tree's type (`KeyTypeMismatch` otherwise): converting, for example a `SMALLINT` literal for an `INTEGER` index, is the caller's job (the `IndexScan` converts its bounds, [execution.md](execution.md#bounds-in-the-keys-type)). A `VARCHAR(n)` tree accepts any text; *n* belongs to the column.
 - `NULL` is never a key (`NullKey`): the index of a table will skip rows whose key is `NULL`.
 - Decoding (for range results) never trusts the bytes: a wrong size, a boolean other than `0`/`1`, a date or timestamp out of range, a non-finite float, `-0.0` or invalid UTF-8 is `Corrupted`.
 
@@ -166,7 +166,7 @@ See [ADR 0010](decisions/0010-b-plus-tree-variable-nodes-and-late-writes.md) for
 
 ## Limitations
 
-- ⚠️ **Maintained by the executors only:** `Catalog::create_index` fills a tree with a table's rows, and the Insert, Update and Delete executors keep it in step, checking keys first with `check_key` and `get` ([execution.md](execution.md#writing-two-phases)); writing through `TableHeap` directly does not. There is no `CREATE INDEX` statement and no index scan yet.
+- ⚠️ **Maintained by the executors only:** `Catalog::create_index` fills a tree with a table's rows, and the Insert, Update and Delete executors keep it in step, checking keys first with `check_key` and `get` ([execution.md](execution.md#writing-two-phases)); writing through `TableHeap` directly does not. There is no `CREATE INDEX` statement yet.
 - ⚠️ **Unique keys only**, of a single column. No composite keys, no `NULL`.
 - ⚠️ **No crash atomicity:** the commit step copies several pages into the buffer pool, which writes them to disk in any order; a crash in between can leave the tree inconsistent on disk. The WAL will fix it.
 - ⚠️ **Single-threaded:** no latches (no *latch crabbing*); every operation takes `&mut BufferPoolManager`.

@@ -359,6 +359,11 @@ impl Catalog {
         find_index(&self.indexes, name)
     }
 
+    /// The table the index belongs to.
+    pub fn index_table(&self, name: &str) -> Result<&TableInfo, CatalogError> {
+        table_of(&self.tables, find_index(&self.indexes, name)?)
+    }
+
     /// The indexes of a table, in creation order: the ones a change to the table must update.
     pub fn table_indexes(&self, table: &str) -> Result<Vec<&IndexInfo>, CatalogError> {
         let table_id = self.table(table)?.id;
@@ -379,11 +384,10 @@ impl Catalog {
         let tree = match self.open_indexes.entry(index.id) {
             Entry::Occupied(open) => open.into_mut(),
             Entry::Vacant(closed) => {
-                let key_type = self
-                    .tables
-                    .iter()
-                    .find(|table| table.id == index.table_id)
-                    .and_then(|table| table.schema.columns().get(usize::from(index.column)))
+                let key_type = table_of(&self.tables, index)?
+                    .schema
+                    .columns()
+                    .get(usize::from(index.column))
                     .map(|column| column.data_type)
                     .ok_or(CatalogError::Corrupted {
                         reason: "an index points to a column that does not exist",
@@ -444,6 +448,15 @@ fn find_table<'a>(tables: &'a [TableInfo], name: &str) -> Result<&'a TableInfo, 
         .find(|table| table.name == name)
         .ok_or_else(|| CatalogError::UndefinedTable {
             name: name.to_string(),
+        })
+}
+
+fn table_of<'a>(tables: &'a [TableInfo], index: &IndexInfo) -> Result<&'a TableInfo, CatalogError> {
+    tables
+        .iter()
+        .find(|table| table.id == index.table_id)
+        .ok_or(CatalogError::Corrupted {
+            reason: "an index points to a table that does not exist",
         })
 }
 
@@ -1560,6 +1573,23 @@ mod tests {
             DataType::SmallInt
         );
         assert!(matches!(missing, CatalogError::UndefinedIndex { .. }));
+    }
+
+    #[test]
+    fn index_table_should_return_the_table_of_the_index() {
+        let mut pool = TestPool::new(16);
+        let mut catalog = Catalog::open(pool.bpm()).unwrap();
+        accounts_with_rows(&mut pool, &mut catalog, 10);
+        catalog
+            .create_index(pool.bpm(), "accounts_age", "accounts", "age")
+            .unwrap();
+
+        let table = catalog.index_table("accounts_age").unwrap();
+        let missing = catalog.index_table("nope").unwrap_err();
+
+        assert_eq!(table.name, "accounts");
+        assert!(matches!(missing, CatalogError::UndefinedIndex { .. }));
+        assert_eq!(missing.sqlstate(), "42704");
     }
 
     #[test]

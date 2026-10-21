@@ -758,7 +758,7 @@ Names have 1 to 63 bytes of UTF-8. Decoding rejects unknown types or flags (`0` 
   7. only then adds the index to the in-memory catalog and keeps its tree open.
 
   A failure in 3–6 leaves no index (not even after reopening) and the name free. The id is consumed for the rest of the session; since a failed index leaves no entry behind, the id can come back after reopening without risk (unlike a table id, whose failed creation can leave orphan columns). Every index is **unique**, because the B+Tree only holds unique keys, and `NULL` keys stay out of it, as several `NULL`s are allowed by `UNIQUE`.
-- **`index(name)` / `indexes()` / `table_indexes(table)`:** in-memory lookups (`UndefinedIndex`, `42704`); `table_indexes` lists a table's indexes in creation order, the ones a change to the table will have to update.
+- **`index(name)` / `indexes()` / `index_table(name)` / `table_indexes(table)`:** in-memory lookups (`UndefinedIndex`, `42704`); `index_table` is the table an index belongs to; `table_indexes` lists a table's indexes in creation order, the ones a change to the table will have to update.
 - **`index_tree(bpm, name)`:** the index's `BPlusTree`, opened on first use with the column's type (which `BPlusTree::open` checks against the type recorded in the tree) and returned as the same handle afterwards.
 - **`table(name)` / `tables()`:** in-memory lookups, no I/O. `tables()` is in creation order. Names are compared byte by byte (`users` ≠ `USERS`), like columns.
 - **`table_heap(bpm, name)`:** the table's [`TableHeap`](#table-heap). The first call opens it (`HeapFile::open` walks its pages); every later call returns the same handle, without I/O. An unknown name → `UndefinedTable`.
@@ -855,6 +855,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Approximate to exact in assignment | allowed, with the `CAST` rules | rejected (`42804`); only an explicit `CAST` rounds (decided with the author; PostgreSQL accepts, rounding) |
 | Exact vs. approximate comparison | by algebraic value | exact, as the standard (PostgreSQL converts the integer to `float8`) |
 | `MOD` with approximate numbers | not defined | `%` with a float → `42883` |
+| Index Scan bounds of another type | `WHERE int_col < 2.5` compares across numeric types | an `IndexScan` takes bounds that store assignment accepts for the key type (an integer of any width, an integer or a `DOUBLE PRECISION` for a float key, a `DATE` for a `TIMESTAMP` key, any text for a `VARCHAR` key), adjusting a bound the key type rounds or cannot hold so that it admits the same rows as the comparison; a `REAL` for an `INTEGER` key or a `TIMESTAMP` for a `DATE` key is `42804`, and the planner will use a `Filter` for those ([execution.md](execution.md#bounds-in-the-keys-type)) |
 | Atomicity of a statement | a statement that fails has no effect | met for errors on data and constraints (the executors validate the whole statement before writing); an I/O failure while writing can leave a statement half done until there is a WAL |
 | `CAST` of a float to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like integers |
 | Arithmetic on dates | through an interval type (`DATE + INTERVAL '30' DAY`) | `DATE ± integer` and `DATE - DATE` in days, as PostgreSQL (decided with the author); no interval type |

@@ -358,7 +358,7 @@ mod tests {
     use super::*;
     use crate::execution::Expr;
     use crate::execution::test_support::TestDb;
-    use crate::execution::{SeqScan, Values, execute};
+    use crate::execution::{IndexScan, SeqScan, Values, execute};
     use crate::table::{Column, Schema};
     use crate::types::{DataType, Value};
     use std::num::NonZeroU16;
@@ -1238,6 +1238,80 @@ mod tests {
             assert_eq!(err.sqlstate(), "XX000", "{err:?}");
         }
         assert_eq!(snapshot(&mut db), before);
+    }
+
+    fn int(value: i32) -> Expr {
+        Expr::Literal(Value::Integer(value))
+    }
+
+    fn integer_ids(db: &mut TestDb) -> Vec<i32> {
+        let mut ids: Vec<i32> = ids(db)
+            .into_iter()
+            .map(|id| match id {
+                Value::Integer(id) => id,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn delete_through_an_index_scan_should_remove_the_rows_in_the_range() {
+        let mut db = five_accounts();
+        let scan = IndexScan::new(
+            "accounts_id",
+            Bound::Included(int(2)),
+            Bound::Excluded(int(4)),
+        );
+
+        let deleted = execute(&mut Delete::new("accounts", Box::new(scan)), &mut db.ctx()).unwrap();
+
+        assert_eq!(count(deleted), 2);
+        assert_eq!(integer_ids(&mut db), [1, 4, 5]);
+        assert_indexes_match_table(&mut db);
+    }
+
+    #[test]
+    fn update_through_an_index_scan_should_set_the_row_of_the_key() {
+        let mut db = five_accounts();
+        let scan = IndexScan::point("accounts_email", text_expr("c@x"));
+
+        let updated = execute(
+            &mut Update::new("accounts", Box::new(scan), vec![set(1, text_expr("new@x"))]),
+            &mut db.ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(count(updated), 1);
+        let email_of_3 = db
+            .stored_rows("accounts")
+            .into_iter()
+            .find(|row| row.values[0] == Value::Integer(3))
+            .map(|row| row.values[1].clone());
+        assert_eq!(email_of_3, Some(Value::Text("new@x".to_string())));
+        assert_indexes_match_table(&mut db);
+    }
+
+    #[test]
+    fn update_of_the_scanned_key_should_change_each_row_once() {
+        // `SET id = id + 10 WHERE id >= 5` read through the index of `id`: a scan interleaved
+        // with the writes would meet each moved key again further on.
+        let rows: Vec<(i32, Option<&str>, &str)> = (1..=30).map(|id| (id, None, "n")).collect();
+        let mut db = accounts_db(&rows);
+        let scan = IndexScan::new("accounts_id", Bound::Included(int(5)), Bound::Unbounded);
+        let plus_ten = Expr::binary(crate::execution::BinaryOp::Add, Expr::Column(0), int(10));
+
+        let updated = execute(
+            &mut Update::new("accounts", Box::new(scan), vec![set(0, plus_ten)]),
+            &mut db.ctx(),
+        )
+        .unwrap();
+
+        assert_eq!(count(updated), 26);
+        let expected: Vec<i32> = (1..=4).chain(15..=40).collect();
+        assert_eq!(integer_ids(&mut db), expected);
+        assert_indexes_match_table(&mut db);
     }
 
     #[test]
