@@ -7,6 +7,7 @@ use std::fmt;
 use crate::storage::buffer_pool::BufferPoolManager;
 use crate::storage::heap_file::{HeapFile, HeapFileError, HeapScan};
 use crate::storage::rid::Rid;
+use crate::storage::slotted_page::max_tuple_size_for;
 use crate::types::Value;
 
 use super::{Schema, SchemaError};
@@ -42,6 +43,23 @@ impl TableHeap {
         self.heap.first_page_id()
     }
 
+    /// The row as `insert` would store it (in the column types), checked against everything
+    /// `insert` checks, sizes included, without writing anything: lets a caller validate a
+    /// whole statement before its first write.
+    pub fn prepare(
+        &self,
+        bpm: &BufferPoolManager,
+        row: &[Value],
+    ) -> Result<Vec<Value>, TableError> {
+        let assigned = self.schema.assign_row(row)?;
+        let size = self.schema.encode_row(&assigned)?.len();
+        let max = max_tuple_size_for(bpm.page_size());
+        if size > max {
+            return Err(TableError::Heap(HeapFileError::TupleTooLarge { size, max }));
+        }
+        Ok(assigned)
+    }
+
     /// Store assignment first (`Schema::encode_row`), so a rejected row writes nothing.
     pub fn insert(
         &mut self,
@@ -72,6 +90,19 @@ impl TableHeap {
         TableScan {
             schema: &self.schema,
             rows: self.heap.scan(bpm),
+        }
+    }
+
+    /// The next row after `after` (or the first), decoded: a cursor that holds no pin between
+    /// calls, for executors that read one row at a time.
+    pub fn next_after(
+        &self,
+        bpm: &mut BufferPoolManager,
+        after: Option<Rid>,
+    ) -> Result<Option<(Rid, Vec<Value>)>, TableError> {
+        match self.heap.next_after(bpm, after)? {
+            None => Ok(None),
+            Some((rid, tuple)) => Ok(Some((rid, self.schema.decode_row(&tuple)?))),
         }
     }
 
@@ -252,6 +283,52 @@ mod tests {
         let rid = table.insert(pool.bpm(), &row).unwrap();
 
         assert_eq!(table.get(pool.bpm(), rid).unwrap(), row);
+    }
+
+    #[test]
+    fn prepare_should_return_the_assigned_row_and_write_nothing() {
+        let mut pool = TestPool::new(4);
+        let table = TableHeap::create(pool.bpm(), accounts()).unwrap();
+        let name = format!("{}   ", "a".repeat(20));
+
+        let prepared = table
+            .prepare(pool.bpm(), &[Value::SmallInt(7), Value::Null, text(&name)])
+            .unwrap();
+
+        assert_eq!(
+            prepared,
+            [Value::Integer(7), Value::Null, text(&"a".repeat(20))]
+        );
+        assert_eq!(stored_tuples(&mut pool, &table), 0);
+    }
+
+    #[test]
+    fn prepare_should_refuse_what_insert_refuses() {
+        let mut pool = TestPool::new(4);
+        let notes = Schema::new(vec![Column::new(
+            "body",
+            DataType::Varchar(std::num::NonZeroU16::new(1_000).unwrap()),
+        )])
+        .unwrap();
+        let table = TableHeap::create(pool.bpm(), notes).unwrap();
+
+        let too_large = table
+            .prepare(pool.bpm(), &[text(&"x".repeat(600))])
+            .unwrap_err();
+        let null_fits = table.prepare(pool.bpm(), &[Value::Null]).unwrap();
+        let wrong_type = table.prepare(pool.bpm(), &[Value::Integer(1)]).unwrap_err();
+
+        assert!(
+            matches!(
+                too_large,
+                TableError::Heap(HeapFileError::TupleTooLarge { .. })
+            ),
+            "{too_large:?}"
+        );
+        assert_eq!(too_large.sqlstate(), "54000");
+        assert_eq!(null_fits, [Value::Null]);
+        assert_eq!(wrong_type.sqlstate(), "42804");
+        assert_eq!(stored_tuples(&mut pool, &table), 0);
     }
 
     #[test]
@@ -449,6 +526,42 @@ mod tests {
             .collect();
         rows.sort_by(|lhs, rhs| lhs[0].sort_cmp(&rhs[0]));
         rows
+    }
+
+    #[test]
+    fn next_after_should_walk_the_rows_like_scan() {
+        let mut pool = TestPool::new(2);
+        let mut table = TableHeap::create(pool.bpm(), accounts()).unwrap();
+        for id in 0..40 {
+            table.insert(pool.bpm(), &tiny_row(id)).unwrap();
+        }
+        let scanned: Vec<(Rid, Vec<Value>)> =
+            table.scan(pool.bpm()).map(|entry| entry.unwrap()).collect();
+
+        let mut walked = Vec::new();
+        let mut after = None;
+        while let Some((rid, row)) = table.next_after(pool.bpm(), after).unwrap() {
+            walked.push((rid, row));
+            after = Some(rid);
+        }
+
+        assert_eq!(walked, scanned);
+        assert!(table.heap.page_count() > 1);
+    }
+
+    #[test]
+    fn next_after_should_report_a_row_that_does_not_decode() {
+        let mut pool = TestPool::new(4);
+        let mut table = TableHeap::create(pool.bpm(), accounts()).unwrap();
+        let other = Schema::new(vec![Column::new("x", DataType::Integer)]).unwrap();
+        table
+            .heap
+            .insert(pool.bpm(), &other.encode_row(&[Value::Integer(9)]).unwrap())
+            .unwrap();
+
+        let err = table.next_after(pool.bpm(), None).unwrap_err();
+
+        assert_eq!(err.sqlstate(), "XX001");
     }
 
     #[test]

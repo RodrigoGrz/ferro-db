@@ -180,13 +180,7 @@ impl BPlusTree {
         key: &Value,
         rid: Rid,
     ) -> Result<(), IndexError> {
-        let encoded = encode_key(self.key_type, key)?;
-        if encoded.len() > self.max_key_size {
-            return Err(IndexError::KeyTooLarge {
-                size: encoded.len(),
-                max: self.max_key_size,
-            });
-        }
+        let encoded = self.insertable_key(key)?;
         let LeafLookup {
             path,
             leaf_id,
@@ -195,9 +189,7 @@ impl BPlusTree {
             position,
         } = self.find_in_leaf(bpm, &encoded)?;
         let Err(position) = position else {
-            return Err(IndexError::DuplicateKey {
-                key: shown_key(key),
-            });
+            return Err(IndexError::duplicate_key(key));
         };
         entries.insert(position, LeafEntry { key: encoded, rid });
         let leaf = Node::Leaf { next, entries };
@@ -216,6 +208,24 @@ impl BPlusTree {
             self.root_page_id = root_page_id;
         }
         Ok(())
+    }
+
+    /// Whether `key` could be inserted, without reading a page: not `NULL`, of the tree's
+    /// type and not longer than `max_key_size`. A caller can check a whole batch before its
+    /// first change.
+    pub fn check_key(&self, key: &Value) -> Result<(), IndexError> {
+        self.insertable_key(key).map(|_| ())
+    }
+
+    fn insertable_key(&self, key: &Value) -> Result<Vec<u8>, IndexError> {
+        let encoded = encode_key(self.key_type, key)?;
+        if encoded.len() > self.max_key_size {
+            return Err(IndexError::KeyTooLarge {
+                size: encoded.len(),
+                max: self.max_key_size,
+            });
+        }
+        Ok(encoded)
     }
 
     /// The removed `Rid`, or `None` when the key was not there (a key too large for the tree
@@ -609,17 +619,6 @@ struct LeafLookup {
     next: u32,
     entries: Vec<LeafEntry>,
     position: Result<usize, usize>,
-}
-
-/// The key as an error message shows it: long text is cut, so a 2 KB key does not make a 2 KB
-/// message.
-fn shown_key(key: &Value) -> String {
-    const MAX_SHOWN_CHARS: usize = 64;
-    let text = key.to_string();
-    match text.char_indices().nth(MAX_SHOWN_CHARS) {
-        Some((cut, _)) => format!("{}…", text.get(..cut).unwrap_or_default()),
-        None => text,
-    }
 }
 
 /// One node of a descent and which of its children the descent took (`0` = the first child).
@@ -1313,6 +1312,30 @@ mod tests {
             matches!(&err, IndexError::DuplicateKey { key } if *key == shown),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn check_key_should_refuse_what_insert_refuses_without_changing_anything() {
+        let mut pool = TestPool::new(4);
+        let tree = BPlusTree::create(pool.bpm(), DataType::VARCHAR_MAX).unwrap();
+        let before = pool.page_bytes(tree.root_page_id);
+
+        let largest = tree.check_key(&Value::Text("x".repeat(111)));
+        let too_large = tree.check_key(&Value::Text("x".repeat(112))).unwrap_err();
+        let null = tree.check_key(&Value::Null).unwrap_err();
+        let mismatch = tree.check_key(&Value::Integer(1)).unwrap_err();
+
+        assert!(largest.is_ok());
+        assert!(matches!(
+            too_large,
+            IndexError::KeyTooLarge {
+                size: 112,
+                max: 111
+            }
+        ));
+        assert!(matches!(null, IndexError::NullKey));
+        assert!(matches!(mismatch, IndexError::KeyTypeMismatch { .. }));
+        assert_eq!(pool.page_bytes(tree.root_page_id), before);
     }
 
     #[test]

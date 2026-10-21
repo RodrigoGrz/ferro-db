@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::storage::buffer_pool::BufferPoolError;
-use crate::types::DataType;
+use crate::types::{DataType, Value};
 
 #[derive(Debug)]
 pub enum IndexError {
@@ -34,6 +34,18 @@ pub enum IndexError {
 }
 
 impl IndexError {
+    /// `DuplicateKey` for `key`, shown cut at 64 characters: a 2 KB key does not make a 2 KB
+    /// message. For callers that find a repeated key before asking the tree.
+    pub fn duplicate_key(key: &Value) -> IndexError {
+        const MAX_SHOWN_CHARS: usize = 64;
+        let text = key.to_string();
+        let key = match text.char_indices().nth(MAX_SHOWN_CHARS) {
+            Some((cut, _)) => format!("{}…", text.get(..cut).unwrap_or_default()),
+            None => text,
+        };
+        IndexError::DuplicateKey { key }
+    }
+
     pub fn sqlstate(&self) -> &'static str {
         match self {
             IndexError::DuplicateKey { .. } => "23505",
@@ -156,6 +168,19 @@ mod tests {
                 true,
             ),
         ]
+    }
+
+    #[test]
+    fn duplicate_key_should_show_a_long_key_cut() {
+        let short = IndexError::duplicate_key(&Value::Integer(7));
+        let long = IndexError::duplicate_key(&Value::Text("x".repeat(100)));
+
+        assert!(matches!(&short, IndexError::DuplicateKey { key } if key == "7"));
+        let shown = format!("{}…", "x".repeat(64));
+        assert!(
+            matches!(&long, IndexError::DuplicateKey { key } if *key == shown),
+            "{long:?}"
+        );
     }
 
     #[test]

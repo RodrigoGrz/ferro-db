@@ -203,21 +203,30 @@ impl Schema {
         self.layout.min_tuple_size()
     }
 
-    /// Store assignment: each value is assigned to its column type and NULL is rejected in
-    /// NOT NULL columns, all before the tuple is built.
-    pub fn encode_row(&self, row: &[Value]) -> Result<Vec<u8>, SchemaError> {
+    /// Store assignment without building the tuple: the values in the column types, or the
+    /// first error in column order (arity, NOT NULL, a value the column cannot take).
+    pub fn assign_row(&self, row: &[Value]) -> Result<Vec<Value>, SchemaError> {
         if row.len() != self.columns.len() {
             return Err(SchemaError::ColumnCountMismatch {
                 expected: self.columns.len(),
                 actual: row.len(),
             });
         }
-        let fields = self
-            .columns
+        self.columns
             .iter()
             .zip(row)
-            .map(|(column, value)| assign(column, value).map(Value::into_encoded))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(column, value)| assign(column, value))
+            .collect()
+    }
+
+    /// Store assignment: each value is assigned to its column type and NULL is rejected in
+    /// NOT NULL columns, all before the tuple is built.
+    pub fn encode_row(&self, row: &[Value]) -> Result<Vec<u8>, SchemaError> {
+        let fields: Vec<Option<Vec<u8>>> = self
+            .assign_row(row)?
+            .into_iter()
+            .map(Value::into_encoded)
+            .collect();
         let borrowed: Vec<Option<&[u8]>> = fields.iter().map(Option::as_deref).collect();
         // Every value is valid here, so a tuple the layout refuses is too large, not corrupted.
         self.layout.encode(&borrowed).map_err(|err| match err {
@@ -771,6 +780,41 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Text(value.to_string())
+    }
+
+    #[test]
+    fn assign_row_should_return_the_values_in_the_column_types() {
+        let schema = profiles();
+
+        let assigned = schema
+            .assign_row(&[Value::SmallInt(7), text("maria   ")])
+            .unwrap();
+
+        assert_eq!(assigned, [Value::Integer(7), text("maria")]);
+        assert_eq!(
+            schema
+                .assign_row(&[Value::Integer(1), Value::Null])
+                .unwrap(),
+            [Value::Integer(1), Value::Null]
+        );
+    }
+
+    #[test]
+    fn assign_row_should_report_the_first_error_in_column_order() {
+        let schema = profiles();
+        let cases = [
+            (vec![Value::Integer(1)], "42601"),
+            (vec![Value::Null, text("x")], "23502"),
+            (vec![text("1"), text("x")], "42804"),
+            (vec![Value::Integer(1), text("marias")], "22001"),
+            (vec![Value::BigInt(1 << 40), text("marias")], "22003"),
+        ];
+
+        for (row, sqlstate) in cases {
+            let err = schema.assign_row(&row).unwrap_err();
+
+            assert_eq!(err.sqlstate(), sqlstate, "{row:?}");
+        }
     }
 
     #[test]

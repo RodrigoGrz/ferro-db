@@ -358,6 +358,34 @@ impl HeapFile {
         }
     }
 
+    /// The first live tuple after `after` (or the first of the heap), in `scan` order. Each
+    /// call reads and unpins its pages, so a cursor holds no pin between calls; `after` may
+    /// be a tuple deleted since.
+    pub fn next_after(
+        &self,
+        bpm: &mut BufferPoolManager,
+        after: Option<Rid>,
+    ) -> Result<Option<(Rid, Vec<u8>)>, HeapFileError> {
+        let (mut page_index, mut after_slot) = match after {
+            None => (0, None),
+            Some(rid) => (self.index_of(rid.page_id)?, Some(rid.slot_id)),
+        };
+        while let Some(&page_id) = self.page_ids.get(page_index) {
+            let found = read_page(bpm, page_id, |page| {
+                Ok(page
+                    .iter()
+                    .find(|&(slot_id, _)| after_slot.is_none_or(|after| slot_id > after))
+                    .map(|(slot_id, tuple)| (Rid::new(page_id, slot_id), tuple.to_vec())))
+            })?;
+            if found.is_some() {
+                return Ok(found);
+            }
+            page_index += 1;
+            after_slot = None;
+        }
+        Ok(None)
+    }
+
     pub fn insert(
         &mut self,
         bpm: &mut BufferPoolManager,
@@ -1144,6 +1172,79 @@ mod tests {
 
     fn scan_all(heap: &HeapFile, bpm: &mut BufferPoolManager) -> Vec<(Rid, Vec<u8>)> {
         heap.scan(bpm).collect::<Result<_, _>>().unwrap()
+    }
+
+    /// Every tuple, by following `next_after` from the start.
+    fn walk_with_cursor(heap: &HeapFile, bpm: &mut BufferPoolManager) -> Vec<(Rid, Vec<u8>)> {
+        let mut tuples = Vec::new();
+        let mut after = None;
+        while let Some((rid, tuple)) = heap.next_after(bpm, after).unwrap() {
+            tuples.push((rid, tuple));
+            after = Some(rid);
+        }
+        tuples
+    }
+
+    #[test]
+    fn next_after_on_an_empty_heap_should_find_nothing() {
+        let mut pool = TestPool::new(4);
+        let heap = HeapFile::create(pool.bpm()).unwrap();
+
+        assert_eq!(heap.next_after(pool.bpm(), None).unwrap(), None);
+    }
+
+    #[test]
+    fn next_after_should_walk_the_heap_like_scan() {
+        let mut pool = TestPool::new(2);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rids: Vec<Rid> = (0..12)
+            .map(|i| heap.insert(pool.bpm(), &tuple(30, i)).unwrap())
+            .collect();
+        // A deleted tuple at the start of a page, and a whole page emptied.
+        heap.delete(pool.bpm(), rids[3]).unwrap();
+        for &rid in rids.iter().filter(|rid| rid.page_id == rids[6].page_id) {
+            heap.delete(pool.bpm(), rid).unwrap();
+        }
+
+        let walked = walk_with_cursor(&heap, pool.bpm());
+
+        assert!(heap.page_count() > 3);
+        assert_eq!(walked, scan_all(&heap, pool.bpm()));
+        assert_eq!(
+            heap.next_after(pool.bpm(), walked.last().map(|(rid, _)| *rid))
+                .unwrap(),
+            None
+        );
+        assert_heap_consistent(pool.bpm(), &heap);
+    }
+
+    #[test]
+    fn next_after_a_deleted_tuple_should_go_on_from_its_place() {
+        let mut pool = TestPool::new(4);
+        let mut heap = HeapFile::create(pool.bpm()).unwrap();
+        let rids: Vec<Rid> = (0..3)
+            .map(|i| heap.insert(pool.bpm(), &tuple(20, i)).unwrap())
+            .collect();
+        heap.delete(pool.bpm(), rids[1]).unwrap();
+
+        let next = heap.next_after(pool.bpm(), Some(rids[1])).unwrap();
+
+        assert_eq!(next, Some((rids[2], tuple(20, 2))));
+    }
+
+    #[test]
+    fn next_after_a_rid_outside_the_heap_should_fail() {
+        let mut pool = TestPool::new(4);
+        let heap = HeapFile::create(pool.bpm()).unwrap();
+
+        let err = heap
+            .next_after(pool.bpm(), Some(Rid::new(99, 0)))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HeapFileError::PageNotInHeap { page_id: 99 }),
+            "{err:?}"
+        );
     }
 
     #[test]

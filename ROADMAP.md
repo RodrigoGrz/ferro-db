@@ -7,7 +7,7 @@ This is the authoritative implementation checklist for ferroDB. The README only 
 - `[x]` means the feature exists **and** is covered by tests (the links point to both).
 - `[ ]` means it is not done. A note says when part of it already exists.
 - Sections keep the order in which the project plans to build them. Items marked *(next)* come from the "next steps" recorded in the design notes and are the closest planned work.
-- Status was last verified against the code on 2026-10-20 (`cargo test --all-targets`: 907 tests passing).
+- Status was last verified against the code on 2026-10-21 (`cargo test --all-targets`: 979 tests passing).
 
 When an item is finished, mark it here in the same change that adds the code, and update the design notes (see the [documentation index](doc.md)).
 
@@ -42,10 +42,10 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Schema: column definitions and typed row ⇄ tuple conversion ([`schema.rs`](src/table/schema.rs), [`tests/table_schema.rs`](tests/table_schema.rs))
 - [x] Table Metadata: tables persisted in the catalog ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
 - [x] Table Heap: typed `insert` / `get` / `update` / `delete` / `scan`, combining `Schema` and `HeapFile`, found by table name through the catalog, which keeps one handle per table ([`table_heap.rs`](src/table/table_heap.rs), [`catalog.rs`](src/catalog/catalog.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs))
-- [ ] INSERT. The typed `TableHeap::insert` exists; there is no SQL statement.
+- [ ] INSERT. The `Insert` executor exists (indexes kept in step, whole statement validated first); there is no SQL statement.
 - [ ] SELECT
-- [ ] UPDATE. The typed `TableHeap::update` exists; there is no SQL statement.
-- [ ] DELETE. The typed `TableHeap::delete` exists; there is no SQL statement.
+- [ ] UPDATE. The `Update` executor exists; there is no SQL statement.
+- [ ] DELETE. The `Delete` executor exists; there is no SQL statement.
 - [x] Sequential Scan: typed table scan in heap order, `TableHeap::scan` ([`table_heap.rs`](src/table/table_heap.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs)). The scan operator of the executor is under Query Execution.
 - [ ] `DROP TABLE`
 
@@ -54,7 +54,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] B+Tree: unique keys of any type (text included) to `Rid`, order-preserving key encoding, variable-size nodes with split, merge and redistribution by bytes, a free list for freed pages ([`src/index/`](src/index/), [`tests/index_b_plus_tree.rs`](tests/index_b_plus_tree.rs), [docs](docs/indexes.md))
 - [ ] Index Scan
 - [ ] Range Scan. `BPlusTree::range` iterates the keys within bounds; there is no scan operator yet (see also Query Execution).
-- [ ] Unique Index. The B+Tree only holds unique keys (`23505` on a duplicate); there is no `CREATE UNIQUE INDEX` nor an index linked to a table.
+- [ ] Unique Index. Every index is unique, and the Insert and Update executors refuse a repeated key (`23505`); there is no `CREATE UNIQUE INDEX` statement yet.
 - [ ] Composite Index
 
 ## SQL
@@ -73,10 +73,10 @@ When an item is finished, mark it here in the same change that adds the code, an
 
 ## Query Execution
 
-- [ ] Sequential Scan
+- [x] Sequential Scan: iterator-model `SeqScan` with a heap cursor ([`scan.rs`](src/execution/scan.rs), [`tests/execution_executors.rs`](tests/execution_executors.rs), [docs](docs/execution.md))
 - [ ] Index Scan
-- [ ] Filter
-- [ ] Projection
+- [x] Filter: keeps the rows whose predicate is TRUE, over expressions with SQL semantics ([`filter.rs`](src/execution/filter.rs), [`expression.rs`](src/execution/expression.rs))
+- [x] Projection ([`projection.rs`](src/execution/projection.rs)). Insert, Update and Delete executors also exist ([`modify.rs`](src/execution/modify.rs))
 - [ ] Sort
 - [ ] Limit
 - [ ] Aggregation
@@ -150,8 +150,8 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 
 ## Reliability
 
-- [x] Unit Tests: 837 tests, in every module
-- [x] Integration Tests: 70 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
+- [x] Unit Tests: 907 tests, in every module
+- [x] Integration Tests: 72 tests in [`tests/`](tests/), including persistence across reopen and on-disk corruption detection
 - [ ] Concurrency Tests
 - [ ] Crash Recovery Tests
 - [ ] Fuzz Tests. Randomized model-based and corruption tests exist (for example `random_corruption_should_never_panic`), but there is no coverage-guided fuzzing harness.

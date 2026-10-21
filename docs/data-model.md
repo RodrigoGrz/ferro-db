@@ -569,6 +569,7 @@ A `Schema` is immutable and keeps the precomputed `TupleLayout` (`DataType::layo
 
 ### Row ⇄ tuple
 
+- **`assign_row`** applies SQL *assignment* without building the tuple and returns the values in the column types (what an index needs as keys); `encode_row` is `assign_row` plus the tuple.
 - **`encode_row`** applies SQL *assignment* column by column, and only builds the tuple if every column passes (the first error, in column order, is the one returned):
   - number of values ≠ number of columns → `ColumnCountMismatch`;
   - `NULL` in a `NOT NULL` column → `NullViolation`;
@@ -637,6 +638,8 @@ for entry in accounts.scan(&mut bpm) {                              // Result<(R
 
 - **`insert` / `update`** run `Schema::encode_row` **before** touching the heap: arity, `NOT NULL` and store assignment (`22001`, `22003`, `42804`, ...) are checked first, so a rejected row writes nothing, and a rejected `update` leaves the old row as it was.
 - **`update` can move the row.** When the new row no longer fits its page, the heap stores it on another page and deletes the old one: the returned `Rid` is the one to use from then on, and the old `Rid` gives `TupleNotFound`.
+- **`prepare(row)`** returns the row as `insert` would store it (in the column types), checked against everything `insert` checks, the size of the tuple included, without writing anything: the executors validate a whole statement with it before their first write.
+- **`next_after(rid)`** is a cursor: the next row after a `Rid` (or the first), decoded, holding no pin between calls.
 - **`get` / `scan`** decode through the schema and never trust the disk. Values come back in the column's type.
 - **`scan`** yields the live rows in heap order (page by page, slot by slot). A row that does not decode is an `Err` for that row (`XX001`), never skipped, and the scan goes on to the next one.
 - A `Rid` of another table, or of a deleted row, is an error, never another row.
@@ -797,7 +800,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 ### Known limitations
 
 - ⚠️ **Crash in the middle of `create_table` or of database creation:** the buffer pool writes pages in any order, so after a real crash "`TableRecord` last" is not guaranteed; orphan columns may remain (ignored) or, in the worst case, a `TableRecord` without columns (`CorruptedSchema` on `open`). The complete fix is the WAL.
-- ⚠️ **Indexes do not follow the table yet:** an index holds the rows that existed when it was created. Inserting, updating or deleting through `TableHeap` does not update it; keeping indexes in step is the job of the executors (INSERT/DELETE), the next step.
+- ⚠️ **Indexes follow the table only through the executors:** the Insert, Update and Delete executors keep every index of the table in step ([execution.md](execution.md#writing-two-phases)); writing through `TableHeap` directly does not update them.
 - ⚠️ **Unique, single-column indexes only:** a column with repeated values cannot be indexed yet (`23505`).
 - ⚠️ **Building an index reads every key first:** `create_index` keeps all the keys of the column in memory before filling the tree (the table scan holds the buffer pool); a sorted bulk load would avoid both that and the inserts one by one.
 - ⚠️ **Orphan pages:** the data heap of a failed `create_table`, the tree of a failed `create_index` and the heaps of an interrupted database creation have no owner until a future `VACUUM`.
@@ -852,6 +855,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Approximate to exact in assignment | allowed, with the `CAST` rules | rejected (`42804`); only an explicit `CAST` rounds (decided with the author; PostgreSQL accepts, rounding) |
 | Exact vs. approximate comparison | by algebraic value | exact, as the standard (PostgreSQL converts the integer to `float8`) |
 | `MOD` with approximate numbers | not defined | `%` with a float → `42883` |
+| Atomicity of a statement | a statement that fails has no effect | met for errors on data and constraints (the executors validate the whole statement before writing); an I/O failure while writing can leave a statement half done until there is a WAL |
 | `CAST` of a float to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like integers |
 | Arithmetic on dates | through an interval type (`DATE + INTERVAL '30' DAY`) | `DATE ± integer` and `DATE - DATE` in days, as PostgreSQL (decided with the author); no interval type |
 | Date text | the literal `DATE 'YYYY-MM-DD'` | only `YYYY-MM-DD`, same as the standard (PostgreSQL also takes other styles set by `DateStyle`) |

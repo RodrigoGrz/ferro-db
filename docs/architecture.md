@@ -21,6 +21,10 @@ flowchart TD
         btree["BPlusTree<br/>src/index/<br/>unique keys → Rid, range scans"]
     end
 
+    subgraph execution["Query execution"]
+        exec["Executors + Expr<br/>src/execution/<br/>scan, filter, projection, insert, update, delete"]
+    end
+
     subgraph storage["Storage engine (src/storage/)"]
         heap["HeapFile + FreeSpaceMap<br/>linked list of slotted pages"]
         slotted["SlottedPage + TupleLayout<br/>slots, tuples, NULL bitmap"]
@@ -33,6 +37,10 @@ flowchart TD
 
     demo --> catalog
     demo --> tableheap
+    exec --> catalog
+    exec --> tableheap
+    exec --> btree
+    exec --> types
     catalog --> tableheap
     catalog --> heap
     catalog --> schema
@@ -53,13 +61,12 @@ flowchart TD
 
     subgraph planned["Planned (not implemented)"]
         sql["SQL parser"]
-        planner["Planner / executor"]
+        planner["Planner"]
         wal["WAL / recovery"]
     end
     sql -.-> planner
+    planner -.-> exec
     planner -.-> catalog
-    planner -.-> tableheap
-    planner -.-> btree
     wal -.-> bpm
 
     classDef plannedNode stroke-dasharray: 5 5,color:#777
@@ -80,6 +87,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
+| Executors (`SeqScan`, `Values`, `Filter`, `Projection`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
 **Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`, `catalog` → `index`, and `index` → `types`/`storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
@@ -115,6 +123,18 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 3. The buffer pool verifies the checksum and the header (type and format version). A failure returns an error and leaves the pool untouched.
 4. A frame is taken from the free list or from the replacer's victim (written back first if dirty), and only then are the free list, replacer and page table updated.
 
+### Running a query
+
+1. A plan is a tree of executors (for example `Projection(Filter(SeqScan))`); `execute` pulls its root until it ends, passing the `ExecutionContext` (catalog and buffer pool) down on every call.
+2. `SeqScan` asks `TableHeap::next_after(last_rid)` for one row at a time: the heap reads the page, copies the next live tuple, unpins the page and the schema decodes it.
+3. `Filter` evaluates its predicate (`Expr::eval`) and passes the row on only when the result is TRUE; `Projection` computes its expressions over the row.
+
+### Changing rows
+
+1. Insert, Update and Delete first read all of their child's rows.
+2. They validate the whole statement: `TableHeap::prepare` applies the table's rules to each new row, and every unique index checks the new keys (`BPlusTree::check_key`, `get`, and repeats among the statement's rows). A refused statement stops here, with nothing written.
+3. Only then do they write each row to the heap and each key to the indexes; an Update takes every moved index entry out before putting any back. See [execution.md](execution.md#writing-two-phases).
+
 ### Looking up a key in an index
 
 1. `BPlusTree::get(&Value)` encodes the key into bytes whose order is the SQL order of the key type.
@@ -137,7 +157,7 @@ Every module has unit tests next to the code; [`tests/`](../tests/) holds integr
 
 These are verified properties of the current code, not bugs to be fixed in passing:
 
-- **No SQL.** There is no parser, planner or executor; everything is driven through the Rust API. `cargo run` is a fixed demo.
+- **No SQL.** There is no parser or planner; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
 - **Single-threaded.** Every buffer pool operation takes `&mut self`; there are no latches, locks or transactions.
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.

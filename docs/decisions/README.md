@@ -16,6 +16,7 @@ The rationale comes from the design notes written while each component was built
 | [0008](0008-varchar-utf8-byte-order-and-assignment.md) | Text is `VARCHAR(n)` in UTF-8, compared by bytes, with store assignment separate from `CAST` | Accepted |
 | [0009](0009-floats-finite-exact-comparison-numeric-family.md) | Floats are finite, compare exactly with integers and share one numeric family | Accepted |
 | [0010](0010-b-plus-tree-variable-nodes-and-late-writes.md) | B+Tree with variable-size nodes, order-preserving keys and writing last | Accepted |
+| [0011](0011-executors-with-context-per-call-and-two-phase-writes.md) | Executors take the database on each call and write in two phases | Accepted |
 
 ## Adding a record
 

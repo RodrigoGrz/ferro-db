@@ -312,6 +312,7 @@ A heap is identified by its first page. The catalog stores the `first_page_id` o
 - **update:** fits in the page → same `Rid`. Does not fit → inserts the new version (may allocate a page), **then** deletes the old one and returns the new `Rid`. If the insert fails, the old version is still there; if deleting the old version fails, the new one is deleted before returning the error, so two live versions are not left behind.
 - **delete:** tombstone in the slot; the space returns to the page and the free space map records it, so the next insert that fits reuses the hole.
 - **scan:** an `Iterator` of `(Rid, Vec<u8>)` in page → slot order. Each page is pinned once: live tuples are copied and the page is unpinned before the first one is returned.
+- **next_after(after):** the first live tuple after a `Rid` (or the first of the heap), in `scan` order: a cursor that holds no borrow and no pin between calls, for executors that read one row at a time. `after` may be a tuple deleted since; a `Rid` of another heap is `PageNotInHeap`.
 
 **Design decisions:** see [ADR 0004](decisions/0004-heap-file-as-linked-list.md). In short:
 

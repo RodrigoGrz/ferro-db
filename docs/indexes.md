@@ -166,7 +166,7 @@ See [ADR 0010](decisions/0010-b-plus-tree-variable-nodes-and-late-writes.md) for
 
 ## Limitations
 
-- ⚠️ **Not maintained yet:** `Catalog::create_index` fills a tree with a table's rows, but later changes through `TableHeap` do not reach it until the executors exist. There is no `CREATE INDEX` statement.
+- ⚠️ **Maintained by the executors only:** `Catalog::create_index` fills a tree with a table's rows, and the Insert, Update and Delete executors keep it in step, checking keys first with `check_key` and `get` ([execution.md](execution.md#writing-two-phases)); writing through `TableHeap` directly does not. There is no `CREATE INDEX` statement and no index scan yet.
 - ⚠️ **Unique keys only**, of a single column. No composite keys, no `NULL`.
 - ⚠️ **No crash atomicity:** the commit step copies several pages into the buffer pool, which writes them to disk in any order; a crash in between can leave the tree inconsistent on disk. The WAL will fix it.
 - ⚠️ **Single-threaded:** no latches (no *latch crabbing*); every operation takes `&mut BufferPoolManager`.
