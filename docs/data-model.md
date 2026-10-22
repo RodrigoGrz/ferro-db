@@ -831,7 +831,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Integer literals | decimal only | same; PostgreSQL 16 accepts `1_000`, `0x1F`, `0o17`, `0b101`, ferroDB does not yet |
 | Integer division | implementation-defined rounding | truncates toward zero (as PostgreSQL) |
 | Result type of `a op b` | implementation-defined | the widest operand type (as PostgreSQL) |
-| Position of `NULL` in `ORDER BY` | implementation-defined | after the values for `ASC` (as PostgreSQL) |
+| Position of `NULL` in `ORDER BY` | implementation-defined without `NULLS FIRST`/`NULLS LAST` | `NULL` greater than every value, as PostgreSQL: last for `ASC`, first for `DESC`; `NULLS FIRST`/`NULLS LAST` are honored in both directions |
 | `MOD(a, b)` | function | only the semantics for now, as the `%` operator; the function arrives with the parser |
 | Display of `NULL` | not defined | `"NULL"` in `Display` (`psql` shows an empty cell) |
 | Table without columns | `CREATE TABLE` requires at least one column | same (`NoColumns`); PostgreSQL accepts tables without columns |

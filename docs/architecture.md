@@ -22,7 +22,7 @@ flowchart TD
     end
 
     subgraph execution["Query execution"]
-        exec["Executors + Expr<br/>src/execution/<br/>seq and index scan, filter, projection, aggregation, insert, update, delete"]
+        exec["Executors + Expr<br/>src/execution/<br/>seq and index scan, filter, projection, aggregation, sort, limit, top-n, insert, update, delete"]
     end
 
     subgraph storage["Storage engine (src/storage/)"]
@@ -87,7 +87,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
-| Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
+| Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Sort`, `Limit`, `TopN`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; sort rows in memory and cut them with `LIMIT`/`OFFSET`; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
 **Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`, `catalog` → `index`, and `index` → `types`/`storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
@@ -133,6 +133,12 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 
 1. On its first call, `Aggregation` pulls its child until it ends. For each row it evaluates the `GROUP BY` expressions, finds the group in a `HashMap` (or creates it, numbered by its arrival) and updates one accumulator per aggregate.
 2. Then it turns each group into a row (the key, then each aggregate's result) and hands them out one per call, sorted by arrival, so in the order the groups first appeared. A `HAVING` is a `Filter` above it. See [execution.md](execution.md#aggregation).
+
+### Sorting and limiting
+
+1. On its first call, `Sort` pulls its child until it ends, computes each row's key (the `ORDER BY` expressions, each with its direction and `NULL` position) and sorts the rows stably in memory; then it hands them out one per call. See [execution.md](execution.md#sort-limit-and-topn).
+2. `Limit` evaluates its count and offset before pulling anything, skips `offset` rows and passes on at most `count`; after that it never pulls its child again, so the scans below it stop early.
+3. `TopN` reads its child like `Sort` but keeps only the best `offset + count` rows in a bounded heap, then sorts them, skips `offset` and hands out the rest.
 
 ### Reading through an index
 

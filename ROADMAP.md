@@ -77,8 +77,8 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Index Scan: iterator-model `IndexScan` by point or range, in key order, with the last key as cursor ([`scan.rs`](src/execution/scan.rs), [`tests/execution_index_scan.rs`](tests/execution_index_scan.rs), [docs](docs/execution.md#index-scan))
 - [x] Filter: keeps the rows whose predicate is TRUE, over expressions with SQL semantics ([`filter.rs`](src/execution/filter.rs), [`expression.rs`](src/execution/expression.rs))
 - [x] Projection ([`projection.rs`](src/execution/projection.rs)). Insert, Update and Delete executors also exist ([`modify.rs`](src/execution/modify.rs))
-- [ ] Sort
-- [ ] Limit
+- [x] Sort: in memory, by several keys with `ASC`/`DESC` and `NULLS FIRST`/`LAST`, ties in input order; `TopN` keeps the first rows of the order in a bounded heap ([`sort.rs`](src/execution/sort.rs), [`tests/execution_sort.rs`](tests/execution_sort.rs), [docs](docs/execution.md#sort-limit-and-topn))
+- [x] Limit: `LIMIT`/`OFFSET` counts validated as the standard says (`2201W`, `2201X`), never pulling the child past the count ([`limit.rs`](src/execution/limit.rs), [`tests/execution_sort.rs`](tests/execution_sort.rs), [docs](docs/execution.md#counts))
 - [x] Aggregation: hash aggregation in memory with `COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, skipping `NULL` as the standard does ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs), [docs](docs/execution.md#aggregation))
 - [x] GROUP BY: groups by any expressions, `NULL` keys in one group, in order of first appearance; `HAVING` is a `Filter` over the groups ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs))
 - [ ] JOIN

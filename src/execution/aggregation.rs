@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use crate::types::{DataType, Finite64, TypeError, Value};
 
+use super::materialized::Materialized;
 use super::{ExecutionContext, ExecutionError, Executor, Expr, Row};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,13 +51,7 @@ pub struct Aggregation {
     child: Box<dyn Executor>,
     group_by: Vec<Expr>,
     aggregates: Vec<Aggregate>,
-    state: AggregationState,
-}
-
-enum AggregationState {
-    Start,
-    Emitting(std::vec::IntoIter<Row>),
-    Done,
+    state: Materialized<()>,
 }
 
 impl Aggregation {
@@ -65,54 +60,47 @@ impl Aggregation {
             child,
             group_by,
             aggregates,
-            state: AggregationState::Start,
+            state: Materialized::Start(()),
         }
-    }
-
-    /// Reads the whole child into the groups, in the order each group first appeared.
-    fn group_rows(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
-        let mut groups = HashMap::new();
-        if self.group_by.is_empty() {
-            groups.insert(Vec::new(), Group::new(0, &self.aggregates));
-        }
-        while let Some(row) = self.child.next(ctx)? {
-            let key = self
-                .group_by
-                .iter()
-                .map(|expr| expr.eval(&row.values))
-                .collect::<Result<Vec<_>, _>>()?;
-            let first_seen = groups.len();
-            groups
-                .entry(key)
-                .or_insert_with(|| Group::new(first_seen, &self.aggregates))
-                .add(&self.aggregates, &row.values)?;
-        }
-        // Sorting the groups, not the rows: cheap next to reading the child.
-        let mut groups: Vec<(Vec<Value>, Group)> = groups.into_iter().collect();
-        groups.sort_unstable_by_key(|(_, group)| group.first_seen);
-        groups
-            .into_iter()
-            .map(|(key, group)| group.into_row(key))
-            .collect()
     }
 }
 
 impl Executor for Aggregation {
     fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>, ExecutionError> {
-        // `Done` until the groups are in hand, so an error also ends the executor.
-        let state = match std::mem::replace(&mut self.state, AggregationState::Done) {
-            AggregationState::Start => {
-                AggregationState::Emitting(self.group_rows(ctx)?.into_iter())
-            }
-            state => state,
-        };
-        let AggregationState::Emitting(mut groups) = state else {
-            return Ok(None);
-        };
-        let row = groups.next();
-        self.state = AggregationState::Emitting(groups);
-        Ok(row)
+        self.state
+            .next(|()| group_rows(self.child.as_mut(), &self.group_by, &self.aggregates, ctx))
     }
+}
+
+/// Reads the whole child into the groups, in the order each group first appeared.
+fn group_rows(
+    child: &mut dyn Executor,
+    group_by: &[Expr],
+    aggregates: &[Aggregate],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let mut groups = HashMap::new();
+    if group_by.is_empty() {
+        groups.insert(Vec::new(), Group::new(0, aggregates));
+    }
+    while let Some(row) = child.next(ctx)? {
+        let key = group_by
+            .iter()
+            .map(|expr| expr.eval(&row.values))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first_seen = groups.len();
+        groups
+            .entry(key)
+            .or_insert_with(|| Group::new(first_seen, aggregates))
+            .add(aggregates, &row.values)?;
+    }
+    // Sorting the groups, not the rows: cheap next to reading the child.
+    let mut groups: Vec<(Vec<Value>, Group)> = groups.into_iter().collect();
+    groups.sort_unstable_by_key(|(_, group)| group.first_seen);
+    groups
+        .into_iter()
+        .map(|(key, group)| group.into_row(key))
+        .collect()
 }
 
 struct Group {

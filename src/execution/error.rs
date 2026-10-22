@@ -23,6 +23,26 @@ pub enum ExecutionError {
         function: &'static str,
         arg: DataType,
     },
+    /// A `LIMIT` or `OFFSET` count that is NULL (`None`) or negative.
+    InvalidRowCount {
+        clause: RowCountClause,
+        count: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCountClause {
+    Limit,
+    Offset,
+}
+
+impl RowCountClause {
+    fn keyword(self) -> &'static str {
+        match self {
+            RowCountClause::Limit => "LIMIT",
+            RowCountClause::Offset => "OFFSET",
+        }
+    }
 }
 
 impl ExecutionError {
@@ -34,6 +54,15 @@ impl ExecutionError {
             ExecutionError::Index(err) => err.sqlstate(),
             ExecutionError::ColumnOutOfRange { .. } | ExecutionError::MissingRid => "XX000",
             ExecutionError::UndefinedFunction { .. } => "42883",
+            // The standard's FETCH FIRST and result OFFSET clauses.
+            ExecutionError::InvalidRowCount {
+                clause: RowCountClause::Limit,
+                ..
+            } => "2201W",
+            ExecutionError::InvalidRowCount {
+                clause: RowCountClause::Offset,
+                ..
+            } => "2201X",
         }
     }
 }
@@ -60,6 +89,14 @@ impl fmt::Display for ExecutionError {
                 "function {function}({}) does not exist",
                 arg.name().to_ascii_lowercase()
             ),
+            ExecutionError::InvalidRowCount {
+                clause,
+                count: Some(count),
+            } => write!(f, "{} must not be negative, got {count}", clause.keyword()),
+            ExecutionError::InvalidRowCount {
+                clause,
+                count: None,
+            } => write!(f, "{} must not be null", clause.keyword()),
         }
     }
 }
@@ -73,7 +110,8 @@ impl std::error::Error for ExecutionError {
             ExecutionError::Index(err) => Some(err),
             ExecutionError::ColumnOutOfRange { .. }
             | ExecutionError::MissingRid
-            | ExecutionError::UndefinedFunction { .. } => None,
+            | ExecutionError::UndefinedFunction { .. }
+            | ExecutionError::InvalidRowCount { .. } => None,
         }
     }
 }
@@ -158,6 +196,24 @@ mod tests {
                 },
                 "function sum(varchar) does not exist",
                 "42883",
+                false,
+            ),
+            (
+                ExecutionError::InvalidRowCount {
+                    clause: RowCountClause::Limit,
+                    count: Some(-3),
+                },
+                "LIMIT must not be negative, got -3",
+                "2201W",
+                false,
+            ),
+            (
+                ExecutionError::InvalidRowCount {
+                    clause: RowCountClause::Offset,
+                    count: None,
+                },
+                "OFFSET must not be null",
+                "2201X",
                 false,
             ),
         ]

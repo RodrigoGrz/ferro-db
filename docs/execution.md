@@ -9,6 +9,7 @@ Dependencies point downward: `execution` → `catalog` → `table` / `index` →
 - [Executors](#executors)
 - [Index Scan](#index-scan)
 - [Aggregation](#aggregation)
+- [Sort, Limit and TopN](#sort-limit-and-topn)
 - [Writing: two phases](#writing-two-phases)
 - [Errors](#errors)
 - [Design decisions](#design-decisions)
@@ -48,7 +49,7 @@ let mut query = Projection::new(Box::new(filter), vec![
 let rows = execute(&mut query, &mut ExecutionContext { catalog: &mut catalog, bpm: &mut bpm })?;
 ```
 
-- Rows read from a table carry their **`Rid`**, which Delete and Update need; rows computed by `Values` have none. `Filter` and `Projection` keep their child's `Rid`.
+- Rows read from a table carry their **`Rid`**, which Delete and Update need; rows computed by `Values` and the groups of an `Aggregation` have none. `Filter`, `Projection`, `Sort`, `Limit` and `TopN` keep their child's `Rid`.
 - The **database is passed to each call** (`ExecutionContext`) instead of being stored in the executors, so a tree of them never holds two mutable borrows of the catalog or the buffer pool, and **no executor keeps a page pinned between calls**.
 - **After an `Err`, an executor is finished:** its children may have been consumed halfway, so it must not be called again.
 - **A `SeqScan` does not shield itself from changes made between two of its `next` calls** by other code: it simply goes on after the last `Rid` it returned. The writing executors never interleave with their own scan, because they read their child completely first; a plan built by hand that interleaves a scan with writes to the same table sees those writes, or not, depending on where they land.
@@ -83,6 +84,9 @@ Every operator is the `Value` operation of the same name, so `NULL`, three-value
 | `Delete::new(table, child)` | deletes the rows the child produces, by `Rid` |
 | `Update::new(table, child, assignments)` | sets `(column, expr)` assignments on the rows the child produces; every expression sees the stored row **before** the update, all at once, so `SET a = b, b = a` swaps |
 | `Aggregation::new(child, group_by, aggregates)` | one row per group: the `GROUP BY` values, then one value per aggregate (`COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), without `Rid` ([below](#aggregation)) |
+| `Sort::new(child, keys)` | the child's rows ordered by the keys (`ASC`/`DESC`, `NULLS FIRST`/`LAST`), ties in input order, sorted in memory; keeps the `Rid` ([below](#sort-limit-and-topn)) |
+| `Limit::new(child, count, offset)` | skips `offset` rows and hands out at most `count`, never pulling the child further; keeps the `Rid` |
+| `TopN::new(child, keys, count, offset)` | the rows of `Limit(Sort(child, keys), count, offset)`, keeping at most `offset + count` rows in a heap |
 
 Insert, Delete and Update return **one row with the number of rows they changed** (a `BIGINT`), as BusTub's do, and `None` afterwards. A row without a `Rid` reaching Delete or Update is `MissingRid` (`XX000`); a `Rid` given twice counts once.
 
@@ -160,6 +164,59 @@ let having = Filter::new(Box::new(groups),
 - **The type of an accumulator is fixed by its first non-`NULL` value.** `SUM`/`AVG` of text, `BOOLEAN`, `DATE` or `TIMESTAMP` is `UndefinedFunction` (`42883`), raised at that value: a column of only `NULL`s never fails. `MIN`/`MAX` accept any comparable type. A value of another family later on only happens in a plan built wrong, and fails with the comparison's error (`42883`).
 - **Integer sums do not depend on the order of the rows:** `MAX + 1 - 1` is `MAX`, since the `i128` is checked against `BIGINT` at the end. An integer average divides the sum rounded to `f64`, so the average of huge `BIGINT`s does not overflow. A count past `i64` (2^63 rows) would be `22003`, not a wrap.
 
+## Sort, Limit and TopN
+
+`Sort` (`sort.rs`) is a pipeline breaker too (CMU 15-445 lecture 10): the first call reads the whole child, computes each row's sort key and sorts the rows **in memory**; later calls hand them out one by one. `Limit` (`limit.rs`) is a counter in the pipeline. `TopN` (`sort.rs`) is `ORDER BY … LIMIT` with a bounded heap (BusTub's project 3, PostgreSQL's bounded heap sort).
+
+```rust
+pub enum SortOrder { Asc, Desc }
+pub enum NullOrder { First, Last }
+pub struct SortKey { pub expr: Expr, pub order: SortOrder, pub nulls: NullOrder }
+// SortKey::asc(expr): ASC NULLS LAST; SortKey::desc(expr): DESC NULLS FIRST
+
+// SELECT name, score FROM players ORDER BY score DESC, name LIMIT 10 OFFSET 20
+let ranked = Sort::new(Box::new(SeqScan::new("players")),
+    vec![SortKey::desc(Expr::Column(1)), SortKey::asc(Expr::Column(0))]);
+let page = Limit::new(Box::new(ranked), Some(Expr::Literal(Value::BigInt(10))),
+    Some(Expr::Literal(Value::BigInt(20))));
+// the same rows, keeping at most 30 in memory
+let page = TopN::new(Box::new(SeqScan::new("players")),
+    vec![SortKey::desc(Expr::Column(1)), SortKey::asc(Expr::Column(0))],
+    Expr::Literal(Value::BigInt(10)), Some(Expr::Literal(Value::BigInt(20))));
+```
+
+### Order
+
+- **Each row's key** is a `Vec` of values that carry their key's direction and `NULL` position, and that order implements `Ord`: two `NULL`s are equal; a single `NULL` goes first or last as `nulls` says, **whatever the direction**; two values compare with `Value::sort_cmp`, reversed for `DESC`. The `Vec` compares key by key, so a later key only breaks ties.
+- **`Value::sort_cmp`** is a total order: numbers (integers and floats interleaved by value, compared exactly), then text (by UTF-8 bytes, `NO PAD`), booleans (`FALSE < TRUE`) and datetimes (by instant). A well-typed column never mixes families.
+- **Default `NULL` position:** as PostgreSQL, `NULL` is greater than every value: last for `ASC`, first for `DESC`. `NULLS FIRST` / `NULLS LAST` override it.
+- **Ties keep their input order:** `Sort` uses a stable sort, and `TopN` breaks ties by the row's arrival number. The output is deterministic, and `TopN` gives exactly the rows of `Limit(Sort)`.
+- **Keys are computed once per row, before sorting:** the comparison cannot fail, and a failing key (`22012`…) stops the executor before any row is out.
+
+### Counts
+
+`LIMIT` and `OFFSET` are expressions without columns (`Limit::new(child, count, offset)`, `None` meaning `LIMIT ALL` and `OFFSET 0`), evaluated **once, on the first call and before the child is pulled**, like the bounds of an `IndexScan`:
+
+| Count | Result |
+|---|---|
+| an integer `≥ 0` of any width | the count (assigned to `BIGINT`) |
+| `NULL` | `InvalidRowCount`: `2201W` for `LIMIT`, `2201X` for `OFFSET` (`LIMIT must not be null`) |
+| negative | `InvalidRowCount`, same SQLSTATEs (`OFFSET must not be negative, got -5`) |
+| a float, text, boolean, date | `42804`, the store assignment rule (a float becomes an integer only through `CAST`) |
+| an expression with a column | `ColumnOutOfRange` (`XX000`) |
+
+- **`Limit` never pulls its child after the count is reached**, and `LIMIT 0` does not pull it at all: below a `Limit`, the rest of a table is never read.
+- **PostgreSQL differs on `NULL`:** it takes `LIMIT NULL` as no limit and `OFFSET NULL` as `0`. ferroDB follows the standard, where a `NULL` row count is an exception (decided with the author); no limit is `count: None`.
+
+### TopN
+
+- `TopN::new(child, keys, count, offset)` validates the counts like `Limit` before reading the child; `count = 0` reads nothing.
+- It keeps the best `offset + count` rows in a max-heap whose root is the worst of them: rows are pushed until the heap holds `offset + count`; after that a row replaces the root only when it comes before it (`peek_mut`), so most rows of a large input cost one comparison. At the end the heap is sorted, `offset` rows are skipped and the rest come out. Memory is O(`offset + count`) and time O(rows · log(`offset + count`)).
+- The bound is `offset + count` saturated, and the heap is **not reserved up front**: `LIMIT 9223372036854775807` allocates nothing in advance.
+- Choosing `TopN` over `Limit(Sort)` will be the planner's job; today whoever builds the plan chooses.
+
+`Sort`, `Limit` and `TopN` all keep each row's `Rid`: they still hand out table rows, so `Delete(Limit(…))` works.
+
 ## Writing: two phases
 
 1. **Read** every row the child produces. This solves the **Halloween problem**: an update that moves a row to a later page (its `Rid` changes) would meet it again in the scan and update it twice. It also lets the whole statement be validated.
@@ -187,12 +244,13 @@ A statement that fails on its data or a constraint therefore leaves the table an
 | `ColumnOutOfRange { column, len }` | `XX000` (a plan built wrong) |
 | `MissingRid` | `XX000` (a plan built wrong) |
 | `UndefinedFunction { function, arg }` | `42883`: an aggregate given a type it does not accept (`function sum(varchar) does not exist`) |
+| `InvalidRowCount { clause, count }` | `2201W` for `LIMIT`, `2201X` for `OFFSET`: a `NULL` (`count: None`) or negative count |
 
 ## Design decisions
 
 See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writes.md) for the context passed to each call and the two-phase writes. Also:
 
-- **A trait for executors:** there are nine real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
+- **A trait for executors:** there are twelve real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
 - **A cursor on the heap** (`HeapFile::next_after`) instead of holding a `TableScan` (which borrows the buffer pool) or reading the whole table: the scan stays lazy. The cost is fetching the page again for every row, almost always a cache hit.
 - **The Index Scan's cursor is the last key**, not a leaf and a position in it: a leaf kept between calls could be merged away and freed by a write. It reuses `BPlusTree::range` (create, take one entry, drop), which already copies the leaf and unpins it before handing out entries; the cost is copying a leaf per row, which a leaf cursor can remove later.
 - **Bounds that do not fit the key type narrow the range** instead of failing: `small_col < 70000` is a valid query and must return every row.
@@ -205,6 +263,14 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - **Integer `SUM` in `i128`**, checked at the end, instead of `Value::add` row by row: exact, and the result does not depend on the order of the rows.
 - **`AVG` of integers as `DOUBLE PRECISION`** (decided with the author), instead of truncating to `BIGINT`: `AVG(1, 2)` is `1.5`, and only the type changes when `NUMERIC` arrives.
 - **`HAVING` as a `Filter`** over the output, instead of a field of `Aggregation`: the `Filter` already has the semantics of a `WHERE`, and BusTub builds the plan the same way.
+- **One state for the pipeline breakers** (`materialized.rs`: `Start`, `Emitting`, `Done`), shared by `Aggregation`, `Sort` and `TopN`: reading the whole child on the first call and ending the executor after an error live in one place.
+- **Sort in memory** (decided with the author), instead of an external merge sort: like the Aggregation, with no temporary pages to manage. The cost is the whole input in memory.
+- **Sort keys computed before sorting**, instead of evaluating the expressions inside the comparison: each expression runs once per row, errors come before sorting, and the comparison cannot fail (`sort_by` takes no fallible comparator).
+- **A stable sort**, instead of `sort_unstable_by`: deterministic output, equal to `TopN`'s; the cost is a buffer of n/2.
+- **The direction inside each key value**, instead of passing the `SortKey`s to the comparison: keys implement `Ord`, so `sort_by` and `BinaryHeap` take them as they are. The cost is two `Copy` enums per value.
+- **`TopN` as its own executor** (decided with the author), as BusTub does, instead of a mode of `Sort`; the random test compares it with `Limit(Sort)`.
+- **Counts as expressions without columns**, evaluated once, instead of `u64`s in the constructor: the planner will pass literals and parameters (`LIMIT $1`), and the checks (`NULL`, negative, type) live in one place, with SQLSTATEs.
+- **A `NULL` count is an error** (the standard, decided with the author), instead of PostgreSQL's no limit.
 
 ## Tests
 
@@ -222,10 +288,14 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - `random_statements_should_keep_the_table_and_its_indexes_like_a_model`: 300 random statements (multi-row inserts, deletes and three kinds of updates over a range of ids, one of them growing rows until they move or their keys become too large), many of them breaking a unique index, compared with a model that predicts each error (`23505`, `54000`), reopening every 50 statements.
 - `aggregation.rs`: `COUNT(*)` and `COUNT(e)` with `NULL`s; an empty input without `GROUP BY` (one row of `0`s and `NULL`s); `MIN`/`MAX` of integers, text (`'a' < 'a '`), dates, booleans, `REAL`, `DOUBLE PRECISION` and timestamps, of only `NULL`s, and of two families (`42883`); `SUM` of every integer width (`BIGINT`) and of `REAL` and `DOUBLE PRECISION` (their type); a sum that overflows halfway and fits at the end, one that does not fit (`22003`), a float overflow in `SUM` and in `AVG` (`22003`); integers and floats mixed in a `SUM` (added as `+` would, and `22003` when the integer part does not fit); `AVG` of integers (`1.5`), of `REAL` (`DOUBLE PRECISION`) and of two `i64::MAX`; `SUM`/`AVG` of text, `BOOLEAN`, `DATE` and `TIMESTAMP` after `NULL`s (`42883` and its message); `GROUP BY` one and two keys in order of first appearance, `NULL` keys in one group, keys apart like `IS DISTINCT FROM` (`'a'` and `'a '` apart, `-0.0` with `0.0`, dates), `GROUP BY` without aggregates (each key once), `id % 3` as the key, an empty input (no rows), a failing key or argument (`22012`, then `None`), a failing child (`42P01`, then `None`), no `Rid` over a `SeqScan`, `HAVING` as a `Filter`; `None` after the end. `value.rs` checks that equal values (`-0.0` and `0.0` included) hash the same.
 - `random_aggregations_should_match_a_model`: 60 rounds over a table of `(SMALLINT, VARCHAR, INTEGER, DOUBLE PRECISION)` with `NULL`s, changed by Insert and Delete executors, grouped by one or two columns with all ten aggregates and compared, sorted by key, with a model computed in `i128`, `f64` (in the rows' order) and `String`, without `Value` arithmetic.
-- Mutations checked by hand, each caught: for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
+- `sort.rs`: `ASC` and `DESC` with their default `NULL` positions, `NULLS FIRST`/`LAST` in both directions, later keys only breaking ties, integer widths and floats interleaved and equal values of different widths tying, text by bytes (`'a' < 'a '`), dates, booleans, timestamps and `REAL`; `Sort` and `TopN` without keys (input order); `Sort` of no rows and of one, ties in input order, the `Rid`s of a table spanning pages, a failing key (`22012`) and a failing child (`42P01`), each ending the sort; `TopN` equal to `Limit(Sort)` for several counts and offsets (past the end included), ties in input order, `count = 0` without reading the child, a count of `i64::MAX` with an offset of `i64::MAX - 1` and of `1`, every invalid count before reading the child (`2201W`, `2201X`, `42804`), a failing key and a failing count (`22012`), the `Rid`s.
+- `limit.rs`: every combination of count and offset (none, one, both, offset past the end, `0`), every integer width, a float, text or boolean count (`42804`), `NULL` and negative counts (`2201W`, `2201X` and their messages), a count with a column (`XX000`), a count or offset that fails to evaluate (`22012`), the child not pulled after the count nor with `LIMIT 0`, an invalid count failing before the child is pulled, the `Rid`s, `None` after the end.
+- `random_sorts_and_limits_should_match_a_model`: 80 rounds over a table of `(INTEGER, VARCHAR, DOUBLE PRECISION)` with `NULL`s and few distinct values, changed by Insert and Delete executors, sorted by 1 to 3 random keys (direction and `NULL` position random) with random counts and offsets; `Sort`, `Limit(Sort)` and `TopN` must equal, row and `Rid`, a stable sort of the stored rows by a model comparator over `Option<i32>`, `Option<String>` and `Option<f64>`.
+- Mutations checked by hand, each caught: for Sort and TopN, an unstable sort, `DESC` also moving the `NULL`s, `TopN` without the arrival tiebreak, a full heap letting a later tie replace its worst row, and reading the child with `count = 0`; for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
 - Integration in [`tests/execution_executors.rs`](../tests/execution_executors.rs), with 8 KB pages and an 8-frame pool: 3,000 rows inserted through the executors, updated in place and with rows moving, and deleted with `%`; after reopening, the scan and both indexes match. A refused insert leaves no trace after reopening.
 - Integration in [`tests/execution_index_scan.rs`](../tests/execution_index_scan.rs), same setup, 3,000 rows in scattered order: after reopening, points and ranges through the `INTEGER` and the `VARCHAR` index equal `Filter(SeqScan)`; an `UPDATE … SET id = id + 10000, email = email || <300 bytes> WHERE id BETWEEN 1000 AND 1999` read through the index moves every key past the cursor and every row out of its page, and after reopening the scans and both indexes match.
 - Integration in [`tests/execution_aggregation.rs`](../tests/execution_aggregation.rs), same setup, 4,000 orders with `NULL` customers and amounts: `GROUP BY customer` over a `SeqScan` equals a model, and again after reopening; over an `IndexScan` of a range with a `HAVING`, it equals the same plan over `Filter(SeqScan)` and the model; a Delete of one customer removes its group and changes the total `COUNT(*)`.
+- Integration in [`tests/execution_sort.rs`](../tests/execution_sort.rs), same setup, 3,000 players inserted in scattered id order: `ORDER BY team, score DESC, id` over a `SeqScan` equals a model and gives the same rows after reopening; `TopN` equals `Limit(Sort)` over the whole table; a `Limit` with an offset over an `IndexScan` gives the first keys of the range; `ORDER BY COUNT(*) DESC, team` over an `Aggregation` sorts the groups.
 
 ## Limitations
 
@@ -236,5 +306,7 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - ⚠️ **Aggregation keeps every group in memory**; there is no spilling to disk.
 - ⚠️ **Aggregate types are checked while running**, at the first non-`NULL` value, not before: a `SUM` of text over only `NULL`s does not fail. The planner will check them with an output schema.
 - **Aggregates are not complete:** no `COUNT(DISTINCT x)` or `SELECT DISTINCT`, no `FILTER (WHERE …)`, `STRING_AGG`, `EVERY`/`BOOL_AND`, `GROUPING SETS`/`ROLLUP`/`CUBE` or window functions.
+- ⚠️ **Sort keeps its whole input in memory**; there is no external merge sort. `TopN` keeps `offset + count` rows.
+- **Sorting is not complete:** no `FETCH FIRST … WITH TIES` or `PERCENT`, no `COLLATE`, and no planner to choose `TopN` over `Limit(Sort)`.
 - ⚠️ **Index Scan bounds must convert to the key type without loss** (`42804` otherwise), and there is no planner yet to choose between Index Scan and SeqScan.
-- **Not there yet:** an output schema with names and types, a descending or index-only scan, Sort, Limit and joins.
+- **Not there yet:** an output schema with names and types, a descending or index-only scan, and joins.
