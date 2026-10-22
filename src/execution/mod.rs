@@ -1,3 +1,4 @@
+pub mod aggregation;
 pub mod error;
 pub mod executor;
 pub mod expression;
@@ -9,6 +10,7 @@ pub mod scan;
 #[cfg(test)]
 mod test_support;
 
+pub use aggregation::{Aggregate, Aggregation};
 pub use error::ExecutionError;
 pub use executor::{ExecutionContext, Executor, Row, execute};
 pub use expression::{BinaryOp, BooleanTest, Expr};

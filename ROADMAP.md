@@ -79,8 +79,8 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Projection ([`projection.rs`](src/execution/projection.rs)). Insert, Update and Delete executors also exist ([`modify.rs`](src/execution/modify.rs))
 - [ ] Sort
 - [ ] Limit
-- [ ] Aggregation
-- [ ] GROUP BY
+- [x] Aggregation: hash aggregation in memory with `COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, skipping `NULL` as the standard does ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs), [docs](docs/execution.md#aggregation))
+- [x] GROUP BY: groups by any expressions, `NULL` keys in one group, in order of first appearance; `HAVING` is a `Filter` over the groups ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs))
 - [ ] JOIN
 - [ ] Hash Join
 - [ ] Nested Loop Join

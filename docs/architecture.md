@@ -22,7 +22,7 @@ flowchart TD
     end
 
     subgraph execution["Query execution"]
-        exec["Executors + Expr<br/>src/execution/<br/>seq and index scan, filter, projection, insert, update, delete"]
+        exec["Executors + Expr<br/>src/execution/<br/>seq and index scan, filter, projection, aggregation, insert, update, delete"]
     end
 
     subgraph storage["Storage engine (src/storage/)"]
@@ -87,7 +87,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
-| Executors (`SeqScan`, `Values`, `Filter`, `Projection`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
+| Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
 **Layering rule.** Dependencies only point downward: `catalog` → `table` → `types` → `storage`, `catalog` → `index`, and `index` → `types`/`storage`. `storage` never imports an upper layer, so the storage formats stay independent of SQL types. `config.rs` (page size) and `serialization.rs` (little-endian codec) sit at the crate root because every layer uses them.
@@ -128,6 +128,11 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 1. A plan is a tree of executors (for example `Projection(Filter(SeqScan))`); `execute` pulls its root until it ends, passing the `ExecutionContext` (catalog and buffer pool) down on every call.
 2. `SeqScan` asks `TableHeap::next_after(last_rid)` for one row at a time: the heap reads the page, copies the next live tuple, unpins the page and the schema decodes it.
 3. `Filter` evaluates its predicate (`Expr::eval`) and passes the row on only when the result is TRUE; `Projection` computes its expressions over the row.
+
+### Aggregating
+
+1. On its first call, `Aggregation` pulls its child until it ends. For each row it evaluates the `GROUP BY` expressions, finds the group in a `HashMap` (or creates it, numbered by its arrival) and updates one accumulator per aggregate.
+2. Then it turns each group into a row (the key, then each aggregate's result) and hands them out one per call, sorted by arrival, so in the order the groups first appeared. A `HAVING` is a `Filter` above it. See [execution.md](execution.md#aggregation).
 
 ### Reading through an index
 

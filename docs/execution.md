@@ -8,6 +8,7 @@ Dependencies point downward: `execution` → `catalog` → `table` / `index` →
 - [Expressions](#expressions)
 - [Executors](#executors)
 - [Index Scan](#index-scan)
+- [Aggregation](#aggregation)
 - [Writing: two phases](#writing-two-phases)
 - [Errors](#errors)
 - [Design decisions](#design-decisions)
@@ -81,6 +82,7 @@ Every operator is the `Value` operation of the same name, so `NULL`, three-value
 | `Insert::new(table, child)` | inserts the child's rows |
 | `Delete::new(table, child)` | deletes the rows the child produces, by `Rid` |
 | `Update::new(table, child, assignments)` | sets `(column, expr)` assignments on the rows the child produces; every expression sees the stored row **before** the update, all at once, so `SET a = b, b = a` swaps |
+| `Aggregation::new(child, group_by, aggregates)` | one row per group: the `GROUP BY` values, then one value per aggregate (`COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), without `Rid` ([below](#aggregation)) |
 
 Insert, Delete and Update return **one row with the number of rows they changed** (a `BIGINT`), as BusTub's do, and `None` afterwards. A row without a `Rid` reaching Delete or Update is `MissingRid` (`XX000`); a `Rid` given twice counts once.
 
@@ -118,6 +120,46 @@ Before the scan starts, each bound is converted to the type of the index's key (
 
 The last row is a [deviation](data-model.md#deviations-from-the-sql-standard): `WHERE int_col < 2.5` is valid SQL. The planner will use a `Filter` for such predicates.
 
+## Aggregation
+
+`Aggregation` (`aggregation.rs`) is **hash aggregation** (CMU 15-445 lecture 11 and project 3, BusTub's `SimpleAggregationHashTable`). It is a *pipeline breaker*: the first call reads the whole child; for each row it evaluates the `GROUP BY` expressions (the group's key), finds or creates the group in a hash table and updates one accumulator per aggregate. Later calls hand out the groups one by one.
+
+```rust
+pub enum Aggregate { CountStar, Count(Expr), Sum(Expr), Avg(Expr), Min(Expr), Max(Expr) }
+
+// SELECT dept, COUNT(*), AVG(salary) FROM staff WHERE age > 30 GROUP BY dept HAVING COUNT(*) > 2
+let groups = Aggregation::new(
+    Box::new(Filter::new(Box::new(SeqScan::new("staff")), age_above_30)),
+    vec![Expr::Column(0)],
+    vec![Aggregate::CountStar, Aggregate::Avg(Expr::Column(2))],
+);
+let having = Filter::new(Box::new(groups),
+    Expr::binary(BinaryOp::Gt, Expr::Column(1), Expr::Literal(Value::BigInt(2))));
+```
+
+- **Output:** the key's values, then one value per aggregate, by position (like `Projection`, there is no output schema yet). A group is not a table row, so it has no `Rid`.
+- **Groups:** two rows share a group when their keys are **not distinct** (`IS NOT DISTINCT FROM`), so every `NULL` key of a column forms one group. The table is a `HashMap<Vec<Value>, Group>` from the key to the group's accumulators and the number of groups that existed before it: `Value` derives `Hash`, and within one type its derived `Eq` is exactly "not distinct" (floats have no NaN or `-0.0`, text compares by bytes). **A key column is assumed to hold one type:** an expression over a schema always yields one type (or `NULL`), so integer widths never mix; a `Values` built by hand that mixes `Integer(1)` and `BigInt(1)` in a column would make two groups, until the planner adds the casts.
+- **Without `GROUP BY`** the whole input is one group, so an empty input still gives **one row** (`SELECT COUNT(*) FROM empty` is `0`); with `GROUP BY`, an empty input gives no rows.
+- **Order:** the groups come out in the order each **first appeared** in the input (the standard promises no order without `ORDER BY`): once the child is read, the groups (not the rows) are sorted by their arrival.
+- **`HAVING`** is a `Filter` over the output, which already keeps only TRUE.
+- **States:** `Start` (the child not read yet), `Emitting` (the finished groups), and `Done` after an `Err`, which ends the executor like every other.
+
+### Accumulators
+
+| Aggregate | State | Each non-`NULL` value | Result |
+|---|---|---|---|
+| `COUNT(*)` | `i64` | every row counts, `NULL`s included | `BIGINT` |
+| `COUNT(e)` | `i64` | +1 | `BIGINT`, `0` without values |
+| `SUM` of integers | `i128` | exact sum | `BIGINT`; `22003` if it does not fit, checked **only at the end** |
+| `SUM` of `REAL` / `DOUBLE PRECISION` | the sum as a `Value` | `Value::add` (overflow `22003`) | the input's type |
+| `AVG` of integers | `i128` sum + count | exact sum | `DOUBLE PRECISION`: sum / count |
+| `AVG` of floats | `DOUBLE PRECISION` sum + count | `Value::add` | `DOUBLE PRECISION` |
+| `MIN` / `MAX` | `Option<Value>` | `Value::compare` | the input's type |
+
+- **`NULL` is skipped** by every aggregate but `COUNT(*)` (`COUNT(*)` is `COUNT` of a constant that is never `NULL`). Over no values, `COUNT` is `0` and the others `NULL`.
+- **The type of an accumulator is fixed by its first non-`NULL` value.** `SUM`/`AVG` of text, `BOOLEAN`, `DATE` or `TIMESTAMP` is `UndefinedFunction` (`42883`), raised at that value: a column of only `NULL`s never fails. `MIN`/`MAX` accept any comparable type. A value of another family later on only happens in a plan built wrong, and fails with the comparison's error (`42883`).
+- **Integer sums do not depend on the order of the rows:** `MAX + 1 - 1` is `MAX`, since the `i128` is checked against `BIGINT` at the end. An integer average divides the sum rounded to `f64`, so the average of huge `BIGINT`s does not overflow. A count past `i64` (2^63 rows) would be `22003`, not a wrap.
+
 ## Writing: two phases
 
 1. **Read** every row the child produces. This solves the **Halloween problem**: an update that moves a row to a later page (its `Rid` changes) would meet it again in the scan and update it twice. It also lets the whole statement be validated.
@@ -144,18 +186,25 @@ A statement that fails on its data or a constraint therefore leaves the table an
 | `Index(IndexError)` | the `IndexError`'s (`23505`, `54000`…) |
 | `ColumnOutOfRange { column, len }` | `XX000` (a plan built wrong) |
 | `MissingRid` | `XX000` (a plan built wrong) |
+| `UndefinedFunction { function, arg }` | `42883`: an aggregate given a type it does not accept (`function sum(varchar) does not exist`) |
 
 ## Design decisions
 
 See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writes.md) for the context passed to each call and the two-phase writes. Also:
 
-- **A trait for executors:** there are eight real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
+- **A trait for executors:** there are nine real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
 - **A cursor on the heap** (`HeapFile::next_after`) instead of holding a `TableScan` (which borrows the buffer pool) or reading the whole table: the scan stays lazy. The cost is fetching the page again for every row, almost always a cache hit.
 - **The Index Scan's cursor is the last key**, not a leaf and a position in it: a leaf kept between calls could be merged away and freed by a write. It reuses `BPlusTree::range` (create, take one entry, drop), which already copies the leaf and unpins it before handing out entries; the cost is copying a leaf per row, which a leaf cursor can remove later.
 - **Bounds that do not fit the key type narrow the range** instead of failing: `small_col < 70000` is a valid query and must return every row.
 - **Columns by position** in expressions: names belong to the planner; there is no output schema to maintain yet.
 - **The count as an output row**, as in BusTub, instead of a different return type: every executor has the same interface.
 - **Keys checked with `get` before writing**, instead of letting the tree's `insert` fail and undoing: "fail without side effects" ([ADR 0007](decisions/0007-fail-without-side-effects.md)).
+- **Hash aggregation in memory**, instead of sort aggregation: it is what CMU and BusTub do in project 3, and there is no Sort yet. The cost is the memory of every group; spilling partitions to disk (external hashing) is for later.
+- **`Hash` derived on `Value`** as the group key, instead of a key encoded in bytes: `Finite32`/`Finite64`, `Date` and `Timestamp` already have a `Hash` coherent with `Eq`.
+- **Groups in order of first appearance**, instead of the `HashMap`'s order: deterministic output and simple tests. The map holds each group with its arrival number and the groups are sorted by it at the end, O(g log g) in the number of groups, instead of a map to positions in a `Vec`, which cloned every key and indexed the `Vec`.
+- **Integer `SUM` in `i128`**, checked at the end, instead of `Value::add` row by row: exact, and the result does not depend on the order of the rows.
+- **`AVG` of integers as `DOUBLE PRECISION`** (decided with the author), instead of truncating to `BIGINT`: `AVG(1, 2)` is `1.5`, and only the type changes when `NUMERIC` arrives.
+- **`HAVING` as a `Filter`** over the output, instead of a field of `Aggregation`: the `Filter` already has the semantics of a `WHERE`, and BusTub builds the plan the same way.
 
 ## Tests
 
@@ -171,9 +220,12 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
   - Update: matching rows, `SET a = b, b = a`, every row updated once even when the rows move, a key another row holds and a key two updated rows would share (nothing changes), two keys swapped, every value the table refuses (nothing changes), an index whose key did not change repointed when its row moves, an index of an unchanged column left alone, a row without a `Rid`, a `Rid` given twice, rows of another table (nothing changes), an unknown table;
   - through an `IndexScan`: a Delete of a range, an Update of a point, and an Update of the scanned key itself (`id = id + 10` over 26 rows, each updated once).
 - `random_statements_should_keep_the_table_and_its_indexes_like_a_model`: 300 random statements (multi-row inserts, deletes and three kinds of updates over a range of ids, one of them growing rows until they move or their keys become too large), many of them breaking a unique index, compared with a model that predicts each error (`23505`, `54000`), reopening every 50 statements.
-- Mutations checked by hand, each caught: entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
+- `aggregation.rs`: `COUNT(*)` and `COUNT(e)` with `NULL`s; an empty input without `GROUP BY` (one row of `0`s and `NULL`s); `MIN`/`MAX` of integers, text (`'a' < 'a '`), dates, booleans, `REAL`, `DOUBLE PRECISION` and timestamps, of only `NULL`s, and of two families (`42883`); `SUM` of every integer width (`BIGINT`) and of `REAL` and `DOUBLE PRECISION` (their type); a sum that overflows halfway and fits at the end, one that does not fit (`22003`), a float overflow in `SUM` and in `AVG` (`22003`); integers and floats mixed in a `SUM` (added as `+` would, and `22003` when the integer part does not fit); `AVG` of integers (`1.5`), of `REAL` (`DOUBLE PRECISION`) and of two `i64::MAX`; `SUM`/`AVG` of text, `BOOLEAN`, `DATE` and `TIMESTAMP` after `NULL`s (`42883` and its message); `GROUP BY` one and two keys in order of first appearance, `NULL` keys in one group, keys apart like `IS DISTINCT FROM` (`'a'` and `'a '` apart, `-0.0` with `0.0`, dates), `GROUP BY` without aggregates (each key once), `id % 3` as the key, an empty input (no rows), a failing key or argument (`22012`, then `None`), a failing child (`42P01`, then `None`), no `Rid` over a `SeqScan`, `HAVING` as a `Filter`; `None` after the end. `value.rs` checks that equal values (`-0.0` and `0.0` included) hash the same.
+- `random_aggregations_should_match_a_model`: 60 rounds over a table of `(SMALLINT, VARCHAR, INTEGER, DOUBLE PRECISION)` with `NULL`s, changed by Insert and Delete executors, grouped by one or two columns with all ten aggregates and compared, sorted by key, with a model computed in `i128`, `f64` (in the rows' order) and `String`, without `Value` arithmetic.
+- Mutations checked by hand, each caught: for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
 - Integration in [`tests/execution_executors.rs`](../tests/execution_executors.rs), with 8 KB pages and an 8-frame pool: 3,000 rows inserted through the executors, updated in place and with rows moving, and deleted with `%`; after reopening, the scan and both indexes match. A refused insert leaves no trace after reopening.
 - Integration in [`tests/execution_index_scan.rs`](../tests/execution_index_scan.rs), same setup, 3,000 rows in scattered order: after reopening, points and ranges through the `INTEGER` and the `VARCHAR` index equal `Filter(SeqScan)`; an `UPDATE … SET id = id + 10000, email = email || <300 bytes> WHERE id BETWEEN 1000 AND 1999` read through the index moves every key past the cursor and every row out of its page, and after reopening the scans and both indexes match.
+- Integration in [`tests/execution_aggregation.rs`](../tests/execution_aggregation.rs), same setup, 4,000 orders with `NULL` customers and amounts: `GROUP BY customer` over a `SeqScan` equals a model, and again after reopening; over an `IndexScan` of a range with a `HAVING`, it equals the same plan over `Filter(SeqScan)` and the model; a Delete of one customer removes its group and changes the total `COUNT(*)`.
 
 ## Limitations
 
@@ -181,5 +233,8 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - ⚠️ **Writes keep the child's rows in memory**, all of them, before writing.
 - ⚠️ **Writing through `TableHeap` directly does not update the indexes**; only the executors do. An Index Scan over such an index fails with `XX000`, or misses rows.
 - ⚠️ **The Index Scan goes down the tree and copies a leaf for every row.**
+- ⚠️ **Aggregation keeps every group in memory**; there is no spilling to disk.
+- ⚠️ **Aggregate types are checked while running**, at the first non-`NULL` value, not before: a `SUM` of text over only `NULL`s does not fail. The planner will check them with an output schema.
+- **Aggregates are not complete:** no `COUNT(DISTINCT x)` or `SELECT DISTINCT`, no `FILTER (WHERE …)`, `STRING_AGG`, `EVERY`/`BOOL_AND`, `GROUPING SETS`/`ROLLUP`/`CUBE` or window functions.
 - ⚠️ **Index Scan bounds must convert to the key type without loss** (`42804` otherwise), and there is no planner yet to choose between Index Scan and SeqScan.
-- **Not there yet:** an output schema with names and types, a descending or index-only scan, Sort, Limit, aggregations and joins.
+- **Not there yet:** an output schema with names and types, a descending or index-only scan, Sort, Limit and joins.

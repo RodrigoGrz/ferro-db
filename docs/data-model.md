@@ -866,3 +866,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Arithmetic on timestamps | through an interval type | none |
 | `CAST` of a `DATE` to a short `VARCHAR(n)` | `22001` when the text does not fit | cut to `n`, like the other types |
 | `CAST` of a `BOOLEAN` to a short `VARCHAR(n)` | `22001` when `'TRUE'`/`'FALSE'` does not fit | cut to `n`, like integers (`CAST(TRUE AS VARCHAR(1))` = `'T'`) |
+| `AVG` of integers | an exact numeric with implementation-defined precision (PostgreSQL returns `NUMERIC`) | `DOUBLE PRECISION` (decided with the author), until `NUMERIC` exists |
+| `SUM` of `BIGINT` | an exact numeric; a result that does not fit is `22003` | `BIGINT`, `22003` when the sum does not fit (PostgreSQL returns `NUMERIC` and never overflows) |
+| `NULL`s eliminated by a set function | the warning `01003` (*null value eliminated in set function*) | no warning (warnings do not exist yet) |
+| `SUM`/`AVG` of a non-numeric type | a syntax or access rule error, before running | `42883` (`function sum(varchar) does not exist`, as PostgreSQL), but raised while running, at the first non-`NULL` value, until the planner checks types |

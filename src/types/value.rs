@@ -17,10 +17,11 @@ use super::{
 
 /// `PartialEq` is structural and meant for tests: `Null == Null` and
 /// `SmallInt(1) != BigInt(1)`. SQL equality is `sql_eq` (or `compare`), which yields
-/// UNKNOWN for NULL.
+/// UNKNOWN for NULL. Within one type the derived `Eq` and `Hash` are SQL's "not distinct"
+/// (floats have no NaN or `-0.0`, text compares by bytes), so a `Value` can key a group.
 ///
 /// NULL carries no type: the type of an expression is decided statically from the schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Null,
     SmallInt(i16),
@@ -4344,6 +4345,35 @@ mod tests {
 
                 assert_eq!(number.cast(DataType::Boolean).as_ref(), Ok(&value));
             }
+        }
+    }
+
+    #[test]
+    fn equal_values_should_have_equal_hashes() {
+        use std::hash::{BuildHasher, RandomState};
+        let state = RandomState::new();
+        let pairs = [
+            (Value::Null, Value::Null),
+            (Value::Integer(7), Value::Integer(7)),
+            (double(-0.0), double(0.0)),
+            (real(-0.0), real(0.0)),
+            (
+                Value::Text("ana".to_string()),
+                Value::Text("ana".to_string()),
+            ),
+            (
+                Value::Date(Date::from_ymd(2026, 10, 22).unwrap()),
+                Value::Date(Date::from_ymd(2026, 10, 22).unwrap()),
+            ),
+            (
+                Value::Timestamp(Timestamp::MAX),
+                Value::Timestamp(Timestamp::MAX),
+            ),
+        ];
+
+        for (left, right) in pairs {
+            assert_eq!(left, right);
+            assert_eq!(state.hash_one(&left), state.hash_one(&right), "{left:?}");
         }
     }
 

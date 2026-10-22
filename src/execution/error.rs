@@ -3,7 +3,7 @@ use std::fmt;
 use crate::catalog::CatalogError;
 use crate::index::IndexError;
 use crate::table::TableError;
-use crate::types::TypeError;
+use crate::types::{DataType, TypeError};
 
 #[derive(Debug)]
 pub enum ExecutionError {
@@ -18,6 +18,11 @@ pub enum ExecutionError {
     },
     /// A row without a `Rid` reached Delete or Update: a plan built wrong.
     MissingRid,
+    /// An aggregate given a type it does not accept, such as `SUM` of text.
+    UndefinedFunction {
+        function: &'static str,
+        arg: DataType,
+    },
 }
 
 impl ExecutionError {
@@ -28,6 +33,7 @@ impl ExecutionError {
             ExecutionError::Table(err) => err.sqlstate(),
             ExecutionError::Index(err) => err.sqlstate(),
             ExecutionError::ColumnOutOfRange { .. } | ExecutionError::MissingRid => "XX000",
+            ExecutionError::UndefinedFunction { .. } => "42883",
         }
     }
 }
@@ -49,6 +55,11 @@ impl fmt::Display for ExecutionError {
                 f,
                 "a row without a row id reached an executor that changes rows"
             ),
+            ExecutionError::UndefinedFunction { function, arg } => write!(
+                f,
+                "function {function}({}) does not exist",
+                arg.name().to_ascii_lowercase()
+            ),
         }
     }
 }
@@ -60,7 +71,9 @@ impl std::error::Error for ExecutionError {
             ExecutionError::Catalog(err) => Some(err),
             ExecutionError::Table(err) => Some(err),
             ExecutionError::Index(err) => Some(err),
-            ExecutionError::ColumnOutOfRange { .. } | ExecutionError::MissingRid => None,
+            ExecutionError::ColumnOutOfRange { .. }
+            | ExecutionError::MissingRid
+            | ExecutionError::UndefinedFunction { .. } => None,
         }
     }
 }
@@ -136,6 +149,15 @@ mod tests {
                 ExecutionError::MissingRid,
                 "a row without a row id reached an executor that changes rows",
                 "XX000",
+                false,
+            ),
+            (
+                ExecutionError::UndefinedFunction {
+                    function: "sum",
+                    arg: DataType::VARCHAR_MAX,
+                },
+                "function sum(varchar) does not exist",
+                "42883",
                 false,
             ),
         ]
