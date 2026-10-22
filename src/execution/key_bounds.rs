@@ -65,6 +65,22 @@ pub(crate) fn key_bound(
     })
 }
 
+/// The key equal to `value`, or `None` when no key can be: `NULL`, a value the key type
+/// rounds, or one it cannot hold.
+///
+/// It is the range `key >= value AND key <= value` converted as an index scan would: only
+/// when both sides keep the value inclusive does a key equal it.
+pub(crate) fn point_key(value: Value, key_type: DataType) -> Result<Option<Value>, ExecutionError> {
+    let lower = key_bound(Bound::Included(value.clone()), key_type, Side::Lower)?;
+    let upper = key_bound(Bound::Included(value), key_type, Side::Upper)?;
+    Ok(match (lower, upper) {
+        (Some(Bound::Included(lower)), Some(Bound::Included(upper))) if lower == upper => {
+            Some(lower)
+        }
+        _ => None,
+    })
+}
+
 enum Converted {
     Key(Value),
     /// Every key is on the right side of the bound.
@@ -108,6 +124,62 @@ mod tests {
 
     fn converted(bound: Bound<Value>, key_type: DataType, side: Side) -> Option<Bound<Value>> {
         key_bound(bound, key_type, side).unwrap()
+    }
+
+    #[test]
+    fn point_key_should_assign_a_value_of_the_same_family() {
+        let day = Date::from_ymd(2024, 3, 15).unwrap();
+        let half = Value::Double(Finite64::new(0.5).unwrap());
+
+        let integer = point_key(Value::SmallInt(5), DataType::Integer).unwrap();
+        let timestamp = point_key(Value::Date(day), DataType::Timestamp).unwrap();
+        let real = point_key(half, DataType::Real).unwrap();
+        let varchar = DataType::Varchar(NonZeroU16::new(3).unwrap());
+        let text = point_key(Value::Text("abcd".to_string()), varchar).unwrap();
+
+        assert_eq!(integer, Some(Value::Integer(5)));
+        assert_eq!(
+            timestamp,
+            Some(Value::Timestamp(Timestamp::at_midnight(day)))
+        );
+        assert_eq!(real, Some(Value::Real(Finite32::new(0.5).unwrap())));
+        assert_eq!(text, Some(Value::Text("abcd".to_string())));
+    }
+
+    #[test]
+    fn point_key_should_be_none_when_no_key_can_equal_the_value() {
+        let cases = [
+            (Value::Null, DataType::Integer),
+            (Value::Double(Finite64::new(0.1).unwrap()), DataType::Real),
+            (Value::Double(Finite64::new(1e-50).unwrap()), DataType::Real),
+            (Value::Integer(70_000), DataType::SmallInt),
+            (Value::BigInt(i64::MIN), DataType::Integer),
+        ];
+
+        for (value, key_type) in cases {
+            assert_eq!(
+                point_key(value.clone(), key_type).unwrap(),
+                None,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn point_key_of_another_family_should_fail() {
+        let cases = [
+            (Value::Text("1".to_string()), DataType::Integer),
+            (
+                Value::Double(Finite64::new(1.0).unwrap()),
+                DataType::Integer,
+            ),
+        ];
+
+        for (value, key_type) in cases {
+            let err = point_key(value, key_type).unwrap_err();
+
+            assert_eq!(err.sqlstate(), "42804");
+        }
     }
 
     #[test]

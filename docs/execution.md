@@ -10,6 +10,7 @@ Dependencies point downward: `execution` → `catalog` → `table` / `index` →
 - [Index Scan](#index-scan)
 - [Aggregation](#aggregation)
 - [Sort, Limit and TopN](#sort-limit-and-topn)
+- [Index Nested Loop Join](#index-nested-loop-join)
 - [Writing: two phases](#writing-two-phases)
 - [Errors](#errors)
 - [Design decisions](#design-decisions)
@@ -49,7 +50,7 @@ let mut query = Projection::new(Box::new(filter), vec![
 let rows = execute(&mut query, &mut ExecutionContext { catalog: &mut catalog, bpm: &mut bpm })?;
 ```
 
-- Rows read from a table carry their **`Rid`**, which Delete and Update need; rows computed by `Values` and the groups of an `Aggregation` have none. `Filter`, `Projection`, `Sort`, `Limit` and `TopN` keep their child's `Rid`.
+- Rows read from a table carry their **`Rid`**, which Delete and Update need; rows computed by `Values`, the groups of an `Aggregation` and the rows of a join have none. `Filter`, `Projection`, `Sort`, `Limit` and `TopN` keep their child's `Rid`.
 - The **database is passed to each call** (`ExecutionContext`) instead of being stored in the executors, so a tree of them never holds two mutable borrows of the catalog or the buffer pool, and **no executor keeps a page pinned between calls**.
 - **After an `Err`, an executor is finished:** its children may have been consumed halfway, so it must not be called again.
 - **A `SeqScan` does not shield itself from changes made between two of its `next` calls** by other code: it simply goes on after the last `Rid` it returned. The writing executors never interleave with their own scan, because they read their child completely first; a plan built by hand that interleaves a scan with writes to the same table sees those writes, or not, depending on where they land.
@@ -87,6 +88,7 @@ Every operator is the `Value` operation of the same name, so `NULL`, three-value
 | `Sort::new(child, keys)` | the child's rows ordered by the keys (`ASC`/`DESC`, `NULLS FIRST`/`LAST`), ties in input order, sorted in memory; keeps the `Rid` ([below](#sort-limit-and-topn)) |
 | `Limit::new(child, count, offset)` | skips `offset` rows and hands out at most `count`, never pulling the child further; keeps the `Rid` |
 | `TopN::new(child, keys, count, offset)` | the rows of `Limit(Sort(child, keys), count, offset)`, keeping at most `offset + count` rows in a heap |
+| `IndexNestedLoopJoin::new(outer, outer_key, index, join_type, predicate)` | for each outer row, the inner rows the index finds for `outer_key` and the predicate accepts, as outer values followed by inner values, without `Rid`; `Inner` or `Left` (padding with `NULL`s) ([below](#index-nested-loop-join)) |
 
 Insert, Delete and Update return **one row with the number of rows they changed** (a `BIGINT`), as BusTub's do, and `None` afterwards. A row without a `Rid` reaching Delete or Update is `MissingRid` (`XX000`); a `Rid` given twice counts once.
 
@@ -217,6 +219,32 @@ let page = TopN::new(Box::new(SeqScan::new("players")),
 
 `Sort`, `Limit` and `TopN` all keep each row's `Rid`: they still hand out table rows, so `Delete(Limit(…))` works.
 
+## Index Nested Loop Join
+
+`IndexNestedLoopJoin` (`join.rs`) joins two tables through an index of the inner one (CMU 15-445 lecture 12; BusTub's `NestedIndexJoin` in project 3; PostgreSQL's nested loop over an index scan). A plain nested loop scans the whole inner table for every outer row, M + m·N pages; through the index each outer row costs one descent of the B+Tree and the fetch of its row, M + m·C. The plain nested loop is not implemented, on purpose (decided with the author), and since the inner side is reached through the index, no executor ever has to start over: `Executor` keeps only `next`.
+
+```rust
+pub enum JoinType { Inner, Left }
+
+// SELECT o.id, o.amount, c.name FROM orders o JOIN customers c ON o.customer_id = c.id AND c.active
+// orders: (id, customer_id, amount); customers: (id, name, active), index customers_id
+let joined = IndexNestedLoopJoin::new(
+    Box::new(SeqScan::new("orders")),
+    Expr::Column(1),            // o.customer_id, over the outer row
+    "customers_id",
+    JoinType::Inner,
+    Some(Expr::Column(5)),      // c.active, over the joined row (3 + 2)
+);
+```
+
+- **The first call** looks the index and its table up in the catalog: the table's name, the key type and its number of columns. An unknown index is `42704`.
+- **For each outer row:** `outer_key` is evaluated over it and converted to the key type by `key_bounds::point_key`, the rule of an `IndexScan::point` bound: an integer of another width or a `DATE` for a `TIMESTAMP` key is assigned; `NULL`, a value the key type rounds (`0.1` for a `REAL` key) or cannot hold (`70000` for a `SMALLINT` key) matches nothing; another family (text or a float for an integer key) is `42804`. The range `[key, key]` of the tree gives the `Rid`s, and `TableHeap::get` the inner rows; a `Rid` the table does not have is `XX000`, as in the `IndexScan`.
+- **A joined row** is the outer values followed by the inner table's values, and has **no `Rid`**: it is not a row of one table.
+- **The residual predicate** (the rest of the `ON`) is evaluated over the joined row and only TRUE matches (`42804` if it is not boolean). It decides what matches: in a `LEFT` join, an outer row whose pair it rejects comes out padded with `NULL`s, where a `Filter` above the join would drop it.
+- **`LEFT`:** an outer row without a match (no key in the index, a `NULL` key, or every pair rejected) comes out once, followed by as many `NULL`s as the inner table has columns.
+- **Order:** the outer order; for one outer row, its matches in key order.
+- **Nothing stays pinned:** the matches of an outer row are read into a `Vec` within the call and the range over the tree is dropped, as the `IndexScan` does with its cursor. Every index is unique today, so an outer row has at most one match; iterating the range keeps the join right for non-unique indexes.
+
 ## Writing: two phases
 
 1. **Read** every row the child produces. This solves the **Halloween problem**: an update that moves a row to a later page (its `Rid` changes) would meet it again in the scan and update it twice. It also lets the whole statement be validated.
@@ -250,7 +278,7 @@ A statement that fails on its data or a constraint therefore leaves the table an
 
 See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writes.md) for the context passed to each call and the two-phase writes. Also:
 
-- **A trait for executors:** there are twelve real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
+- **A trait for executors:** there are thirteen real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
 - **A cursor on the heap** (`HeapFile::next_after`) instead of holding a `TableScan` (which borrows the buffer pool) or reading the whole table: the scan stays lazy. The cost is fetching the page again for every row, almost always a cache hit.
 - **The Index Scan's cursor is the last key**, not a leaf and a position in it: a leaf kept between calls could be merged away and freed by a write. It reuses `BPlusTree::range` (create, take one entry, drop), which already copies the leaf and unpins it before handing out entries; the cost is copying a leaf per row, which a leaf cursor can remove later.
 - **Bounds that do not fit the key type narrow the range** instead of failing: `small_col < 70000` is a valid query and must return every row.
@@ -270,6 +298,13 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - **The direction inside each key value**, instead of passing the `SortKey`s to the comparison: keys implement `Ord`, so `sort_by` and `BinaryHeap` take them as they are. The cost is two `Copy` enums per value.
 - **`TopN` as its own executor** (decided with the author), as BusTub does, instead of a mode of `Sort`; the random test compares it with `Limit(Sort)`.
 - **Counts as expressions without columns**, evaluated once, instead of `u64`s in the constructor: the planner will pass literals and parameters (`LIMIT $1`), and the checks (`NULL`, negative, type) live in one place, with SQLSTATEs.
+- **An index nested loop join instead of the plain one** (decided with the author): one descent of the B+Tree per outer row instead of a scan of the inner table. Joins without an index on the inner side or without an equality wait for a Hash Join or a planner.
+- **The join key converted like an `IndexScan::point` bound** (`point_key`), instead of a rule of its own: `WHERE c.id = 5` and the join behave the same, rounding and out-of-range values included.
+- **The range `[key, key]` instead of `BPlusTree::get`:** at most one match with unique indexes, and still right when indexes may repeat keys.
+- **The matches of an outer row in a `Vec`**, instead of keeping the iterator over the tree between calls: it borrows the buffer pool and would hold a leaf a merge could free.
+- **The residual predicate inside the join** (decided with the author), instead of a `Filter` above: in a `LEFT` join it decides what matches.
+- **`INNER` and `LEFT` only** (decided with the author): `RIGHT` and `FULL` need to know which inner rows never matched, which only a scan of the inner table tells.
+- **The inner width from the catalog**, read on the first call: a `LEFT` join pads with it even when no inner row is ever read.
 - **A `NULL` count is an error** (the standard, decided with the author), instead of PostgreSQL's no limit.
 
 ## Tests
@@ -291,11 +326,15 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - `sort.rs`: `ASC` and `DESC` with their default `NULL` positions, `NULLS FIRST`/`LAST` in both directions, later keys only breaking ties, integer widths and floats interleaved and equal values of different widths tying, text by bytes (`'a' < 'a '`), dates, booleans, timestamps and `REAL`; `Sort` and `TopN` without keys (input order); `Sort` of no rows and of one, ties in input order, the `Rid`s of a table spanning pages, a failing key (`22012`) and a failing child (`42P01`), each ending the sort; `TopN` equal to `Limit(Sort)` for several counts and offsets (past the end included), ties in input order, `count = 0` without reading the child, a count of `i64::MAX` with an offset of `i64::MAX - 1` and of `1`, every invalid count before reading the child (`2201W`, `2201X`, `42804`), a failing key and a failing count (`22012`), the `Rid`s.
 - `limit.rs`: every combination of count and offset (none, one, both, offset past the end, `0`), every integer width, a float, text or boolean count (`42804`), `NULL` and negative counts (`2201W`, `2201X` and their messages), a count with a column (`XX000`), a count or offset that fails to evaluate (`22012`), the child not pulled after the count nor with `LIMIT 0`, an invalid count failing before the child is pulled, the `Rid`s, `None` after the end.
 - `random_sorts_and_limits_should_match_a_model`: 80 rounds over a table of `(INTEGER, VARCHAR, DOUBLE PRECISION)` with `NULL`s and few distinct values, changed by Insert and Delete executors, sorted by 1 to 3 random keys (direction and `NULL` position random) with random counts and offsets; `Sort`, `Limit(Sort)` and `TopN` must equal, row and `Rid`, a stable sort of the stored rows by a model comparator over `Option<i32>`, `Option<String>` and `Option<f64>`.
-- Mutations checked by hand, each caught: for Sort and TopN, an unstable sort, `DESC` also moving the `NULL`s, `TopN` without the arrival tiebreak, a full heap letting a later tie replace its worst row, and reading the child with `count = 0`; for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
+- `key_bounds.rs`, `point_key`: an integer of another width, a `DATE` for a `TIMESTAMP` key, an exact `DOUBLE PRECISION` for a `REAL` key and text longer than the `VARCHAR` are assigned; `NULL`, `0.1` and `1e-50` for a `REAL` key, `70000` for a `SMALLINT` key and `i64::MIN` for an `INTEGER` key match nothing; text and a float for an integer key are `42804`.
+- `join.rs`: `INNER` pairs in outer order, a `NULL` outer key, a `SMALLINT` key against an `INTEGER` index, a key of another family (`42804`), an empty outer side and an empty inner table, an unknown index (`42704`), a failing key (`22012`, after a first row, then `None`), no `Rid` over a `SeqScan`; `LEFT` padding unmatched rows, `NULL` keys and every row of an empty inner table with the inner width; a residual predicate dropping pairs in `INNER` (`FALSE` and `UNKNOWN`), padding them in `LEFT` where a `Filter` above drops them, reading both sides, not boolean (`42804`) or failing (`22012`); an index out of step with its table (`XX000`, then `None`); a failing outer child (`42P01`); an outer key longer than the index can hold (no match, padded in `LEFT`); a `DOUBLE PRECISION` key against a `REAL` index (`0.5` matches, `0.1` does not) and a `DATE` key against a `TIMESTAMP` index (midnight matches); a self-join of a table scanned and searched through its own index.
+- `random_joins_should_match_a_plain_nested_loop`: 80 rounds over `orders (INTEGER, SMALLINT, INTEGER)` and `customers (INTEGER, VARCHAR, BOOLEAN)` with a unique index, both changed by Insert and Delete executors (customers deleted under their orders, orders with `NULL` or missing customers), joined `INNER` or `LEFT` with no predicate, `c.active` or `o.amount > 50`; the output must equal, row by row and in order, a plain nested loop over the stored rows written in Rust, without the index or `key_bounds`.
+- Mutations checked by hand, each caught: for the join, a predicate ignored, `LEFT` padding outer rows that matched, and inner rows that fail to load skipped instead of failing; for Sort and TopN, an unstable sort, `DESC` also moving the `NULL`s, `TopN` without the arrival tiebreak, a full heap letting a later tie replace its worst row, and reading the child with `count = 0`; for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
 - Integration in [`tests/execution_executors.rs`](../tests/execution_executors.rs), with 8 KB pages and an 8-frame pool: 3,000 rows inserted through the executors, updated in place and with rows moving, and deleted with `%`; after reopening, the scan and both indexes match. A refused insert leaves no trace after reopening.
 - Integration in [`tests/execution_index_scan.rs`](../tests/execution_index_scan.rs), same setup, 3,000 rows in scattered order: after reopening, points and ranges through the `INTEGER` and the `VARCHAR` index equal `Filter(SeqScan)`; an `UPDATE … SET id = id + 10000, email = email || <300 bytes> WHERE id BETWEEN 1000 AND 1999` read through the index moves every key past the cursor and every row out of its page, and after reopening the scans and both indexes match.
 - Integration in [`tests/execution_aggregation.rs`](../tests/execution_aggregation.rs), same setup, 4,000 orders with `NULL` customers and amounts: `GROUP BY customer` over a `SeqScan` equals a model, and again after reopening; over an `IndexScan` of a range with a `HAVING`, it equals the same plan over `Filter(SeqScan)` and the model; a Delete of one customer removes its group and changes the total `COUNT(*)`.
 - Integration in [`tests/execution_sort.rs`](../tests/execution_sort.rs), same setup, 3,000 players inserted in scattered id order: `ORDER BY team, score DESC, id` over a `SeqScan` equals a model and gives the same rows after reopening; `TopN` equals `Limit(Sort)` over the whole table; a `Limit` with an offset over an `IndexScan` gives the first keys of the range; `ORDER BY COUNT(*) DESC, team` over an `Aggregation` sorts the groups.
+- Integration in [`tests/execution_join.rs`](../tests/execution_join.rs), same setup, 4,000 orders and 257 customers: `INNER` and `LEFT` over a `SeqScan` equal a model after reopening; a join feeds an `Aggregation` (revenue per region) and a `Sort`; deleting customers through the executors removes their pairs from `INNER` and pads them in `LEFT`.
 
 ## Limitations
 
@@ -309,4 +348,5 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - ⚠️ **Sort keeps its whole input in memory**; there is no external merge sort. `TopN` keeps `offset + count` rows.
 - **Sorting is not complete:** no `FETCH FIRST … WITH TIES` or `PERCENT`, no `COLLATE`, and no planner to choose `TopN` over `Limit(Sort)`.
 - ⚠️ **Index Scan bounds must convert to the key type without loss** (`42804` otherwise), and there is no planner yet to choose between Index Scan and SeqScan.
+- ⚠️ **Joins need an index on the inner side** and an equality on one column: no plain nested loop, Hash Join or Sort-Merge Join yet, and no `RIGHT`, `FULL` or `CROSS JOIN`. There is no planner to choose the inner side or the index.
 - **Not there yet:** an output schema with names and types, a descending or index-only scan, and joins.

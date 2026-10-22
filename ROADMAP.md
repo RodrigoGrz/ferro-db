@@ -81,9 +81,10 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Limit: `LIMIT`/`OFFSET` counts validated as the standard says (`2201W`, `2201X`), never pulling the child past the count ([`limit.rs`](src/execution/limit.rs), [`tests/execution_sort.rs`](tests/execution_sort.rs), [docs](docs/execution.md#counts))
 - [x] Aggregation: hash aggregation in memory with `COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, skipping `NULL` as the standard does ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs), [docs](docs/execution.md#aggregation))
 - [x] GROUP BY: groups by any expressions, `NULL` keys in one group, in order of first appearance; `HAVING` is a `Filter` over the groups ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs))
-- [ ] JOIN
+- [ ] JOIN. `INNER` and `LEFT` exist through the `IndexNestedLoopJoin`; `RIGHT`, `FULL`, `CROSS` and the syntax do not.
 - [ ] Hash Join
-- [ ] Nested Loop Join
+- [ ] Nested Loop Join. Not implemented on purpose: the plain loop scans the inner table for every outer row; the index nested loop join below replaces it.
+- [x] Index Nested Loop Join: one B+Tree descent per outer row, `INNER` and `LEFT` with a residual predicate, the key converted like an `IndexScan` point ([`join.rs`](src/execution/join.rs), [`tests/execution_join.rs`](tests/execution_join.rs), [docs](docs/execution.md#index-nested-loop-join))
 
 ## Transactions
 
