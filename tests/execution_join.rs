@@ -137,7 +137,8 @@ fn sorted_values(rows: Vec<Row>) -> Vec<Vec<Value>> {
     values
 }
 
-/// The join computed without the executors, by order id.
+/// The join computed without the executors, by order id. Only `INNER` and `LEFT` reach an index
+/// nested loop join.
 fn expected_join(join_type: JoinType, exists: impl Fn(i32) -> bool) -> Vec<Vec<Value>> {
     (0..ORDERS)
         .filter_map(|id| {
@@ -149,7 +150,7 @@ fn expected_join(join_type: JoinType, exists: impl Fn(i32) -> bool) -> Vec<Vec<V
             match (matched, join_type) {
                 (Some(customer), _) => Some([order, customer].concat()),
                 (None, JoinType::Left) => Some([order, vec![Value::Null; 3]].concat()),
-                (None, JoinType::Inner) => None,
+                (None, _) => None,
             }
         })
         .collect()

@@ -11,6 +11,7 @@ Dependencies point downward: `execution` → `catalog` → `table` / `index` →
 - [Aggregation](#aggregation)
 - [Sort, Limit and TopN](#sort-limit-and-topn)
 - [Index Nested Loop Join](#index-nested-loop-join)
+- [Hash Join](#hash-join)
 - [Writing: two phases](#writing-two-phases)
 - [Errors](#errors)
 - [Design decisions](#design-decisions)
@@ -89,6 +90,7 @@ Every operator is the `Value` operation of the same name, so `NULL`, three-value
 | `Limit::new(child, count, offset)` | skips `offset` rows and hands out at most `count`, never pulling the child further; keeps the `Rid` |
 | `TopN::new(child, keys, count, offset)` | the rows of `Limit(Sort(child, keys), count, offset)`, keeping at most `offset + count` rows in a heap |
 | `IndexNestedLoopJoin::new(outer, outer_key, index, join_type, predicate)` | for each outer row, the inner rows the index finds for `outer_key` and the predicate accepts, as outer values followed by inner values, without `Rid`; `Inner` or `Left` (padding with `NULL`s) ([below](#index-nested-loop-join)) |
+| `HashJoin::new(left, right, keys, join_type, predicate)` | builds a hash table of the right input by key, then joins each left row with its bucket; `Inner`, `Left`, `Right` or `Full`, without `Rid` ([below](#hash-join)) |
 
 Insert, Delete and Update return **one row with the number of rows they changed** (a `BIGINT`), as BusTub's do, and `None` afterwards. A row without a `Rid` reaching Delete or Update is `MissingRid` (`XX000`); a `Rid` given twice counts once.
 
@@ -245,6 +247,35 @@ let joined = IndexNestedLoopJoin::new(
 - **Order:** the outer order; for one outer row, its matches in key order.
 - **Nothing stays pinned:** the matches of an outer row are read into a `Vec` within the call and the range over the tree is dropped, as the `IndexScan` does with its cursor. Every index is unique today, so an outer row has at most one match; iterating the range keeps the join right for non-unique indexes.
 
+## Hash Join
+
+`HashJoin` (`hash_join.rs`) joins two inputs by equal keys without an index (CMU 15-445 lecture 12). The first call reads the whole right input into a hash table by key (build); then each left row looks its bucket up (probe). Each input is read once; the right one is kept in memory.
+
+```rust
+pub struct JoinInput { pub child: Box<dyn Executor>, pub width: usize }
+
+// SELECT * FROM customers c FULL JOIN regions r ON c.region = r.code
+// customers: (id, name, region SMALLINT); regions: (code BIGINT, name), no index
+let joined = HashJoin::new(
+    JoinInput { child: Box::new(SeqScan::new("customers")), width: 3 },
+    JoinInput { child: Box::new(SeqScan::new("regions")), width: 2 },
+    vec![(Expr::Column(2), Expr::Column(0))],   // (over the left row, over the right row)
+    JoinType::Full,
+    None,
+);
+```
+
+- **Keys** are pairs of expressions, one over the left row and one over the right row; two rows match when every pair is equal and the residual predicate is TRUE. With no keys every pair of rows matches: `Inner` without a predicate is a `CROSS JOIN`.
+- **Normalized keys.** `Value`'s derived `Eq` separates `Integer(1)` from `BigInt(1)` and `Double(1.0)`, but SQL's `=` does not, and the two sides of a join may have different types. Each key value is hashed as: an integer of any width, or a float whose value is an `i64`, as that integer (`1 = 1.0`); any other float as the bits of its exact `f64` (`REAL 0.1 <> DOUBLE PRECISION 0.1`, the exact comparison of the types layer); text as its bytes (`NO PAD`); a `DATE` as its midnight and a `TIMESTAMP` as itself, in microseconds. Two normalized keys are equal exactly when `=` is TRUE.
+- **Families:** the first non-`NULL` right value of each key column is kept, and every later key value, right or left, is compared with it by `Value::compare`: keys of different families fail with the `=` error (`42883`). With an empty right input nothing is checked.
+- **`NULL`** in any key never matches; the row still comes out padded in the outer joins.
+- **Outer joins:** `Left` and `Full` pad a left row without a match with `right.width` `NULL`s where it is. Each right row carries its arrival number and whether a pair with it passed the predicate; `Right` and `Full` hand out the right rows that never matched (`NULL` keys included) at the end, in input order, after `left.width` `NULL`s. The predicate decides: a right row whose only pair it rejects comes out padded.
+- **Widths:** an empty input does not say how many values its rows have, and the outer joins need them, so each `JoinInput` declares its width; a row of another width is `RowWidthMismatch` (`XX000`).
+- **Order:** the left input's order; for one left row, its matches in the right input's order; unmatched right rows last.
+- **States:** `Start` (build on the first call), `Probing` (one left row at a time, its joined rows pending), `Finishing` (the unmatched right rows) and `Done`, also after an `Err`.
+
+The `IndexNestedLoopJoin` refuses `Right` and `Full` with `UnsupportedJoinType` (`0A000`): it finds inner rows only for outer ones, and cannot tell which inner rows never matched.
+
 ## Writing: two phases
 
 1. **Read** every row the child produces. This solves the **Halloween problem**: an update that moves a row to a later page (its `Rid` changes) would meet it again in the scan and update it twice. It also lets the whole statement be validated.
@@ -273,12 +304,14 @@ A statement that fails on its data or a constraint therefore leaves the table an
 | `MissingRid` | `XX000` (a plan built wrong) |
 | `UndefinedFunction { function, arg }` | `42883`: an aggregate given a type it does not accept (`function sum(varchar) does not exist`) |
 | `InvalidRowCount { clause, count }` | `2201W` for `LIMIT`, `2201X` for `OFFSET`: a `NULL` (`count: None`) or negative count |
+| `UnsupportedJoinType { join_type }` | `0A000`: a `RIGHT` or `FULL` index nested loop join |
+| `RowWidthMismatch { expected, actual }` | `XX000`: a row of a join input whose width is not the declared one (a plan built wrong) |
 
 ## Design decisions
 
 See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writes.md) for the context passed to each call and the two-phase writes. Also:
 
-- **A trait for executors:** there are thirteen real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
+- **A trait for executors:** there are fourteen real implementations now and more to come, and a tree of `Box<dyn Executor>` is the Volcano model itself.
 - **A cursor on the heap** (`HeapFile::next_after`) instead of holding a `TableScan` (which borrows the buffer pool) or reading the whole table: the scan stays lazy. The cost is fetching the page again for every row, almost always a cache hit.
 - **The Index Scan's cursor is the last key**, not a leaf and a position in it: a leaf kept between calls could be merged away and freed by a write. It reuses `BPlusTree::range` (create, take one entry, drop), which already copies the leaf and unpins it before handing out entries; the cost is copying a leaf per row, which a leaf cursor can remove later.
 - **Bounds that do not fit the key type narrow the range** instead of failing: `small_col < 70000` is a valid query and must return every row.
@@ -298,6 +331,15 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - **The direction inside each key value**, instead of passing the `SortKey`s to the comparison: keys implement `Ord`, so `sort_by` and `BinaryHeap` take them as they are. The cost is two `Copy` enums per value.
 - **`TopN` as its own executor** (decided with the author), as BusTub does, instead of a mode of `Sort`; the random test compares it with `Limit(Sort)`.
 - **Counts as expressions without columns**, evaluated once, instead of `u64`s in the constructor: the planner will pass literals and parameters (`LIMIT $1`), and the checks (`NULL`, negative, type) live in one place, with SQLSTATEs.
+- **The hash join builds on the right input**, always, instead of the smaller one: without statistics nothing tells which is smaller; the optimizer will order the inputs.
+- **The hash table in memory**, instead of a Grace or hybrid hash join that partitions to disk: like the Aggregation and the Sort. The cost is the whole right input in memory.
+- **Normalized join keys**, instead of `Value` itself as in `GROUP BY`: the two sides may have different types (`SMALLINT` against `BIGINT`, `INTEGER` against `DOUBLE PRECISION`), which the derived `Eq` would keep apart; in a `GROUP BY` a column has one type.
+- **Key families checked against the first right key**, with `Value::compare`, instead of letting keys of different families simply never match: the error is the one `=` gives in a `Filter`, for one comparison per key.
+- **`JoinInput` declares its width**, instead of learning it from the rows: an empty input has no rows to learn from, and the outer joins pad with it. Each row is checked against it.
+- **`RIGHT` and `FULL` by marking the right rows** (decided with the author): possible because the build side is in memory. The `IndexNestedLoopJoin`, which cannot see unmatched inner rows, refuses them with `0A000`.
+- **Buckets that own their rows and arrival numbers**, instead of positions into a `Vec` of rows: no indexing in production code; the unmatched right rows are gathered from the buckets and sorted by arrival at the end, O(n log n) in those rows only.
+- **Key pairs `Vec<(Expr, Expr)>`**, instead of two lists: the two sides can never have a different number of keys.
+- **One rule for the `ON`** (`join::joined` and `join::passes`), shared by both joins: a joined row is the left values then the right ones, without `Rid`, and only a TRUE predicate matches.
 - **An index nested loop join instead of the plain one** (decided with the author): one descent of the B+Tree per outer row instead of a scan of the inner table. Joins without an index on the inner side or without an equality wait for a Hash Join or a planner.
 - **The join key converted like an `IndexScan::point` bound** (`point_key`), instead of a rule of its own: `WHERE c.id = 5` and the join behave the same, rounding and out-of-range values included.
 - **The range `[key, key]` instead of `BPlusTree::get`:** at most one match with unique indexes, and still right when indexes may repeat keys.
@@ -329,12 +371,15 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - `key_bounds.rs`, `point_key`: an integer of another width, a `DATE` for a `TIMESTAMP` key, an exact `DOUBLE PRECISION` for a `REAL` key and text longer than the `VARCHAR` are assigned; `NULL`, `0.1` and `1e-50` for a `REAL` key, `70000` for a `SMALLINT` key and `i64::MIN` for an `INTEGER` key match nothing; text and a float for an integer key are `42804`.
 - `join.rs`: `INNER` pairs in outer order, a `NULL` outer key, a `SMALLINT` key against an `INTEGER` index, a key of another family (`42804`), an empty outer side and an empty inner table, an unknown index (`42704`), a failing key (`22012`, after a first row, then `None`), no `Rid` over a `SeqScan`; `LEFT` padding unmatched rows, `NULL` keys and every row of an empty inner table with the inner width; a residual predicate dropping pairs in `INNER` (`FALSE` and `UNKNOWN`), padding them in `LEFT` where a `Filter` above drops them, reading both sides, not boolean (`42804`) or failing (`22012`); an index out of step with its table (`XX000`, then `None`); a failing outer child (`42P01`); an outer key longer than the index can hold (no match, padded in `LEFT`); a `DOUBLE PRECISION` key against a `REAL` index (`0.5` matches, `0.1` does not) and a `DATE` key against a `TIMESTAMP` index (midnight matches); a self-join of a table scanned and searched through its own index.
 - `random_joins_should_match_a_plain_nested_loop`: 80 rounds over `orders (INTEGER, SMALLINT, INTEGER)` and `customers (INTEGER, VARCHAR, BOOLEAN)` with a unique index, both changed by Insert and Delete executors (customers deleted under their orders, orders with `NULL` or missing customers), joined `INNER` or `LEFT` with no predicate, `c.active` or `o.amount > 50`; the output must equal, row by row and in order, a plain nested loop over the stored rows written in Rust, without the index or `key_bounds`.
-- Mutations checked by hand, each caught: for the join, a predicate ignored, `LEFT` padding outer rows that matched, and inner rows that fail to load skipped instead of failing; for Sort and TopN, an unstable sort, `DESC` also moving the `NULL`s, `TopN` without the arrival tiebreak, a full heap letting a later tie replace its worst row, and reading the child with `count = 0`; for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
+- `hash_join.rs`: normalized keys equal for integers of every width, an integer and an integral `REAL` or `DOUBLE PRECISION`, `REAL 0.5` and `DOUBLE PRECISION 0.5`, equal text, booleans, a `DATE` and its midnight `TIMESTAMP`; different for `0.5` against `0` and `1`, `REAL 0.1` against `DOUBLE PRECISION 0.1`, floats past the `i64` range against its limits, `'a'` against `'a '`, the next day, text against a number; no key for `NULL`. `INNER` pairs many-to-many in left then right order, two keys, keys of different numeric types, `NULL` in either key, keys of different families from the left and among right rows (`42883`), empty inputs, no keys (every pair), a row of another width on each side (`XX000`), a failing key on each side (`22012`) and a failing child (`42P01`), no `Rid`. `LEFT` padding in place, `RIGHT` adding unmatched right rows at the end, `FULL` both, the declared width of an empty side, `NULL` keys padded on both sides in arrival order. A residual predicate dropping pairs, a right row whose only pair it rejects padded in `RIGHT` and `FULL`, a predicate not boolean (`42804`) or failing (`22012`). A key of another family against an empty right input (no error: no match, padded in `LEFT`), a `DATE` key joining the midnight `TIMESTAMP` and not ten o'clock, outer joins of two empty inputs (no rows), a failing left child after the build (`42P01`). `join.rs`: `RIGHT` and `FULL` refused by the index nested loop join (`0A000`).
+- `random_hash_joins_should_match_a_nested_loop`: 300 rounds of two `VALUES` inputs with repeated and `NULL` keys, a `SMALLINT`, `INTEGER` or `DOUBLE PRECISION` key on the left against an `INTEGER`, `BIGINT` or `REAL` key on the right (with halves no integer equals), one or two keys, the four join types and an optional predicate; the output must equal, in order, a nested loop over the rows that compares numbers as `f64` and labels as `String`, without the normalized key or a hash table.
+- Mutations checked by hand, each caught: for the hash join, integral floats not normalized, a right row marked as matched before the predicate, and unmatched right rows not sorted by arrival; for the index join, a predicate ignored, `LEFT` padding outer rows that matched, and inner rows that fail to load skipped instead of failing; for Sort and TopN, an unstable sort, `DESC` also moving the `NULL`s, `TopN` without the arrival tiebreak, a full heap letting a later tie replace its worst row, and reading the child with `count = 0`; for the Aggregation, a key cut to its first expression (caught by the random test) and an executor that reads on after an error; entries rewritten row by row instead of in two passes, the keys of replaced rows not allowed, a new `Rid` ignored when the key did not change, and Insert without the uniqueness check; for the Index Scan, each corner of the narrowed range flipped, `NULL` as no bound, an inclusive bound made exclusive, the upper bound converted as a lower one, and an empty range scanned whole; in the float rules, rounding ignored, a rounded-up bound made exclusive on the upper side the wrong way, a float overflow failing and a value near zero not taken as zero (the random test alone catches each of `key_bounds.rs`).
 - Integration in [`tests/execution_executors.rs`](../tests/execution_executors.rs), with 8 KB pages and an 8-frame pool: 3,000 rows inserted through the executors, updated in place and with rows moving, and deleted with `%`; after reopening, the scan and both indexes match. A refused insert leaves no trace after reopening.
 - Integration in [`tests/execution_index_scan.rs`](../tests/execution_index_scan.rs), same setup, 3,000 rows in scattered order: after reopening, points and ranges through the `INTEGER` and the `VARCHAR` index equal `Filter(SeqScan)`; an `UPDATE … SET id = id + 10000, email = email || <300 bytes> WHERE id BETWEEN 1000 AND 1999` read through the index moves every key past the cursor and every row out of its page, and after reopening the scans and both indexes match.
 - Integration in [`tests/execution_aggregation.rs`](../tests/execution_aggregation.rs), same setup, 4,000 orders with `NULL` customers and amounts: `GROUP BY customer` over a `SeqScan` equals a model, and again after reopening; over an `IndexScan` of a range with a `HAVING`, it equals the same plan over `Filter(SeqScan)` and the model; a Delete of one customer removes its group and changes the total `COUNT(*)`.
 - Integration in [`tests/execution_sort.rs`](../tests/execution_sort.rs), same setup, 3,000 players inserted in scattered id order: `ORDER BY team, score DESC, id` over a `SeqScan` equals a model and gives the same rows after reopening; `TopN` equals `Limit(Sort)` over the whole table; a `Limit` with an offset over an `IndexScan` gives the first keys of the range; `ORDER BY COUNT(*) DESC, team` over an `Aggregation` sorts the groups.
 - Integration in [`tests/execution_join.rs`](../tests/execution_join.rs), same setup, 4,000 orders and 257 customers: `INNER` and `LEFT` over a `SeqScan` equal a model after reopening; a join feeds an `Aggregation` (revenue per region) and a `Sort`; deleting customers through the executors removes their pairs from `INNER` and pads them in `LEFT`.
+- Integration in [`tests/execution_hash_join.rs`](../tests/execution_hash_join.rs), same setup, 400 customers, 3,000 orders and 5 regions: the four join types on a `SMALLINT` column against a `BIGINT` one without index equal a model after reopening; `INNER` and `LEFT` equal the `IndexNestedLoopJoin` where the right column has an index; two chained hash joins feed an `Aggregation`.
 
 ## Limitations
 
@@ -348,5 +393,6 @@ See [ADR 0011](decisions/0011-executors-with-context-per-call-and-two-phase-writ
 - ⚠️ **Sort keeps its whole input in memory**; there is no external merge sort. `TopN` keeps `offset + count` rows.
 - **Sorting is not complete:** no `FETCH FIRST … WITH TIES` or `PERCENT`, no `COLLATE`, and no planner to choose `TopN` over `Limit(Sort)`.
 - ⚠️ **Index Scan bounds must convert to the key type without loss** (`42804` otherwise), and there is no planner yet to choose between Index Scan and SeqScan.
-- ⚠️ **Joins need an index on the inner side** and an equality on one column: no plain nested loop, Hash Join or Sort-Merge Join yet, and no `RIGHT`, `FULL` or `CROSS JOIN`. There is no planner to choose the inner side or the index.
+- ⚠️ **Joins need an equality** (or no condition at all): the index nested loop join needs an index on the inner side, and the hash join keeps its whole right input in memory, with no partitioning to disk. There is no plain nested loop or Sort-Merge Join for other conditions (`ON a.x < b.y` only works as a residual predicate), and no planner to choose the join, its build side or the index.
+- ⚠️ **Hash join key types are checked while running**, and only when both sides have values: a key of the wrong family against an empty right input does not fail.
 - **Not there yet:** an output schema with names and types, a descending or index-only scan, and joins.

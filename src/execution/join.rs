@@ -20,9 +20,24 @@ use super::{ExecutionContext, ExecutionError, Executor, Expr, Row};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
     Inner,
-    /// Every outer row comes out at least once, with NULLs for the inner columns when
+    /// Every left (outer) row comes out at least once, with NULLs for the right columns when
     /// nothing matched.
     Left,
+    /// Every right row comes out at least once, with NULLs for the left columns.
+    Right,
+    /// `LEFT` and `RIGHT` together.
+    Full,
+}
+
+impl JoinType {
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            JoinType::Inner => "INNER JOIN",
+            JoinType::Left => "LEFT JOIN",
+            JoinType::Right => "RIGHT JOIN",
+            JoinType::Full => "FULL JOIN",
+        }
+    }
 }
 
 /// For each outer row, the inner rows whose `index` key equals `outer_key` (evaluated over
@@ -75,6 +90,13 @@ impl IndexNestedLoopJoin {
     }
 
     fn inner_table(&self, ctx: &mut ExecutionContext<'_>) -> Result<InnerTable, ExecutionError> {
+        // The index only finds inner rows for outer ones: it cannot tell which inner rows never
+        // matched.
+        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            return Err(ExecutionError::UnsupportedJoinType {
+                join_type: self.join_type,
+            });
+        }
         let table = ctx.catalog.index_table(&self.index)?;
         let (name, width) = (table.name.clone(), table.schema.columns().len());
         let key_type = ctx.catalog.index_tree(ctx.bpm, &self.index)?.key_type();
@@ -101,13 +123,6 @@ impl IndexNestedLoopJoin {
         Ok(matches)
     }
 
-    fn is_match(&self, joined_values: &[Value]) -> Result<bool, ExecutionError> {
-        match &self.predicate {
-            Some(predicate) => Ok(predicate.eval(joined_values)?.is_true()?),
-            None => Ok(true),
-        }
-    }
-
     fn matches(
         &self,
         ctx: &mut ExecutionContext<'_>,
@@ -121,7 +136,7 @@ impl IndexNestedLoopJoin {
         let mut matches = Vec::new();
         for inner_values in inner_rows(ctx, &self.index, &inner.name, &key)? {
             let row = joined(outer_values.to_vec(), inner_values);
-            if self.is_match(&row.values)? {
+            if passes(self.predicate.as_ref(), &row.values)? {
                 matches.push(row);
             }
         }
@@ -150,10 +165,23 @@ impl Executor for IndexNestedLoopJoin {
     }
 }
 
-/// The outer values followed by the inner ones. Not a row of one table, so no `Rid`.
-fn joined(mut values: Vec<Value>, inner_values: impl IntoIterator<Item = Value>) -> Row {
-    values.extend(inner_values);
+/// The left (outer) values followed by the right (inner) ones. Not a row of one table, so no
+/// `Rid`.
+pub(super) fn joined(mut values: Vec<Value>, right_values: impl IntoIterator<Item = Value>) -> Row {
+    values.extend(right_values);
     Row { values, rid: None }
+}
+
+/// Whether a joined row matches the rest of the `ON`: like a `WHERE`, only TRUE does. In an
+/// outer join this decides what matches, so a pair it rejects leaves its row padded.
+pub(super) fn passes(
+    predicate: Option<&Expr>,
+    joined_values: &[Value],
+) -> Result<bool, ExecutionError> {
+    match predicate {
+        Some(predicate) => Ok(predicate.eval(joined_values)?.is_true()?),
+        None => Ok(true),
+    }
 }
 
 /// The inner table's rows whose key is `key`, in key order. The range is read and dropped
@@ -316,6 +344,21 @@ mod tests {
 
         assert!(from_no_outer.is_empty());
         assert!(from_no_inner.is_empty());
+    }
+
+    #[test]
+    fn right_and_full_joins_should_be_unsupported() {
+        for join_type in [JoinType::Right, JoinType::Full] {
+            let mut db = ana_and_bia();
+
+            let err = join_err(&mut db, join(orders(&[(1, int(10))]), join_type));
+
+            assert_eq!(err.sqlstate(), "0A000");
+            assert!(
+                matches!(err, ExecutionError::UnsupportedJoinType { join_type: found } if found == join_type),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

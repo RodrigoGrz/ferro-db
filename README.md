@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index and the first query executors work and are tested (1,100 tests). Typed rows can be stored in tables that survive restarts and queried and changed through executors, from the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index and the first query executors work and are tested (1,130 tests). Typed rows can be stored in tables that survive restarts and queried and changed through executors, from the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -31,7 +31,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **Table Heap** | A table's rows as typed values: insert, get, update, delete and scan, validated by the schema before anything is written. |
 | **Catalog** | Tables, columns and indexes persisted on disk and bootstrapped from page 0, loaded into memory on open; finds a table's rows and an index's tree by name, keeping one open handle each; creates and fills indexes. |
 | **B+Tree index** | A unique index from keys of any type (text included) to row ids, with range scans; nodes of variable-size entries split, merge and redistribute by bytes, and a failed operation changes nothing. |
-| **Executors** | Iterator-model executors over expressions with SQL semantics: sequential scan, index scan (points and ranges, in key order), values, filter (`WHERE` keeps TRUE only), projection, hash aggregation (`GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`; `HAVING` as a filter), sort (several keys, `NULLS FIRST`/`LAST`), limit and offset, top-N with a bounded heap, index nested loop join (`INNER` and `LEFT`), insert, update and delete. Writes keep the indexes in step and validate a whole statement before writing (a refused statement leaves no trace). |
+| **Executors** | Iterator-model executors over expressions with SQL semantics: sequential scan, index scan (points and ranges, in key order), values, filter (`WHERE` keeps TRUE only), projection, hash aggregation (`GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`; `HAVING` as a filter), sort (several keys, `NULLS FIRST`/`LAST`), limit and offset, top-N with a bounded heap, index nested loop join (`INNER` and `LEFT`), hash join (`INNER`, `LEFT`, `RIGHT`, `FULL`), insert, update and delete. Writes keep the indexes in step and validate a whole statement before writing (a refused statement leaves no trace). |
 
 **Partially there:**
 
@@ -40,7 +40,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** SQL lexer and parser, query planning, more joins (hash join), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** SQL lexer and parser, query planning, more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -50,7 +50,7 @@ flowchart TD
     catalog["Catalog<br/>tables and columns, page 0"]
     tableheap["Table Heap<br/>typed rows of a table"]
     btree["B+Tree index<br/>keys → row ids"]
-    exec["Executors<br/>seq and index scan, filter, projection, aggregation, sort, limit, top-n, index join, insert, update, delete"]
+    exec["Executors<br/>seq and index scan, filter, projection, aggregation, sort, limit, top-n, index join, hash join, insert, update, delete"]
     schema["Schema + types<br/>row ⇄ tuple, SQL semantics"]
     heap["Heap File + free space map"]
     page["Slotted pages + tuple format"]
@@ -134,7 +134,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 1,016 unit tests + 84 integration tests
+cargo test --all-targets   # 1,043 unit tests + 87 integration tests
 ```
 
 The suite is the main way the implementation is verified:

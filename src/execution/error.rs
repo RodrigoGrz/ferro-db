@@ -5,6 +5,8 @@ use crate::index::IndexError;
 use crate::table::TableError;
 use crate::types::{DataType, TypeError};
 
+use super::JoinType;
+
 #[derive(Debug)]
 pub enum ExecutionError {
     Type(TypeError),
@@ -27,6 +29,15 @@ pub enum ExecutionError {
     InvalidRowCount {
         clause: RowCountClause,
         count: Option<i64>,
+    },
+    /// A join type the executor cannot run, such as a `RIGHT` index nested loop join.
+    UnsupportedJoinType {
+        join_type: JoinType,
+    },
+    /// A row of a join input whose width is not the declared one: a plan built wrong.
+    RowWidthMismatch {
+        expected: usize,
+        actual: usize,
     },
 }
 
@@ -52,7 +63,10 @@ impl ExecutionError {
             ExecutionError::Catalog(err) => err.sqlstate(),
             ExecutionError::Table(err) => err.sqlstate(),
             ExecutionError::Index(err) => err.sqlstate(),
-            ExecutionError::ColumnOutOfRange { .. } | ExecutionError::MissingRid => "XX000",
+            ExecutionError::ColumnOutOfRange { .. }
+            | ExecutionError::MissingRid
+            | ExecutionError::RowWidthMismatch { .. } => "XX000",
+            ExecutionError::UnsupportedJoinType { .. } => "0A000",
             ExecutionError::UndefinedFunction { .. } => "42883",
             // The standard's FETCH FIRST and result OFFSET clauses.
             ExecutionError::InvalidRowCount {
@@ -97,6 +111,15 @@ impl fmt::Display for ExecutionError {
                 clause,
                 count: None,
             } => write!(f, "{} must not be null", clause.keyword()),
+            ExecutionError::UnsupportedJoinType { join_type } => write!(
+                f,
+                "{} is not supported by an index nested loop join",
+                join_type.keyword()
+            ),
+            ExecutionError::RowWidthMismatch { expected, actual } => write!(
+                f,
+                "a join input declared {expected} values per row produced a row of {actual}"
+            ),
         }
     }
 }
@@ -111,7 +134,9 @@ impl std::error::Error for ExecutionError {
             ExecutionError::ColumnOutOfRange { .. }
             | ExecutionError::MissingRid
             | ExecutionError::UndefinedFunction { .. }
-            | ExecutionError::InvalidRowCount { .. } => None,
+            | ExecutionError::InvalidRowCount { .. }
+            | ExecutionError::UnsupportedJoinType { .. }
+            | ExecutionError::RowWidthMismatch { .. } => None,
         }
     }
 }
@@ -143,6 +168,7 @@ impl From<IndexError> for ExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::table::SchemaError;
 
     fn every_error() -> Vec<(ExecutionError, &'static str, &'static str, bool)> {
@@ -214,6 +240,23 @@ mod tests {
                 },
                 "OFFSET must not be null",
                 "2201X",
+                false,
+            ),
+            (
+                ExecutionError::UnsupportedJoinType {
+                    join_type: JoinType::Right,
+                },
+                "RIGHT JOIN is not supported by an index nested loop join",
+                "0A000",
+                false,
+            ),
+            (
+                ExecutionError::RowWidthMismatch {
+                    expected: 3,
+                    actual: 2,
+                },
+                "a join input declared 3 values per row produced a row of 2",
+                "XX000",
                 false,
             ),
         ]
