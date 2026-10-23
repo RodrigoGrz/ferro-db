@@ -1,6 +1,6 @@
 # Architecture
 
-ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts. There is no SQL layer yet.
+ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the first step of the SQL layer, the lexer.
 
 This page explains the components and how data moves between them. Byte formats and invariants live in [storage-engine.md](storage-engine.md) and [data-model.md](data-model.md).
 
@@ -19,6 +19,10 @@ flowchart TD
 
     subgraph indexes["Indexes"]
         btree["BPlusTree<br/>src/index/<br/>unique keys → Rid, range scans"]
+    end
+
+    subgraph sql["SQL (src/sql/)"]
+        lexer["Lexer<br/>text → tokens, 42601 syntax errors"]
     end
 
     subgraph execution["Query execution"]
@@ -87,6 +91,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Schema` | Validate columns; convert a row of values to tuple bytes and back. | Know page sizes or table names. |
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
+| Lexer (`tokenize`) | Turn the text of a statement into tokens with their byte spans: words folded to lowercase and marked as keywords, quoted identifiers, strings, numbers as written, operators; skip whitespace and nested comments; report syntax errors (`42601`) at a character position. | Parse statements, check names against the catalog, or depend on any other layer. |
 | Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Sort`, `Limit`, `TopN`, `IndexNestedLoopJoin`, `HashJoin`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; sort rows in memory and cut them with `LIMIT`/`OFFSET`; join two tables through an index of the inner one or an in-memory hash table; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
@@ -122,6 +127,12 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 2. On a miss, the `DiskManager` reads the page (all zeros if it was never written).
 3. The buffer pool verifies the checksum and the header (type and format version). A failure returns an error and leaves the pool untouched.
 4. A frame is taken from the free list or from the replacer's victim (written back first if dirty), and only then are the free list, replacer and page table updated.
+
+### Lexing a statement
+
+1. `tokenize` walks the text one character at a time (never off a character boundary), skipping whitespace, `--` comments and nested `/* */` comments.
+2. The first character of each token decides its kind: a letter or `_` starts a word (folded to lowercase, then looked up in the sorted keyword table), `"` a quoted identifier, `'` a string, a digit (or a dot before one) a number, anything else an operator or punctuation mark.
+3. Each token keeps the byte span of its source; the first problem stops the lexer with a `SqlError` at its character position. See [sql.md](sql.md).
 
 ### Running a query
 
@@ -187,7 +198,7 @@ Every module has unit tests next to the code; [`tests/`](../tests/) holds integr
 
 These are verified properties of the current code, not bugs to be fixed in passing:
 
-- **No SQL.** There is no parser or planner; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
+- **No SQL statements yet.** The lexer turns text into tokens, but there is no parser or planner; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
 - **Single-threaded.** Every buffer pool operation takes `&mut self`; there are no latches, locks or transactions.
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.

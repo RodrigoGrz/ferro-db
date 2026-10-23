@@ -59,7 +59,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 
 ## SQL
 
-- [ ] Lexer
+- [x] Lexer: words folded to lowercase with their keywords, quoted identifiers, strings, numbers as written, operators (`!=` as `<>`), nested comments, syntax errors (`42601`) at a character position ([`lexer.rs`](src/sql/lexer.rs), [`tests/sql_lexer.rs`](tests/sql_lexer.rs), [docs](docs/sql.md))
 - [ ] SQL Parser
 - [ ] AST
 - [ ] DDL

@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index and the first query executors work and are tested (1,130 tests). Typed rows can be stored in tables that survive restarts and queried and changed through executors, from the Rust API. There is no SQL interface yet. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL lexer work and are tested (1,172 tests). Typed rows can be stored in tables that survive restarts and queried and changed through executors, from the Rust API. There are no SQL statements yet: the lexer turns SQL text into tokens, and the parser comes next. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -40,7 +40,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 - `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** SQL lexer and parser, query planning, more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** SQL parser, query planning, more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -134,7 +134,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 1,043 unit tests + 87 integration tests
+cargo test --all-targets   # 1,080 unit tests + 92 integration tests
 ```
 
 The suite is the main way the implementation is verified:
@@ -155,6 +155,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - [docs/data-model.md](docs/data-model.md): integers, floats, VARCHAR, BOOLEAN, DATE, TIMESTAMP and NULL, schema, catalog, deviations from the SQL standard
 - [docs/indexes.md](docs/indexes.md): the B+Tree, key encoding, node format, splits and merges
 - [docs/execution.md](docs/execution.md): expressions, executors, two-phase writes and index maintenance
+- [docs/sql.md](docs/sql.md): the SQL layer: the lexer (tokens, keywords, identifiers, literals, comments, syntax errors)
 - [docs/decisions/](docs/decisions/README.md): architectural decision records
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and conventions
 
