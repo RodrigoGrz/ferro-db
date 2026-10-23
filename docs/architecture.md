@@ -1,6 +1,6 @@
 # Architecture
 
-ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the first step of the SQL layer, the lexer.
+ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the first steps of the SQL layer: the lexer and a parser for `SELECT`.
 
 This page explains the components and how data moves between them. Byte formats and invariants live in [storage-engine.md](storage-engine.md) and [data-model.md](data-model.md).
 
@@ -23,6 +23,7 @@ flowchart TD
 
     subgraph sql["SQL (src/sql/)"]
         lexer["Lexer<br/>text → tokens, 42601 syntax errors"]
+        parser["Parser + AST<br/>tokens → SELECT statements, precedence climbing"]
     end
 
     subgraph execution["Query execution"]
@@ -41,6 +42,8 @@ flowchart TD
 
     demo --> catalog
     demo --> tableheap
+    parser --> lexer
+    parser --> types
     exec --> catalog
     exec --> tableheap
     exec --> btree
@@ -92,6 +95,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
 | Lexer (`tokenize`) | Turn the text of a statement into tokens with their byte spans: words folded to lowercase and marked as keywords, quoted identifiers, strings, numbers as written, operators; skip whitespace and nested comments; report syntax errors (`42601`) at a character position. | Parse statements, check names against the catalog, or depend on any other layer. |
+| Parser and AST (`parse`) | Turn tokens into `SELECT` statements by recursive descent: projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, expressions by precedence climbing; decide which keywords are reserved; print the AST back as canonical SQL. | Resolve names or types against the catalog, run anything, or parse other statements yet. |
 | Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Sort`, `Limit`, `TopN`, `IndexNestedLoopJoin`, `HashJoin`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; sort rows in memory and cut them with `LIMIT`/`OFFSET`; join two tables through an index of the inner one or an in-memory hash table; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
@@ -133,6 +137,13 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 1. `tokenize` walks the text one character at a time (never off a character boundary), skipping whitespace, `--` comments and nested `/* */` comments.
 2. The first character of each token decides its kind: a letter or `_` starts a word (folded to lowercase, then looked up in the sorted keyword table), `"` a quoted identifier, `'` a string, a digit (or a dot before one) a number, anything else an operator or punctuation mark.
 3. Each token keeps the byte span of its source; the first problem stops the lexer with a `SqlError` at its character position. See [sql.md](sql.md).
+
+### Parsing a statement
+
+1. `parse` lexes the whole text, then reads statements separated by `;`.
+2. `select` reads the clauses in their fixed order, each with its own function; `FROM` reads tables and joins left to right, a comma being a `CROSS JOIN`.
+3. `expression_from(min)` reads an operand and then every operator that binds at least as tightly as `min`, its right side one level tighter, so precedence and left associativity come from one table; comparisons refuse a second comparison.
+4. The result is an AST with names and literal text; the first problem stops the parser with a `SqlError` at the position of its token. See [sql.md](sql.md#parser).
 
 ### Running a query
 
@@ -198,7 +209,7 @@ Every module has unit tests next to the code; [`tests/`](../tests/) holds integr
 
 These are verified properties of the current code, not bugs to be fixed in passing:
 
-- **No SQL statements yet.** The lexer turns text into tokens, but there is no parser or planner; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
+- **No SQL statements run yet.** The lexer and the parser turn a `SELECT` into an AST, but there is no planner; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
 - **Single-threaded.** Every buffer pool operation takes `&mut self`; there are no latches, locks or transactions.
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.

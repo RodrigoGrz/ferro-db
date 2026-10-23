@@ -211,7 +211,7 @@ const KEYWORDS: [(&str, Keyword); 69] = [
 
 impl Keyword {
     /// `text` is already folded to lowercase.
-    fn from_word(text: &str) -> Option<Keyword> {
+    pub(super) fn from_word(text: &str) -> Option<Keyword> {
         KEYWORDS
             .binary_search_by(|(name, _)| (*name).cmp(text))
             .ok()
@@ -446,13 +446,14 @@ impl Lexer<'_> {
         is_next
     }
 
-    /// The character at byte `offset`, counting from 1, as error messages show it.
     fn position(&self, offset: usize) -> usize {
-        self.sql
-            .get(..offset)
-            .map_or(0, |before| before.chars().count())
-            + 1
+        character_position(self.sql, offset)
     }
+}
+
+/// The character at byte `offset` of `sql`, counting from 1, as error messages show it.
+pub(super) fn character_position(sql: &str, offset: usize) -> usize {
+    sql.get(..offset).map_or(0, |before| before.chars().count()) + 1
 }
 
 fn is_word_start(character: char) -> bool {

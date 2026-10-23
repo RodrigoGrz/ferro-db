@@ -60,8 +60,8 @@ When an item is finished, mark it here in the same change that adds the code, an
 ## SQL
 
 - [x] Lexer: words folded to lowercase with their keywords, quoted identifiers, strings, numbers as written, operators (`!=` as `<>`), nested comments, syntax errors (`42601`) at a character position ([`lexer.rs`](src/sql/lexer.rs), [`tests/sql_lexer.rs`](tests/sql_lexer.rs), [docs](docs/sql.md))
-- [ ] SQL Parser
-- [ ] AST
+- [x] SQL Parser: recursive descent for `SELECT` (projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`) and expressions by precedence climbing, with `42601`, `42704`, `22023` and `0A000` errors ([`parser.rs`](src/sql/parser.rs), [`tests/sql_parser.rs`](tests/sql_parser.rs), [docs](docs/sql.md#parser)). Only `SELECT` so far: `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `CREATE INDEX` and `DROP TABLE` come next.
+- [x] AST: statements with names and literal text, printed back as canonical SQL ([`ast.rs`](src/sql/ast.rs), [docs](docs/sql.md#ast)). Only `SELECT` so far.
 - [ ] DDL
 - [ ] DML
 - [ ] Query Validation

@@ -876,3 +876,6 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | `!=` | not in the standard; `<>` is the inequality | accepted as `<>`, like PostgreSQL, MySQL and SQLite (decided with the author) |
 | Adjacent string literals | `'foo'` and `'bar'` separated by a newline are one literal, `'foobar'` | not concatenated: two string tokens ([sql.md](sql.md#limitations)) |
 | Prefixed literals | `N'…'`, `U&'…'`, `X'…'`, `B'…'` | not lexed yet (nor PostgreSQL's `E'…'`) |
+| `VARCHAR` without a length | the length is required | accepted as the widest, `VARCHAR(65535)`, as PostgreSQL accepts it as unlimited |
+| `LIMIT n` | not in the standard; the form is `OFFSET n ROWS FETCH FIRST m ROWS ONLY` | both accepted, `LIMIT` as in PostgreSQL ([sql.md](sql.md#select)) |
+| `SELECT DISTINCT`, set operations, subqueries, `CASE`, `LIKE`, `JOIN … USING`, `NATURAL JOIN` | part of the standard's query expressions | not parsed yet; `SELECT DISTINCT` is refused with `0A000` |
