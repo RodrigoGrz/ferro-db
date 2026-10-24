@@ -7,7 +7,7 @@ use crate::table::SchemaError;
 use crate::types::TypeError;
 
 /// An error while turning a statement into work and doing it. The layers below keep their own
-/// errors and SQLSTATEs; the variants of its own are the binder's.
+/// errors and SQLSTATEs; the variants of its own are the binder's and the planner's.
 #[derive(Debug)]
 pub enum PlannerError {
     Sql(SqlError),
@@ -18,7 +18,7 @@ pub enum PlannerError {
     UndefinedColumn {
         column: String,
     },
-    /// A column qualified by a table the statement does not use.
+    /// A column qualified by a table the statement does not use, or `t.*` of one.
     UndefinedTableReference {
         table: String,
     },
@@ -35,10 +35,38 @@ pub enum PlannerError {
         expected: usize,
         found: usize,
     },
-    /// An aggregate where none may be (`WHERE`, `VALUES`, `SET`).
+    /// An aggregate where none may be: `WHERE`, `ON`, `GROUP BY`, `LIMIT`, `VALUES`, `SET`.
     AggregateNotAllowed {
-        function: String,
+        clause: &'static str,
     },
+    /// An aggregate inside the argument of another.
+    NestedAggregate,
+    /// A column of a grouped query read outside an aggregate without being grouped.
+    GroupingError {
+        column: String,
+    },
+    /// A column without a table that more than one table of the `FROM` has.
+    AmbiguousColumn {
+        column: String,
+    },
+    /// Two tables of one `FROM` under the same name.
+    DuplicateAlias {
+        table: String,
+    },
+    /// `ORDER BY n` past the select list.
+    InvalidPosition {
+        position: String,
+    },
+    /// `ORDER BY name` where several output columns have that name.
+    AmbiguousOrderBy {
+        name: String,
+    },
+    /// A column in the count of `LIMIT` or `OFFSET`, which is computed once.
+    ColumnInRowCount {
+        clause: &'static str,
+    },
+    /// `SELECT *` without `FROM`.
+    WildcardWithoutTables,
     UndefinedFunction {
         name: String,
     },
@@ -60,11 +88,16 @@ impl PlannerError {
             PlannerError::Execution(err) => err.sqlstate(),
             PlannerError::UndefinedColumn { .. } => "42703",
             PlannerError::UndefinedTableReference { .. } => "42P01",
+            PlannerError::AmbiguousColumn { .. } | PlannerError::AmbiguousOrderBy { .. } => "42702",
+            PlannerError::DuplicateAlias { .. } => "42712",
             PlannerError::DuplicateColumn { .. } => "42701",
-            PlannerError::DuplicateAssignment { .. } | PlannerError::ColumnCountMismatch { .. } => {
-                "42601"
-            }
-            PlannerError::AggregateNotAllowed { .. } => "42803",
+            PlannerError::DuplicateAssignment { .. }
+            | PlannerError::ColumnCountMismatch { .. }
+            | PlannerError::WildcardWithoutTables => "42601",
+            PlannerError::AggregateNotAllowed { .. }
+            | PlannerError::NestedAggregate
+            | PlannerError::GroupingError { .. } => "42803",
+            PlannerError::InvalidPosition { .. } | PlannerError::ColumnInRowCount { .. } => "42P10",
             PlannerError::UndefinedFunction { .. } => "42883",
             PlannerError::Unsupported { .. } => "0A000",
             PlannerError::MissingCount => "XX000",
@@ -100,8 +133,32 @@ impl fmt::Display for PlannerError {
                 f,
                 "INSERT has more target columns ({expected}) than expressions ({found})"
             ),
-            PlannerError::AggregateNotAllowed { function } => {
-                write!(f, "aggregate function \"{function}\" is not allowed here")
+            PlannerError::AggregateNotAllowed { clause } => {
+                write!(f, "aggregate functions are not allowed in {clause}")
+            }
+            PlannerError::NestedAggregate => write!(f, "aggregate function calls cannot be nested"),
+            PlannerError::GroupingError { column } => write!(
+                f,
+                "column \"{column}\" must appear in the GROUP BY clause or be used in an aggregate \
+                 function"
+            ),
+            PlannerError::AmbiguousColumn { column } => {
+                write!(f, "column reference \"{column}\" is ambiguous")
+            }
+            PlannerError::DuplicateAlias { table } => {
+                write!(f, "table name \"{table}\" specified more than once")
+            }
+            PlannerError::InvalidPosition { position } => {
+                write!(f, "ORDER BY position {position} is not in select list")
+            }
+            PlannerError::AmbiguousOrderBy { name } => {
+                write!(f, "ORDER BY \"{name}\" is ambiguous")
+            }
+            PlannerError::ColumnInRowCount { clause } => {
+                write!(f, "argument of {clause} must not contain variables")
+            }
+            PlannerError::WildcardWithoutTables => {
+                write!(f, "SELECT * with no tables specified is not valid")
             }
             PlannerError::UndefinedFunction { name } => {
                 write!(f, "function \"{name}\" does not exist")
@@ -244,11 +301,68 @@ mod tests {
                 false,
             ),
             (
-                PlannerError::AggregateNotAllowed {
-                    function: "count".to_string(),
-                },
-                "aggregate function \"count\" is not allowed here",
+                PlannerError::AggregateNotAllowed { clause: "WHERE" },
+                "aggregate functions are not allowed in WHERE",
                 "42803",
+                false,
+            ),
+            (
+                PlannerError::NestedAggregate,
+                "aggregate function calls cannot be nested",
+                "42803",
+                false,
+            ),
+            (
+                PlannerError::GroupingError {
+                    column: "u.email".to_string(),
+                },
+                "column \"u.email\" must appear in the GROUP BY clause or be used in an aggregate \
+                 function",
+                "42803",
+                false,
+            ),
+            (
+                PlannerError::AmbiguousColumn {
+                    column: "id".to_string(),
+                },
+                "column reference \"id\" is ambiguous",
+                "42702",
+                false,
+            ),
+            (
+                PlannerError::DuplicateAlias {
+                    table: "t".to_string(),
+                },
+                "table name \"t\" specified more than once",
+                "42712",
+                false,
+            ),
+            (
+                PlannerError::InvalidPosition {
+                    position: "3".to_string(),
+                },
+                "ORDER BY position 3 is not in select list",
+                "42P10",
+                false,
+            ),
+            (
+                PlannerError::AmbiguousOrderBy {
+                    name: "x".to_string(),
+                },
+                "ORDER BY \"x\" is ambiguous",
+                "42702",
+                false,
+            ),
+            (
+                PlannerError::ColumnInRowCount { clause: "LIMIT" },
+                "argument of LIMIT must not contain variables",
+                "42P10",
+                false,
+            ),
+            (
+                PlannerError::WildcardWithoutTables,
+                "SELECT * with no tables specified is not valid",
+                "42601",
                 false,
             ),
             (

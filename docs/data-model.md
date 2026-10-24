@@ -885,3 +885,7 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | Prefix `+` | numeric operands only | `+x` is `x` for any type (PostgreSQL refuses `+` on text) |
 | `CREATE INDEX` | not in the standard | only `CREATE UNIQUE INDEX` (decided with the author): every index is unique; a plain `CREATE INDEX` is `0A000` |
 | `PRIMARY KEY` and `UNIQUE` column constraints | part of `<column definition>` | not yet (`0A000`); the Constraints section will add them |
+| `ORDER BY` by position (`ORDER BY 2`) | removed in SQL:1999; a sort key is a column name of the result or an expression | accepted (decided with the author), as PostgreSQL; a position outside the select list is `42P10` ([planner.md](planner.md#planning-a-select)) |
+| `GROUP BY` by expressions (`GROUP BY a + 1`) | grouping columns only: column references | any expression over the input, as PostgreSQL; an expression of the select list equal to one of them, compared once bound, reads the group. Not by output name or position (PostgreSQL accepts both); an integer alone is refused (`0A000`) rather than read as a constant |
+| Functional dependencies in `GROUP BY` (T301) | a column determined by the grouping columns (by a primary key) may be read outside an aggregate | not yet: every column read outside an aggregate must be grouped (`42803`) |
+| `EXPLAIN` | not in the standard | `EXPLAIN SELECT …` gives the logical plan as text, in a format of ferroDB's own ([planner.md](planner.md#explain)) |

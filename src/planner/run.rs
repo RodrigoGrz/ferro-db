@@ -1,7 +1,8 @@
 //! Running statements: DDL straight against the catalog, DML through the executors with a
 //! fixed plan (`Insert(Values)`, `Update` and `Delete` over `Filter(SeqScan)`). The whole text
 //! is parsed before any statement runs; each statement is atomic, but a failure keeps the
-//! statements before it (there are no transactions). `SELECT` waits for the query planner.
+//! statements before it (there are no transactions). A `SELECT` is only planned, for `EXPLAIN`:
+//! running it waits for the physical plan.
 
 use crate::execution::{
     Delete, ExecutionContext, Executor, Expr, Filter, Insert, SeqScan, Update, Values, execute,
@@ -11,16 +12,20 @@ use crate::table::{Column, Schema};
 use crate::types::Value;
 
 use super::PlannerError;
-use super::binder::{Scope, bind};
+use super::binder::bind;
+use super::scope::Scope;
+use super::select::plan_select;
 
 /// What each statement did: its command tag, which a client prints as it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementOutcome {
     CreateTable,
     CreateIndex,
     Insert(u64),
     Update(u64),
     Delete(u64),
+    /// The text of the plan, one node per line.
+    Explain(String),
 }
 
 /// Parses every statement of `sql` (a syntax error runs none), then runs them in order; the
@@ -42,6 +47,9 @@ fn run_statement(
 ) -> Result<StatementOutcome, PlannerError> {
     match statement {
         Statement::Select(_) => Err(PlannerError::Unsupported { feature: "SELECT" }),
+        Statement::Explain(select) => Ok(StatementOutcome::Explain(
+            plan_select(&select, ctx.catalog)?.to_string(),
+        )),
         Statement::CreateTable { name, columns } => create_table(ctx, &name, columns),
         Statement::CreateIndex {
             is_unique: false, ..
@@ -128,7 +136,7 @@ fn row_in_table_order(
     (0..width)
         .map(
             |position| match assigned.iter().find(|(target, _)| *target == position) {
-                Some((_, value)) => bind(value, &Scope::empty()),
+                Some((_, value)) => bind(value, &Scope::empty(), "VALUES"),
                 None => Ok(Expr::Literal(Value::Null)),
             },
         )
@@ -152,7 +160,7 @@ fn update(
                 column: assignment.column.clone(),
             });
         }
-        bound.push((position, bind(&assignment.value, &scope)?));
+        bound.push((position, bind(&assignment.value, &scope, "SET")?));
     }
     let rows = matching_rows(table, selection, &scope)?;
     let count = execute_count(Update::new(table, rows, bound), ctx)?;
@@ -179,7 +187,7 @@ fn matching_rows(
 ) -> Result<Box<dyn Executor>, PlannerError> {
     let scan = Box::new(SeqScan::new(table));
     Ok(match selection {
-        Some(selection) => Box::new(Filter::new(scan, bind(selection, scope)?)),
+        Some(selection) => Box::new(Filter::new(scan, bind(selection, scope, "WHERE")?)),
         None => scan,
     })
 }
@@ -483,6 +491,49 @@ mod tests {
         assert_eq!(rest, [StatementOutcome::Delete(1)]);
         assert!(stored(&mut db).is_empty());
         assert!(index_keys(&mut db, "t_id").is_empty());
+    }
+
+    #[test]
+    fn explain_should_give_the_plan_of_a_select() {
+        let mut db = filled_db();
+
+        let outcomes = run(
+            &mut db,
+            "EXPLAIN SELECT v FROM t WHERE id > 1; INSERT INTO t VALUES (9, 9, 'z')",
+        );
+        let unknown = run_err(&mut db, "EXPLAIN SELECT zz FROM t");
+
+        assert_eq!(
+            outcomes,
+            [
+                StatementOutcome::Explain(
+                    "Project: t.v AS v\n  Filter: t.id > 1\n    Scan: t".to_string()
+                ),
+                StatementOutcome::Insert(1),
+            ]
+        );
+        assert_eq!(unknown.sqlstate(), "42703");
+    }
+
+    #[test]
+    fn aggregates_should_be_refused_naming_their_clause() {
+        let mut db = filled_db();
+        let statements = [
+            ("INSERT INTO t VALUES (count(*), 1, 'a')", "VALUES"),
+            ("UPDATE t SET v = max(v)", "SET"),
+            ("UPDATE t SET v = 1 WHERE sum(v) > 1", "WHERE"),
+            ("DELETE FROM t WHERE avg(v) > 1", "WHERE"),
+        ];
+
+        let messages = statements.map(|(sql, _)| run_err(&mut db, sql).to_string());
+
+        for ((sql, clause), message) in statements.iter().zip(messages) {
+            assert_eq!(
+                message,
+                format!("aggregate functions are not allowed in {clause}"),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -85,6 +85,7 @@ pub enum Keyword {
     Distinct,
     Double,
     Drop,
+    Explain,
     False,
     Fetch,
     First,
@@ -137,7 +138,7 @@ pub enum Keyword {
 }
 
 /// Every keyword by its lowercase text, sorted for a binary search.
-const KEYWORDS: [(&str, Keyword); 69] = [
+const KEYWORDS: [(&str, Keyword); 70] = [
     ("all", Keyword::All),
     ("and", Keyword::And),
     ("as", Keyword::As),
@@ -158,6 +159,7 @@ const KEYWORDS: [(&str, Keyword); 69] = [
     ("distinct", Keyword::Distinct),
     ("double", Keyword::Double),
     ("drop", Keyword::Drop),
+    ("explain", Keyword::Explain),
     ("false", Keyword::False),
     ("fetch", Keyword::Fetch),
     ("first", Keyword::First),

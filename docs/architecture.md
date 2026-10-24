@@ -1,6 +1,6 @@
 # Architecture
 
-ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the SQL layer: a lexer, a parser and a planner that runs `CREATE TABLE`, `CREATE UNIQUE INDEX`, `INSERT`, `UPDATE` and `DELETE` (`SELECT` parses but does not run yet).
+ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the SQL layer: a lexer, a parser and a planner that runs `CREATE TABLE`, `CREATE UNIQUE INDEX`, `INSERT`, `UPDATE` and `DELETE`, and turns a `SELECT` into a validated logical plan that `EXPLAIN` shows (running it waits for the physical plan).
 
 This page explains the components and how data moves between them. Byte formats and invariants live in [storage-engine.md](storage-engine.md) and [data-model.md](data-model.md).
 
@@ -27,7 +27,7 @@ flowchart TD
     end
 
     subgraph planning["Planner (src/planner/)"]
-        planner["run_sql + binder<br/>DDL → catalog, DML → executors"]
+        planner["run_sql, binder, logical plan<br/>DDL → catalog, DML → executors, SELECT → EXPLAIN"]
     end
 
     subgraph execution["Query execution"]
@@ -74,17 +74,15 @@ flowchart TD
     disk --> file
 
     subgraph planned["Planned (not implemented)"]
-        sql["SQL parser"]
-        planner["Planner"]
+        physical["Physical plan<br/>logical plan → executors"]
         wal["WAL / recovery"]
     end
-    sql -.-> planner
-    planner -.-> exec
-    planner -.-> catalog
+    planner -.-> physical
+    physical -.-> exec
     wal -.-> bpm
 
     classDef plannedNode stroke-dasharray: 5 5,color:#777
-    class sql,planner,wal plannedNode
+    class physical,wal plannedNode
 ```
 
 An arrow means "uses". Dashed nodes and arrows are planned work from the [roadmap](../ROADMAP.md), not current capabilities.
@@ -102,8 +100,8 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `TableHeap` | A table's rows as values: validate and encode before writing, decode on read, typed scan. | Know table names or the catalog. |
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
 | Lexer (`tokenize`) | Turn the text of a statement into tokens with their byte spans: words folded to lowercase and marked as keywords, quoted identifiers, strings, numbers as written, operators; skip whitespace and nested comments; report syntax errors (`42601`) at a character position. | Parse statements, check names against the catalog, or depend on any other layer. |
-| Parser and AST (`parse`) | Turn tokens into statements (`SELECT`, `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`) by recursive descent: projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, expressions by precedence climbing; decide which keywords are reserved; print the AST back as canonical SQL. | Resolve names or types against the catalog, run anything, or parse other statements yet. |
-| Planner (`run_sql`) | Parse a whole text, then run each statement: bind names to column positions and literals to typed values, run DDL against the catalog and DML through a fixed plan of executors; report each outcome like a command tag. | Run `SELECT`, choose indexes, or undo the statements before a failure (no transactions). |
+| Parser and AST (`parse`) | Turn tokens into statements (`SELECT`, `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN SELECT`) by recursive descent: projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, expressions by precedence climbing; decide which keywords are reserved; print the AST back as canonical SQL. | Resolve names or types against the catalog, run anything, or parse other statements yet. |
+| Planner (`run_sql`, `plan_select`) | Parse a whole text, then run each statement: bind names to column positions and literals to typed values, run DDL against the catalog and DML through a fixed plan of executors; turn a `SELECT` into a logical plan (scope of the `FROM`, grouping rules, `ORDER BY` by position, name or expression) and print it for `EXPLAIN`; report each outcome like a command tag. | Run `SELECT` (no physical plan yet), choose indexes or join orders, or undo the statements before a failure (no transactions). |
 | Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Sort`, `Limit`, `TopN`, `IndexNestedLoopJoin`, `HashJoin`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; sort rows in memory and cut them with `LIMIT`/`OFFSET`; join two tables through an index of the inner one or an in-memory hash table; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
 
@@ -159,6 +157,13 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 2. For each statement, the binder resolves the table in the catalog, turns column names into positions and literals into typed values (`-9223372036854775808` a `BIGINT`, `1.5` a `DOUBLE PRECISION`), and rewrites `BETWEEN` and `IN` into comparisons.
 3. DDL goes to the catalog (`create_table`, `create_index`); DML builds `Insert(Values)`, `Update(Filter(SeqScan))` or `Delete(Filter(SeqScan))` and pulls it, the executors validating the whole statement before writing.
 4. Each statement returns its outcome (`Insert(3)`, `Update(2)`…); the first failure stops the rest, and the statements before it stay done. See [planner.md](planner.md).
+
+### Planning a SELECT
+
+1. `plan_select` reads the `FROM`: each table becomes a `Scan` with its scope (its visible name and columns at an offset of the row), each join a `Join` whose `ON` binds over its two sides only.
+2. `WHERE` binds over the whole scope. If the query is grouped (`GROUP BY`, `HAVING` or an aggregate), the select list, `HAVING` and `ORDER BY` bind in the binder's grouped mode, which turns aggregates and group expressions into columns of the grouped row and refuses any other column (`42803`); then the `Aggregate` node is built with every aggregate found.
+3. `ORDER BY` items become sort keys by position, output name or expression over the rows before the projection; `LIMIT` and `OFFSET` bind over no columns.
+4. The plan is assembled as `Scan/Join → Filter → Aggregate → Filter → Sort → Limit → Project`; `EXPLAIN` prints it one node per line with the columns by name. See [planner.md](planner.md#planning-a-select).
 
 ### Running a query
 
@@ -224,7 +229,7 @@ Every module has unit tests next to the code; [`tests/`](../tests/) holds integr
 
 These are verified properties of the current code, not bugs to be fixed in passing:
 
-- **`SELECT` does not run yet.** DDL and DML run through `run_sql`, but there is no query planner for `SELECT`; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
+- **`SELECT` does not run yet.** DDL and DML run through `run_sql`, and a `SELECT` is planned (`EXPLAIN`), but there is no physical plan to turn it into executors; queries are trees of executors built through the Rust API. `cargo run` is a fixed demo.
 - **Single-threaded.** Every buffer pool operation takes `&mut self`; there are no latches, locks or transactions.
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.

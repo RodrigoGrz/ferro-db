@@ -10,6 +10,8 @@ use super::parser::is_reserved;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Select(Box<Select>),
+    /// `EXPLAIN SELECT …`: the plan of the query, not its rows.
+    Explain(Box<Select>),
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
@@ -217,6 +219,7 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Select(select) => write!(f, "{select}"),
+            Statement::Explain(select) => write!(f, "EXPLAIN {select}"),
             Statement::CreateTable { name, columns } => {
                 write!(f, "CREATE TABLE {} (", Name(name))?;
                 write_list(f, columns)?;
@@ -512,7 +515,7 @@ fn write_list<T: fmt::Display>(f: &mut fmt::Formatter<'_>, items: &[T]) -> fmt::
 
 /// A name, bare when the lexer would read it back unchanged (a word with no ASCII capital
 /// that is not a reserved keyword), quoted otherwise.
-struct Name<'a>(&'a str);
+pub(crate) struct Name<'a>(pub(crate) &'a str);
 
 impl fmt::Display for Name<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

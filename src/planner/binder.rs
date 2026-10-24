@@ -1,121 +1,289 @@
 //! The binder: an expression of the AST, with names and literal text, as an expression the
 //! executors evaluate, with column positions and typed values.
+//!
+//! Above the groups of a grouped query it binds in another mode (ISO/IEC 9075, 7.12): an
+//! aggregate, or a part equal to an expression of `GROUP BY`, becomes a column of the grouped
+//! row, and any other column is an error. The parts are compared already bound, so `a`, `t.a`
+//! and `A` are the same group.
 
-use crate::execution::{BinaryOp, BooleanTest, Expr};
+use crate::execution::{Aggregate, BinaryOp, BooleanTest, Expr};
 use crate::sql::ast;
-use crate::table::Schema;
 use crate::types::{DataType, Value};
 
 use super::PlannerError;
+use super::scope::Scope;
 
-/// The columns an expression may read: those of the statement's table, or none (a row of
-/// `VALUES`).
-pub(super) struct Scope<'a> {
-    table: Option<(&'a str, &'a Schema)>,
+/// The groups of a grouped query and the aggregates read above them: the row of the
+/// `Aggregate` node is the groups' values, then the aggregates'.
+pub(super) struct Grouping {
+    pub(super) group_by: Vec<Expr>,
+    pub(super) aggregates: Vec<Aggregate>,
 }
 
-impl<'a> Scope<'a> {
-    pub(super) fn table(name: &'a str, schema: &'a Schema) -> Self {
-        Self {
-            table: Some((name, schema)),
-        }
-    }
-
-    pub(super) fn empty() -> Self {
-        Self { table: None }
-    }
-
-    /// The position of a column, checking its table qualifier against the statement's table.
-    pub(super) fn column(&self, table: Option<&str>, name: &str) -> Result<usize, PlannerError> {
-        let undefined = || PlannerError::UndefinedColumn {
-            column: name.to_string(),
-        };
-        let Some((table_name, schema)) = self.table else {
-            return Err(undefined());
-        };
-        if let Some(qualifier) = table.filter(|qualifier| *qualifier != table_name) {
-            return Err(PlannerError::UndefinedTableReference {
-                table: qualifier.to_string(),
-            });
-        }
-        schema
-            .columns()
+impl Grouping {
+    fn group_column(&self, expr: &Expr) -> Option<Expr> {
+        self.group_by
             .iter()
-            .position(|column| column.name == name)
-            .ok_or_else(undefined)
+            .position(|group| group == expr)
+            .map(Expr::Column)
+    }
+
+    /// The column of the aggregate, computed once however many times it is written.
+    fn aggregate_column(&mut self, aggregate: Aggregate) -> Expr {
+        let index = match self.aggregates.iter().position(|other| *other == aggregate) {
+            Some(index) => index,
+            None => {
+                self.aggregates.push(aggregate);
+                self.aggregates.len() - 1
+            }
+        };
+        Expr::Column(self.group_by.len() + index)
     }
 }
 
-pub(super) fn bind(expr: &ast::Expr, scope: &Scope<'_>) -> Result<Expr, PlannerError> {
-    let bind_box = |expr: &ast::Expr| bind(expr, scope).map(Box::new);
-    Ok(match expr {
-        ast::Expr::Column { table, name } => Expr::Column(scope.column(table.as_deref(), name)?),
-        ast::Expr::Literal(literal) => Expr::Literal(literal_value(literal)?),
-        ast::Expr::Unary { op, expr } => match (op, number_text(expr)) {
-            // The sign joins the literal before its type is chosen, so the smallest BIGINT,
-            // whose absolute value is not one, is written as itself.
-            (ast::UnaryOp::Minus, Some(text)) => Expr::Literal(number(&format!("-{text}"))?),
-            (ast::UnaryOp::Minus, None) => Expr::Negate(bind_box(expr)?),
-            (ast::UnaryOp::Not, _) => Expr::Not(bind_box(expr)?),
-            (ast::UnaryOp::Plus, _) => bind(expr, scope)?,
-        },
-        ast::Expr::Binary { op, left, right } => Expr::Binary {
-            op: binary_op(*op),
-            left: bind_box(left)?,
-            right: bind_box(right)?,
-        },
-        ast::Expr::IsNull { expr, negated } => Expr::IsNull {
-            expr: bind_box(expr)?,
-            negated: *negated,
-        },
-        ast::Expr::Is {
-            expr,
-            test,
-            negated,
-        } => Expr::Test {
-            expr: bind_box(expr)?,
-            test: match test {
-                ast::BooleanTest::True => BooleanTest::True,
-                ast::BooleanTest::False => BooleanTest::False,
-                ast::BooleanTest::Unknown => BooleanTest::Unknown,
-            },
-            negated: *negated,
-        },
-        ast::Expr::IsDistinctFrom {
-            left,
-            right,
-            negated,
-        } => Expr::IsDistinctFrom {
-            left: bind_box(left)?,
-            right: bind_box(right)?,
-            negated: *negated,
-        },
-        ast::Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => negate_if(
-            *negated,
-            between(bind(expr, scope)?, bind(low, scope)?, bind(high, scope)?),
-        ),
-        ast::Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let expr = bind(expr, scope)?;
-            let list = list
-                .iter()
-                .map(|item| bind(item, scope))
-                .collect::<Result<Vec<_>, _>>()?;
-            negate_if(*negated, in_list(expr, list))
+/// The expression over the columns of `scope`; `clause` names where it is, for the error of an
+/// aggregate there.
+pub(super) fn bind(
+    expr: &ast::Expr,
+    scope: &Scope<'_>,
+    clause: &'static str,
+) -> Result<Expr, PlannerError> {
+    Binder {
+        scope,
+        mode: Mode::Plain(clause),
+    }
+    .bind(expr)
+}
+
+/// The expression over the grouped row, adding the aggregates it calls to `grouping`.
+pub(super) fn bind_grouped(
+    expr: &ast::Expr,
+    scope: &Scope<'_>,
+    grouping: &mut Grouping,
+) -> Result<Expr, PlannerError> {
+    Binder {
+        scope,
+        mode: Mode::Grouped(grouping),
+    }
+    .bind(expr)
+}
+
+/// The column of the input at `position` read above the groups, as `*` does: the group that is
+/// that column, or an error.
+pub(super) fn grouped_column(
+    position: usize,
+    scope: &Scope<'_>,
+    grouping: &Grouping,
+) -> Result<Expr, PlannerError> {
+    grouping
+        .group_column(&Expr::Column(position))
+        .ok_or_else(|| PlannerError::GroupingError {
+            column: scope
+                .qualified_name(position)
+                .unwrap_or_else(|| format!("#{position}")),
+        })
+}
+
+/// Whether `expr` calls an aggregate anywhere.
+pub(super) fn contains_aggregate(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Function { name, .. } if is_aggregate(name) => true,
+        _ => children(expr).into_iter().any(contains_aggregate),
+    }
+}
+
+pub(super) fn contains_column(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Column { .. }) || children(expr).into_iter().any(contains_column)
+}
+
+fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match expr {
+        ast::Expr::Column { .. } | ast::Expr::Literal(_) => Vec::new(),
+        ast::Expr::Unary { expr, .. }
+        | ast::Expr::IsNull { expr, .. }
+        | ast::Expr::Is { expr, .. }
+        | ast::Expr::Cast { expr, .. } => vec![expr],
+        ast::Expr::Binary { left, right, .. } | ast::Expr::IsDistinctFrom { left, right, .. } => {
+            vec![left, right]
         }
-        ast::Expr::Cast { expr, to } => Expr::Cast {
-            expr: bind_box(expr)?,
-            to: *to,
+        ast::Expr::Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
+        ast::Expr::InList { expr, list, .. } => std::iter::once(&**expr).chain(list).collect(),
+        ast::Expr::Function { args, .. } => match args {
+            ast::FunctionArgs::Star => Vec::new(),
+            ast::FunctionArgs::List(list) => list.iter().collect(),
         },
-        ast::Expr::Function { name, .. } => return Err(function_error(name)),
+    }
+}
+
+fn is_aggregate(name: &str) -> bool {
+    matches!(name, "count" | "sum" | "avg" | "min" | "max")
+}
+
+/// Where an expression is, which decides what an aggregate in it means.
+enum Mode<'g> {
+    /// A clause that refuses aggregates, by name.
+    Plain(&'static str),
+    /// The argument of an aggregate: another one there is nested.
+    AggregateArgument,
+    /// Above the groups of a grouped query.
+    Grouped(&'g mut Grouping),
+}
+
+struct Binder<'s, 'a, 'g> {
+    scope: &'s Scope<'a>,
+    mode: Mode<'g>,
+}
+
+impl Binder<'_, '_, '_> {
+    fn bind(&mut self, expr: &ast::Expr) -> Result<Expr, PlannerError> {
+        if let Mode::Grouped(grouping) = &mut self.mode {
+            if let ast::Expr::Function { name, args } = expr
+                && is_aggregate(name)
+            {
+                let aggregate = aggregate(expr, name, args, self.scope)?;
+                return Ok(grouping.aggregate_column(aggregate));
+            }
+            if !contains_aggregate(expr) {
+                // Without an aggregate inside, the part binds over the input like any other.
+                let bound = bind(expr, self.scope, "SELECT")?;
+                if let Some(column) = grouping.group_column(&bound) {
+                    return Ok(column);
+                }
+                if let Expr::Column(position) = bound {
+                    return grouped_column(position, self.scope, grouping);
+                }
+                if !contains_column(expr) {
+                    return Ok(bound);
+                }
+            }
+        }
+        self.bind_parts(expr)
+    }
+
+    fn boxed(&mut self, expr: &ast::Expr) -> Result<Box<Expr>, PlannerError> {
+        self.bind(expr).map(Box::new)
+    }
+
+    /// The expression made of its parts, each bound in the same mode.
+    fn bind_parts(&mut self, expr: &ast::Expr) -> Result<Expr, PlannerError> {
+        Ok(match expr {
+            ast::Expr::Column { table, name } => {
+                Expr::Column(self.scope.column(table.as_deref(), name)?)
+            }
+            ast::Expr::Literal(literal) => Expr::Literal(literal_value(literal)?),
+            ast::Expr::Unary { op, expr } => match (op, number_text(expr)) {
+                // The sign joins the literal before its type is chosen, so the smallest BIGINT,
+                // whose absolute value is not one, is written as itself.
+                (ast::UnaryOp::Minus, Some(text)) => Expr::Literal(number(&format!("-{text}"))?),
+                (ast::UnaryOp::Minus, None) => Expr::Negate(self.boxed(expr)?),
+                (ast::UnaryOp::Not, _) => Expr::Not(self.boxed(expr)?),
+                (ast::UnaryOp::Plus, _) => self.bind(expr)?,
+            },
+            ast::Expr::Binary { op, left, right } => Expr::Binary {
+                op: binary_op(*op),
+                left: self.boxed(left)?,
+                right: self.boxed(right)?,
+            },
+            ast::Expr::IsNull { expr, negated } => Expr::IsNull {
+                expr: self.boxed(expr)?,
+                negated: *negated,
+            },
+            ast::Expr::Is {
+                expr,
+                test,
+                negated,
+            } => Expr::Test {
+                expr: self.boxed(expr)?,
+                test: match test {
+                    ast::BooleanTest::True => BooleanTest::True,
+                    ast::BooleanTest::False => BooleanTest::False,
+                    ast::BooleanTest::Unknown => BooleanTest::Unknown,
+                },
+                negated: *negated,
+            },
+            ast::Expr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => Expr::IsDistinctFrom {
+                left: self.boxed(left)?,
+                right: self.boxed(right)?,
+                negated: *negated,
+            },
+            ast::Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let between = between(self.bind(expr)?, self.bind(low)?, self.bind(high)?);
+                negate_if(*negated, between)
+            }
+            ast::Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let expr = self.bind(expr)?;
+                let list = list
+                    .iter()
+                    .map(|item| self.bind(item))
+                    .collect::<Result<Vec<_>, _>>()?;
+                negate_if(*negated, in_list(expr, list))
+            }
+            ast::Expr::Cast { expr, to } => Expr::Cast {
+                expr: self.boxed(expr)?,
+                to: *to,
+            },
+            ast::Expr::Function { name, .. } => return Err(self.function_error(name)),
+        })
+    }
+
+    /// No scalar functions exist yet, and an aggregate reaches here only where it may not be.
+    fn function_error(&self, name: &str) -> PlannerError {
+        match &self.mode {
+            Mode::Plain(clause) if is_aggregate(name) => {
+                PlannerError::AggregateNotAllowed { clause }
+            }
+            Mode::AggregateArgument if is_aggregate(name) => PlannerError::NestedAggregate,
+            _ => PlannerError::UndefinedFunction {
+                name: name.to_string(),
+            },
+        }
+    }
+}
+
+/// The aggregate `call` names: `count(*)`, or one of the aggregates of one argument.
+fn aggregate(
+    call: &ast::Expr,
+    name: &str,
+    args: &ast::FunctionArgs,
+    scope: &Scope<'_>,
+) -> Result<Aggregate, PlannerError> {
+    let undefined = || PlannerError::UndefinedFunction {
+        name: call.to_string(),
+    };
+    let [argument] = (match args {
+        ast::FunctionArgs::Star if name == "count" => return Ok(Aggregate::CountStar),
+        ast::FunctionArgs::Star => &[],
+        ast::FunctionArgs::List(list) => list.as_slice(),
+    }) else {
+        return Err(undefined());
+    };
+    let argument = Binder {
+        scope,
+        mode: Mode::AggregateArgument,
+    }
+    .bind(argument)?;
+    Ok(match name {
+        "count" => Aggregate::Count(argument),
+        "sum" => Aggregate::Sum(argument),
+        "avg" => Aggregate::Avg(argument),
+        "min" => Aggregate::Min(argument),
+        "max" => Aggregate::Max(argument),
+        _ => return Err(undefined()),
     })
 }
 
@@ -155,19 +323,6 @@ fn negate_if(negated: bool, expr: Expr) -> Expr {
     match negated {
         true => Expr::Not(Box::new(expr)),
         false => expr,
-    }
-}
-
-/// No scalar functions exist yet; the aggregates belong to a `SELECT`'s groups, never to a
-/// `WHERE`, a row of `VALUES` or a `SET`.
-fn function_error(name: &str) -> PlannerError {
-    match name {
-        "count" | "sum" | "avg" | "min" | "max" => PlannerError::AggregateNotAllowed {
-            function: name.to_string(),
-        },
-        _ => PlannerError::UndefinedFunction {
-            name: name.to_string(),
-        },
     }
 }
 
@@ -227,7 +382,7 @@ mod tests {
     use super::*;
 
     use crate::sql::{SelectItem, Statement, parse};
-    use crate::table::Column;
+    use crate::table::{Column, Schema};
     use crate::types::{Date, Finite64, Timestamp};
 
     /// `t (id INTEGER, v INTEGER, s VARCHAR)`.
@@ -252,12 +407,12 @@ mod tests {
 
     fn bound(sql: &str) -> Expr {
         let schema = schema();
-        bind(&ast_expr(sql), &Scope::table("t", &schema)).unwrap()
+        bind(&ast_expr(sql), &Scope::table("t", &schema), "WHERE").unwrap()
     }
 
     fn bind_err(sql: &str) -> PlannerError {
         let schema = schema();
-        bind(&ast_expr(sql), &Scope::table("t", &schema)).unwrap_err()
+        bind(&ast_expr(sql), &Scope::table("t", &schema), "WHERE").unwrap_err()
     }
 
     fn literal(sql: &str) -> Value {
@@ -285,7 +440,7 @@ mod tests {
     fn an_unknown_column_or_table_should_fail() {
         let unknown = bind_err("zz");
         let other_table = bind_err("u.v");
-        let in_values = bind(&ast_expr("id"), &Scope::empty()).unwrap_err();
+        let in_values = bind(&ast_expr("id"), &Scope::empty(), "VALUES").unwrap_err();
 
         assert!(matches!(&unknown, PlannerError::UndefinedColumn { column } if column == "zz"));
         assert_eq!(unknown.sqlstate(), "42703");
@@ -477,7 +632,11 @@ mod tests {
         let unknown = bind_err("f(1)");
 
         assert!(
-            matches!(&aggregate, PlannerError::AggregateNotAllowed { function } if function == "count")
+            matches!(
+                aggregate,
+                PlannerError::AggregateNotAllowed { clause: "WHERE" }
+            ),
+            "{aggregate:?}"
         );
         assert_eq!(aggregate.sqlstate(), "42803");
         assert_eq!(summed.sqlstate(), "42803");

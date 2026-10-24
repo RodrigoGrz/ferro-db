@@ -1,6 +1,7 @@
 //! The parser: tokens as statements, by recursive descent, one function per rule of the
-//! grammar. Only `SELECT` exists so far: `[ALL] items [FROM tables] [WHERE] [GROUP BY]
-//! [HAVING] [ORDER BY] [LIMIT | FETCH] [OFFSET]`, joins read left to right and a comma being a
+//! grammar: `SELECT`, `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, `INSERT`, `UPDATE`, `DELETE` and
+//! `EXPLAIN SELECT`. A `SELECT` is `[ALL] items [FROM tables] [WHERE] [GROUP BY] [HAVING]
+//! [ORDER BY] [LIMIT | FETCH] [OFFSET]`, joins read left to right and a comma being a
 //! `CROSS JOIN`.
 //!
 //! Expressions use precedence climbing over `Precedence`, PostgreSQL's order: `OR`, `AND`,
@@ -85,7 +86,30 @@ impl Parser<'_> {
                 self.next += 1;
                 self.delete()
             }
+            Some(Keyword::Explain) => {
+                self.next += 1;
+                self.explain()
+            }
             _ => Err(self.error_here("a statement")),
+        }
+    }
+
+    /// The rest of `EXPLAIN SELECT …`, after `EXPLAIN`; the plan of another statement is valid
+    /// SQL elsewhere, not yet here.
+    fn explain(&mut self) -> Result<Statement, SqlError> {
+        match self.peek_keyword() {
+            Some(Keyword::Select) => {
+                self.next += 1;
+                Ok(Statement::Explain(Box::new(self.select()?)))
+            }
+            Some(
+                Keyword::Create
+                | Keyword::Insert
+                | Keyword::Update
+                | Keyword::Delete
+                | Keyword::Explain,
+            ) => Err(self.unsupported("EXPLAIN of statements other than SELECT")),
+            _ => Err(self.error_here("SELECT")),
         }
     }
 
@@ -1448,6 +1472,35 @@ mod tests {
     }
 
     #[test]
+    fn explain_should_wrap_a_select() {
+        let explained = statement("EXPLAIN SELECT a FROM t");
+        let as_names = statement("SELECT explain FROM explain");
+
+        assert!(matches!(&explained, Statement::Explain(_)), "{explained:?}");
+        assert_eq!(explained.to_string(), "EXPLAIN SELECT a FROM t");
+        assert_eq!(as_names.to_string(), "SELECT explain FROM explain");
+    }
+
+    #[test]
+    fn explain_of_anything_but_a_select_should_fail() {
+        let unsupported = SqlError::Unsupported {
+            feature: "EXPLAIN of statements other than SELECT",
+            position: 9,
+        };
+
+        assert_eq!(parse_err("EXPLAIN INSERT INTO t VALUES (1)"), unsupported);
+        assert_eq!(parse_err("EXPLAIN DELETE FROM t"), unsupported);
+        assert_eq!(parse_err("EXPLAIN EXPLAIN SELECT 1"), unsupported);
+        assert_eq!(parse_err("EXPLAIN t"), unexpected("t", "SELECT", 9));
+        assert_eq!(
+            parse_err("EXPLAIN"),
+            SqlError::UnexpectedEnd {
+                expected: "SELECT".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn update_should_take_assignments_and_an_optional_where() {
         let with_where = statement("UPDATE t SET v = v + 1, s = 'x' WHERE id > 2");
         let without = statement("UPDATE t SET v = NULL");
@@ -2255,7 +2308,7 @@ mod tests {
 
         fn statement(&mut self) -> Statement {
             let table = self.name();
-            match self.below(6) {
+            match self.below(7) {
                 0 => Statement::Select(Box::new(self.select())),
                 1 => Statement::CreateTable {
                     name: table,
@@ -2296,6 +2349,7 @@ mod tests {
                         .collect(),
                     selection: self.chance(2).then(|| self.expr(2)),
                 },
+                5 => Statement::Explain(Box::new(self.select())),
                 _ => Statement::Delete {
                     table,
                     selection: self.chance(2).then(|| self.expr(2)),

@@ -43,7 +43,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Table Metadata: tables persisted in the catalog ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
 - [x] Table Heap: typed `insert` / `get` / `update` / `delete` / `scan`, combining `Schema` and `HeapFile`, found by table name through the catalog, which keeps one handle per table ([`table_heap.rs`](src/table/table_heap.rs), [`catalog.rs`](src/catalog/catalog.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs))
 - [x] INSERT: `INSERT INTO t [(columns)] VALUES …` through `run_sql`, the columns outside the list `NULL` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs), [docs](docs/planner.md#statements))
-- [ ] SELECT
+- [ ] SELECT. Parsed and planned (`EXPLAIN SELECT` shows the logical plan); it runs with the physical plan.
 - [x] UPDATE: `UPDATE t SET … [WHERE …]` through `run_sql` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs))
 - [x] DELETE: `DELETE FROM t [WHERE …]` through `run_sql` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs))
 - [x] Sequential Scan: typed table scan in heap order, `TableHeap::scan` ([`table_heap.rs`](src/table/table_heap.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs)). The scan operator of the executor is under Query Execution.
@@ -64,11 +64,11 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] AST: statements with names and literal text, printed back as canonical SQL ([`ast.rs`](src/sql/ast.rs), [docs](docs/sql.md#ast)).
 - [x] DDL: `CREATE TABLE` (types, `NOT NULL`) and `CREATE UNIQUE INDEX` run against the catalog ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs), [docs](docs/planner.md)). `PRIMARY KEY`, `UNIQUE` columns and `DROP TABLE` not yet.
 - [x] DML: `INSERT`, `UPDATE` and `DELETE` bound and run through the executors ([`binder.rs`](src/planner/binder.rs), [`run.rs`](src/planner/run.rs), [docs](docs/planner.md))
-- [ ] Query Validation. Names and literals are bound for statements on one table (`42703`, `42P01`, `42803`); the validation of `SELECT` (groups, aggregates, joins) comes with the query planner.
+- [x] Query Validation: names resolved against the tables of the `FROM` (`42P01`, `42702`, `42703`, `42712`), the `ON` of a join limited to its two sides, grouping rules (`42803`: columns outside the groups, aggregates nested or in `WHERE`/`ON`/`GROUP BY`), `ORDER BY` positions and names (`42P10`, `42702`), columns in `LIMIT` (`42P10`) ([`scope.rs`](src/planner/scope.rs), [`binder.rs`](src/planner/binder.rs), [`select.rs`](src/planner/select.rs), [`tests/planner_select.rs`](tests/planner_select.rs), [docs](docs/planner.md#planning-a-select))
 
 ## Query Planning
 
-- [ ] Logical Query Plan
+- [x] Logical Query Plan: a `SELECT` as `Scan/Join → Filter → Aggregate → Filter → Sort → Limit → Project` over the executors' expressions, shown by `EXPLAIN` with the columns by name ([`logical_plan.rs`](src/planner/logical_plan.rs), [`select.rs`](src/planner/select.rs), [`explain.rs`](src/planner/explain.rs), [`tests/planner_select.rs`](tests/planner_select.rs), [docs](docs/planner.md#logical-plan))
 - [ ] Physical Query Plan
 
 ## Query Execution
@@ -81,7 +81,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Limit: `LIMIT`/`OFFSET` counts validated as the standard says (`2201W`, `2201X`), never pulling the child past the count ([`limit.rs`](src/execution/limit.rs), [`tests/execution_sort.rs`](tests/execution_sort.rs), [docs](docs/execution.md#counts))
 - [x] Aggregation: hash aggregation in memory with `COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, skipping `NULL` as the standard does ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs), [docs](docs/execution.md#aggregation))
 - [x] GROUP BY: groups by any expressions, `NULL` keys in one group, in order of first appearance; `HAVING` is a `Filter` over the groups ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs))
-- [ ] JOIN. `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` exist through the `IndexNestedLoopJoin` and the `HashJoin`; the syntax does not.
+- [ ] JOIN. `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` exist through the `IndexNestedLoopJoin` and the `HashJoin`, and the syntax is parsed and planned (`Join` in the logical plan); running a join from SQL waits for the physical plan.
 - [x] Hash Join: in-memory build of the right input and probe by normalized keys (`1 = 1.0`), `INNER`, `LEFT`, `RIGHT` and `FULL` with a residual predicate, several keys or none (`CROSS`) ([`hash_join.rs`](src/execution/hash_join.rs), [`tests/execution_hash_join.rs`](tests/execution_hash_join.rs), [docs](docs/execution.md#hash-join))
 - [ ] Nested Loop Join. Not implemented on purpose: the plain loop scans the inner table for every outer row; the index nested loop join below replaces it.
 - [x] Index Nested Loop Join: one B+Tree descent per outer row, `INNER` and `LEFT` with a residual predicate, the key converted like an `IndexScan` point ([`join.rs`](src/execution/join.rs), [`tests/execution_join.rs`](tests/execution_join.rs), [docs](docs/execution.md#index-nested-loop-join))
