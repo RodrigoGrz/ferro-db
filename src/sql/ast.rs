@@ -9,7 +9,47 @@ use super::parser::is_reserved;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    Select(Select),
+    Select(Box<Select>),
+    CreateTable {
+        name: String,
+        columns: Vec<ColumnDef>,
+    },
+    /// Only a `UNIQUE` index runs; a plain `CREATE INDEX` parses and the planner refuses it.
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+        is_unique: bool,
+    },
+    /// `columns` is empty when the statement names none: every column, in table order.
+    Insert {
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<Expr>>,
+    },
+    Update {
+        table: String,
+        assignments: Vec<Assignment>,
+        selection: Option<Expr>,
+    },
+    Delete {
+        table: String,
+        selection: Option<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: DataType,
+    pub is_not_null: bool,
+}
+
+/// `column = value` in an `UPDATE`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,7 +217,86 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Select(select) => write!(f, "{select}"),
+            Statement::CreateTable { name, columns } => {
+                write!(f, "CREATE TABLE {} (", Name(name))?;
+                write_list(f, columns)?;
+                write!(f, ")")
+            }
+            Statement::CreateIndex {
+                name,
+                table,
+                column,
+                is_unique,
+            } => {
+                let unique = if *is_unique { "UNIQUE " } else { "" };
+                write!(
+                    f,
+                    "CREATE {unique}INDEX {} ON {} ({})",
+                    Name(name),
+                    Name(table),
+                    Name(column)
+                )
+            }
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
+                write!(f, "INSERT INTO {}", Name(table))?;
+                if !columns.is_empty() {
+                    let names: Vec<Name<'_>> = columns.iter().map(|column| Name(column)).collect();
+                    write!(f, " (")?;
+                    write_list(f, &names)?;
+                    write!(f, ")")?;
+                }
+                write!(f, " VALUES ")?;
+                for (index, row) in rows.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "(")?;
+                    write_list(f, row)?;
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => {
+                write!(f, "UPDATE {} SET ", Name(table))?;
+                write_list(f, assignments)?;
+                write_where(f, selection.as_ref())
+            }
+            Statement::Delete { table, selection } => {
+                write!(f, "DELETE FROM {}", Name(table))?;
+                write_where(f, selection.as_ref())
+            }
         }
+    }
+}
+
+impl fmt::Display for ColumnDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", Name(&self.name), self.data_type)?;
+        if self.is_not_null {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Assignment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} = {}", Name(&self.column), self.value)
+    }
+}
+
+fn write_where(f: &mut fmt::Formatter<'_>, selection: Option<&Expr>) -> fmt::Result {
+    match selection {
+        Some(selection) => write!(f, " WHERE {selection}"),
+        None => Ok(()),
     }
 }
 
@@ -632,7 +751,7 @@ mod tests {
             offset: Some(number("20")),
         };
 
-        let sql = Statement::Select(select).to_string();
+        let sql = Statement::Select(Box::new(select)).to_string();
 
         assert_eq!(
             sql,
@@ -667,8 +786,94 @@ mod tests {
             offset: Some(number("5")),
         };
 
-        let sql = Statement::Select(constant).to_string();
+        let sql = Statement::Select(Box::new(constant)).to_string();
 
         assert_eq!(sql, "SELECT * FROM (a CROSS JOIN b) OFFSET 5");
+    }
+
+    #[test]
+    fn ddl_statements_should_print_as_sql() {
+        let create_table = Statement::CreateTable {
+            name: "Users".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    is_not_null: true,
+                },
+                ColumnDef {
+                    name: "date".to_string(),
+                    data_type: DataType::Varchar(NonZeroU16::new(5).unwrap()),
+                    is_not_null: false,
+                },
+            ],
+        };
+        let index = |is_unique| Statement::CreateIndex {
+            name: "users_id".to_string(),
+            table: "Users".to_string(),
+            column: "id".to_string(),
+            is_unique,
+        };
+
+        assert_eq!(
+            create_table.to_string(),
+            "CREATE TABLE \"Users\" (id INTEGER NOT NULL, date VARCHAR(5))"
+        );
+        assert_eq!(
+            index(true).to_string(),
+            "CREATE UNIQUE INDEX users_id ON \"Users\" (id)"
+        );
+        assert_eq!(
+            index(false).to_string(),
+            "CREATE INDEX users_id ON \"Users\" (id)"
+        );
+    }
+
+    #[test]
+    fn dml_statements_should_print_as_sql() {
+        let insert = |columns: Vec<&str>| Statement::Insert {
+            table: "t".to_string(),
+            columns: columns.into_iter().map(str::to_string).collect(),
+            rows: vec![
+                vec![number("1"), column("a")],
+                vec![number("2"), number("3")],
+            ],
+        };
+        let update = Statement::Update {
+            table: "t".to_string(),
+            assignments: vec![
+                Assignment {
+                    column: "v".to_string(),
+                    value: binary(BinaryOp::Plus, column("v"), number("1")),
+                },
+                Assignment {
+                    column: "select".to_string(),
+                    value: number("0"),
+                },
+            ],
+            selection: Some(binary(BinaryOp::Gt, column("id"), number("2"))),
+        };
+        let delete = |selection| Statement::Delete {
+            table: "t".to_string(),
+            selection,
+        };
+
+        assert_eq!(
+            insert(vec![]).to_string(),
+            "INSERT INTO t VALUES (1, a), (2, 3)"
+        );
+        assert_eq!(
+            insert(vec!["id", "Name"]).to_string(),
+            "INSERT INTO t (id, \"Name\") VALUES (1, a), (2, 3)"
+        );
+        assert_eq!(
+            update.to_string(),
+            "UPDATE t SET v = (v + 1), \"select\" = 0 WHERE (id > 2)"
+        );
+        assert_eq!(delete(None).to_string(), "DELETE FROM t");
+        assert_eq!(
+            delete(Some(column("gone"))).to_string(),
+            "DELETE FROM t WHERE gone"
+        );
     }
 }

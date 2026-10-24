@@ -4,7 +4,7 @@ use ferro_db::sql::{
 
 fn select(sql: &str) -> Select {
     match parse(sql).unwrap().as_slice() {
-        [Statement::Select(select)] => select.clone(),
+        [Statement::Select(select)] => (**select).clone(),
         other => panic!("{other:?}"),
     }
 }

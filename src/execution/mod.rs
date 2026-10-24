@@ -13,7 +13,7 @@ pub mod projection;
 pub mod scan;
 pub mod sort;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use aggregation::{Aggregate, Aggregation};
 pub use error::{ExecutionError, RowCountClause};

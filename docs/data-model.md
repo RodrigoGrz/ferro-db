@@ -879,3 +879,9 @@ See [ADR 0006](decisions/0006-catalog-on-page-zero.md) for the bootstrap and com
 | `VARCHAR` without a length | the length is required | accepted as the widest, `VARCHAR(65535)`, as PostgreSQL accepts it as unlimited |
 | `LIMIT n` | not in the standard; the form is `OFFSET n ROWS FETCH FIRST m ROWS ONLY` | both accepted, `LIMIT` as in PostgreSQL ([sql.md](sql.md#select)) |
 | `SELECT DISTINCT`, set operations, subqueries, `CASE`, `LIKE`, `JOIN … USING`, `NATURAL JOIN` | part of the standard's query expressions | not parsed yet; `SELECT DISTINCT` is refused with `0A000` |
+| Exact numeric literals with a fraction (`1.5`) | `NUMERIC`, an exact numeric | `DOUBLE PRECISION` until there is `NUMERIC` ([planner.md](planner.md#binder)) |
+| Integer literals past `BIGINT` | an exact numeric with implementation-defined precision (PostgreSQL makes them `NUMERIC`) | `22003` |
+| A string literal for a numeric column (`INSERT … VALUES ('5')`) | refused: a character string is not assignable to a number | refused (`42804`), as the standard; PostgreSQL accepts it, adapting the untyped literal |
+| Prefix `+` | numeric operands only | `+x` is `x` for any type (PostgreSQL refuses `+` on text) |
+| `CREATE INDEX` | not in the standard | only `CREATE UNIQUE INDEX` (decided with the author): every index is unique; a plain `CREATE INDEX` is `0A000` |
+| `PRIMARY KEY` and `UNIQUE` column constraints | part of `<column definition>` | not yet (`0A000`); the Constraints section will add them |

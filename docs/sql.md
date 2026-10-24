@@ -1,8 +1,8 @@
 # SQL
 
-This document describes ferroDB's SQL layer (`src/sql/`): how the text of a statement becomes something the rest of the database can use. The **lexer** turns text into tokens and the **parser** turns tokens into an **AST**; only `SELECT` statements and expressions are parsed so far, and nothing runs them yet: the planner, which will resolve names and build executors, comes next. The execution layer is in [execution.md](execution.md).
+This document describes ferroDB's SQL layer (`src/sql/`): how the text of a statement becomes something the rest of the database can use. The **lexer** turns text into tokens and the **parser** turns tokens into an **AST**; the parser reads `SELECT`, `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, `INSERT`, `UPDATE` and `DELETE`. The planner ([planner.md](planner.md)) runs all of them but `SELECT`, whose query planner comes next. The execution layer is in [execution.md](execution.md).
 
-The layer depends only on `types` (the `DataType` of a `CAST`). The planner will depend on it and on the catalog and the executors.
+The layer depends only on `types` (the `DataType` of a `CAST` or a column). The planner depends on it and on the catalog and the executors.
 
 - [Lexer](#lexer)
   - [Tokens](#tokens)
@@ -10,6 +10,7 @@ The layer depends only on `types` (the `DataType` of a `CAST`). The planner will
   - [Errors](#errors)
 - [Parser](#parser)
   - [SELECT](#select)
+  - [Other statements](#other-statements)
   - [Expressions](#expressions)
   - [Names and reserved words](#names-and-reserved-words)
   - [Parse errors](#parse-errors)
@@ -117,6 +118,21 @@ table_ref := name [[AS] alias]
 - **`LIMIT`, `OFFSET` and `FETCH`** may come in any order, each once; `LIMIT` and `FETCH` both set the count, so only one of them may appear. `FETCH FIRST ROW ONLY` without a number is 1; `LIMIT ALL` is no limit. `LIMIT` is PostgreSQL's; `OFFSET … FETCH FIRST` is the standard's form.
 - **`SELECT DISTINCT`** is refused with `Unsupported` (`0A000`); `SELECT ALL` is the default.
 
+### Other statements
+
+```
+CREATE TABLE name ( name type [NOT NULL | NULL] [, …] )
+CREATE [UNIQUE] INDEX name ON table ( column )
+INSERT INTO table [( column [, …] )] VALUES ( expr [, …] ) [, ( … ) …]
+UPDATE table SET column = expr [, …] [WHERE expr]
+DELETE FROM table [WHERE expr]
+```
+
+- The types are those of a `CAST` (below).
+- `PRIMARY KEY` and `UNIQUE` after a column are refused with `Unsupported` (`0A000`): they belong to the Constraints section, still to come. An index on more than one column is refused the same way.
+- `CREATE INDEX` without `UNIQUE` parses; the planner refuses it, since every index of ferroDB is unique.
+- `INSERT … SELECT` is refused with `0A000`; a column list, when given, must name at least one column.
+
 ### Expressions
 
 Precedence climbing (Pratt): `expression_from(min)` reads an operand, then every operator that binds at least as tightly as `min`, reading its right side one level tighter, which makes operators left-associative. The table is PostgreSQL's order, loosest first:
@@ -160,14 +176,21 @@ After `AS`, a column alias may be any word, a keyword included (`SELECT 1 AS fro
 
 `found` is the token's source text as written; the position is its first character.
 
-**Nesting is limited** to `MAX_NESTING` (200) levels of expressions and table references: parentheses, signs, `NOT`, function arguments and parenthesized joins each open one. The parser recurses once per level, and so do `Display`, dropping the tree and the planner to come, so without a limit a long enough `((((…))))` would exhaust the stack and abort the process; past it, `TooDeep` (`54001`, *statement too complex*), as PostgreSQL does when it reaches `max_stack_depth`.
+**Nesting is limited** to `MAX_NESTING` (200) levels of expressions and table references: parentheses, signs, `NOT`, function arguments and parenthesized joins each open one, and so does each operator or join of a chain, read in a loop but stored as deep as it is long (`a + b + c` is `(a + b) + c`; `FROM a, b, c` is `(a CROSS JOIN b) CROSS JOIN c`). The parser recurses once per level, and so do `Display`, dropping the tree, the binder and evaluation, so without a limit a long enough `((((…))))` or `1 + 1 + … + 1` would exhaust the stack and abort the process; past it, `TooDeep` (`54001`, *statement too complex*), as PostgreSQL does when it reaches `max_stack_depth`.
 
 ## AST
 
 `ast.rs` holds the statement as written, with **names** rather than column positions (the executors' `Expr` uses positions; the planner will translate):
 
 ```rust
-pub enum Statement { Select(Select) }
+pub enum Statement {
+    Select(Box<Select>),
+    CreateTable { name, columns: Vec<ColumnDef> },            // ColumnDef { name, data_type, is_not_null }
+    CreateIndex { name, table, column, is_unique },
+    Insert { table, columns: Vec<String>, rows: Vec<Vec<Expr>> },   // columns empty: every column
+    Update { table, assignments: Vec<Assignment>, selection: Option<Expr> },
+    Delete { table, selection: Option<Expr> },
+}
 pub struct Select {
     pub projection: Vec<SelectItem>, pub from: Option<TableRef>, pub selection: Option<Expr>,
     pub group_by: Vec<Expr>, pub having: Option<Expr>, pub order_by: Vec<OrderItem>,
@@ -216,18 +239,19 @@ Literals keep their text where the planner gives them a type: a number may becom
 - Mutations checked by hand, each caught: block comments that do not nest, and a doubled quote not standing for one.
 - Integration in [`tests/sql_lexer.rs`](../tests/sql_lexer.rs): a `SELECT` with a join, `GROUP BY`, `HAVING`, `ORDER BY … NULLS LAST`, `LIMIT` and `OFFSET`; a `CREATE TABLE` with types and constraints; an `INSERT` with a string holding `''`, accents and a newline; a script of three statements with line and nested block comments; errors deep in a statement reported at the right character.
 - `ast.rs`: literals (strings with `''`, typed literals), names quoted only when needed (capitals, reserved words, spaces, quotes, a leading digit; non-reserved keywords and non-ASCII letters bare), every compound expression in parentheses, a `SELECT` with every clause, a minimal one with a `CROSS JOIN`.
-- `parser.rs`: every kind of literal, `date` and `rows` as names, qualified and quoted columns, parentheses, function calls with `*`, nothing or arguments, `CAST` to every type, `VARCHAR` lengths out of range (`22023`) and unknown types (`42704`), missing operands, unclosed parentheses, a reserved word as a column, a statement not starting with `SELECT`; incomplete type names (`DOUBLE` without `PRECISION`, `CHARACTER(5)`, `VARCHAR()`, `VARCHAR(-1)`), an empty `IN ()`, `FETCH` missing `FIRST`, `ROWS` or `ONLY`; nesting exactly at the limit and one level past it for parentheses, signs, `NOT` and parenthesized joins (`54001`, at the right character), and 10,000 levels of each on a 2 MB stack failing with `54001` instead of overflowing; each precedence level and associativity, `NOT`, `IS` tests, `BETWEEN` followed by `AND`, `IN`, signs, chained comparisons (`42601`), incomplete operators; wildcards and aliases (`AS` with a keyword), tables with aliases and commas, every join kind with and without `OUTER`, `CROSS JOIN`, parenthesized joins, a join without `ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` directions and null positions, every form of `LIMIT`, `OFFSET` and `FETCH` and a count given twice, statements and empty statements, `SELECT DISTINCT` (`0A000`) and `SELECT ALL`, non-reserved keywords as names, clauses out of order or incomplete.
+- `parser.rs`: every kind of literal, `date` and `rows` as names, qualified and quoted columns, parentheses, function calls with `*`, nothing or arguments, `CAST` to every type, `VARCHAR` lengths out of range (`22023`) and unknown types (`42704`), missing operands, unclosed parentheses, a reserved word as a column, a statement not starting with `SELECT`; incomplete type names (`DOUBLE` without `PRECISION`, `CHARACTER(5)`, `VARCHAR()`, `VARCHAR(-1)`), an empty `IN ()`, `FETCH` missing `FIRST`, `ROWS` or `ONLY`; nesting exactly at the limit and one level past it for parentheses, signs, `NOT` and parenthesized joins (`54001`, at the right character), and 10,000 levels of each on a 2 MB stack failing with `54001` instead of overflowing; chains of `+`, `*`, `||`, `AND` and `OR` and of commas and `CROSS JOIN`s exactly at the limit and one past it, and 100,000 long on a 2 MB stack failing the same way; each precedence level and associativity, `NOT`, `IS` tests, `BETWEEN` followed by `AND`, `IN`, signs, chained comparisons (`42601`), incomplete operators; wildcards and aliases (`AS` with a keyword), tables with aliases and commas, every join kind with and without `OUTER`, `CROSS JOIN`, parenthesized joins, a join without `ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` directions and null positions, every form of `LIMIT`, `OFFSET` and `FETCH` and a count given twice, statements and empty statements, `SELECT DISTINCT` (`0A000`) and `SELECT ALL`, non-reserved keywords as names, clauses out of order or incomplete.
 - `random_operator_chains_should_parse_like_a_shunting_yard`: 2,000 chains of up to 8 operands joined by `OR`, `AND`, `||`, `+`, `-`, `*`, `/` and `%` without parentheses; the tree must equal the one a shunting-yard built in the test with the same levels gives.
 - `random_selects_should_print_and_parse_back_to_themselves`: 1,000 random `SELECT`s (every expression kind to depth 3, joins to depth 2, every clause, names that need quotes or are non-reserved keywords); printing and parsing back gives the same AST.
 - `random_token_soup_should_never_panic`: 20,000 random sequences of keywords, names, literals and symbols; the parser never panics and every error has one of the layer's SQLSTATEs.
-- Mutations checked by hand, each caught: `+` and `-` at the level of `*` and `/`, and reserved words printed without quotes (by the random tests); the nesting limit off by one (by the boundary test).
+- Mutations checked by hand, each caught: `+` and `-` at the level of `*` and `/`, and reserved words printed without quotes (by the random tests); the nesting limit off by one (by the boundary test); a chain of joins not counted against the limit (by the chain boundary test).
+- `parser.rs`, other statements: `CREATE TABLE` with every column form and non-reserved keywords as names, `PRIMARY KEY` and `UNIQUE` (`0A000`), malformed tables (no columns, no type, unclosed, a reserved name, `NOT` without `NULL`); `CREATE UNIQUE INDEX` and `CREATE INDEX`, an index on two columns (`0A000`), `CREATE UNIQUE TABLE`, `CREATE VIEW`, a missing `ON`; `INSERT` with and without a column list and several rows, an empty column list or row, a missing `INTO`, an unclosed row, `INSERT … SELECT` (`0A000`); `UPDATE` with several assignments, with and without `WHERE`, a missing `SET` or `=`; `DELETE` with and without `WHERE`, a missing `FROM`. The random round trip prints and parses back 2,000 statements of all six kinds.
 - Integration in [`tests/sql_parser.rs`](../tests/sql_parser.rs): a `SELECT` with a join, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY … NULLS LAST`, `LIMIT` and `OFFSET` checked clause by clause; the `OFFSET … FETCH NEXT` form; a script with comments; a complex query printed and parsed back; errors deep in a query with their positions and SQLSTATEs.
 
 ## Limitations
 
-- **Only `SELECT` is parsed**, and nothing runs it: there is no planner yet, and `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `CREATE INDEX` and `DROP TABLE` come next.
+- **Statements parsed:** `SELECT`, `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, `INSERT … VALUES`, `UPDATE`, `DELETE`. Not yet: `DROP TABLE`, `ALTER TABLE`, column constraints other than `NOT NULL`, `DEFAULT`, `INSERT … SELECT`.
 - **Not parsed yet:** `SELECT DISTINCT` (refused with `0A000`), `UNION`/`INTERSECT`/`EXCEPT`, subqueries, `WITH`, `CASE`, `LIKE`, `JOIN … USING`, `NATURAL JOIN`, window functions, `COUNT(DISTINCT x)`, the boolean literal `UNKNOWN`.
-- **At most 200 levels of nesting** (`54001` beyond), a fixed count where PostgreSQL measures the stack (`max_stack_depth`).
+- **At most 200 levels of nesting** (`54001` beyond), a fixed count where PostgreSQL measures the stack (`max_stack_depth`). Each operator of a chain counts, so `a = 1 OR a = 2 OR …` fits about 200 terms; a long list of values belongs in `IN (…)`, which has no such limit.
 - **Not lexed:** strings with a prefix (`E'…'`, `N'…'`, `U&'…'`, `X'…'`, `B'…'`), the standard's concatenation of string literals separated by a newline, parameters (`$1`, `?`), PostgreSQL operators (`::`, `~`, `->`) and dollar quoting (`$$…$$`).
 - **No identifier length check here:** names longer than 63 bytes are refused by the catalog (`42622`).
 - **The whole statement in memory:** no incremental lexing of a stream.

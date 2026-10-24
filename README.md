@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL lexer and parser work and are tested (1,222 tests). Typed rows can be stored in tables that survive restarts and queried and changed through executors, from the Rust API. SQL is not run yet: `SELECT` statements parse into an AST, and the planner that will run them comes next. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,271 tests). Tables and unique indexes are created, and rows inserted, updated and deleted, with SQL (`run_sql`); queries still run through executors built in Rust, because `SELECT` parses but its query planner comes next. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -35,12 +35,11 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 
 **Partially there:**
 
-- Queries and writes run through executors built in Rust, but there are no `INSERT`/`SELECT`/`UPDATE`/`DELETE` statements yet: the parser and the planner come later.
-- Indexes are created through the catalog and kept in step by the executors; there is no `CREATE INDEX` statement yet, and no planner to choose an index scan.
-- `NOT NULL` is enforced per column by the schema, but there is no DDL to declare it.
+- `INSERT`, `UPDATE` and `DELETE` run from SQL, but `SELECT` only parses: queries run through executors built in Rust until the query planner exists.
+- `CREATE UNIQUE INDEX` creates an index and the executors keep it in step, but nothing chooses an index scan for a query yet.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** parsing of `INSERT`, `UPDATE`, `DELETE` and DDL, query planning, more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** the query planner for `SELECT`, more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -134,7 +133,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 1,125 unit tests + 97 integration tests
+cargo test --all-targets   # 1,171 unit tests + 100 integration tests
 ```
 
 The suite is the main way the implementation is verified:
@@ -156,6 +155,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - [docs/indexes.md](docs/indexes.md): the B+Tree, key encoding, node format, splits and merges
 - [docs/execution.md](docs/execution.md): expressions, executors, two-phase writes and index maintenance
 - [docs/sql.md](docs/sql.md): the SQL layer: the lexer (tokens, keywords, identifiers, literals, comments) and the parser and AST for `SELECT` (grammar, precedence, reserved words, errors)
+- [docs/planner.md](docs/planner.md): the planner layer: `run_sql`, the binder (names, literal types, `BETWEEN`/`IN`), how each statement runs, errors
 - [docs/decisions/](docs/decisions/README.md): architectural decision records
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and conventions
 

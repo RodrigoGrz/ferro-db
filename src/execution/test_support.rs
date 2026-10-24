@@ -14,7 +14,7 @@ use super::{ExecutionContext, Row};
 
 const PAGE_SIZE: usize = 512;
 
-pub(super) struct TestDb {
+pub(crate) struct TestDb {
     path: PathBuf,
     bpm: Option<BufferPoolManager>,
     pub catalog: Catalog,

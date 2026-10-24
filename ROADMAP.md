@@ -42,10 +42,10 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Schema: column definitions and typed row ⇄ tuple conversion ([`schema.rs`](src/table/schema.rs), [`tests/table_schema.rs`](tests/table_schema.rs))
 - [x] Table Metadata: tables persisted in the catalog ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
 - [x] Table Heap: typed `insert` / `get` / `update` / `delete` / `scan`, combining `Schema` and `HeapFile`, found by table name through the catalog, which keeps one handle per table ([`table_heap.rs`](src/table/table_heap.rs), [`catalog.rs`](src/catalog/catalog.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs))
-- [ ] INSERT. The `Insert` executor exists (indexes kept in step, whole statement validated first); there is no SQL statement.
+- [x] INSERT: `INSERT INTO t [(columns)] VALUES …` through `run_sql`, the columns outside the list `NULL` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs), [docs](docs/planner.md#statements))
 - [ ] SELECT
-- [ ] UPDATE. The `Update` executor exists; there is no SQL statement.
-- [ ] DELETE. The `Delete` executor exists; there is no SQL statement.
+- [x] UPDATE: `UPDATE t SET … [WHERE …]` through `run_sql` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs))
+- [x] DELETE: `DELETE FROM t [WHERE …]` through `run_sql` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs))
 - [x] Sequential Scan: typed table scan in heap order, `TableHeap::scan` ([`table_heap.rs`](src/table/table_heap.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs)). The scan operator of the executor is under Query Execution.
 - [ ] `DROP TABLE`
 
@@ -54,17 +54,17 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] B+Tree: unique keys of any type (text included) to `Rid`, order-preserving key encoding, variable-size nodes with split, merge and redistribution by bytes, a free list for freed pages ([`src/index/`](src/index/), [`tests/index_b_plus_tree.rs`](tests/index_b_plus_tree.rs), [docs](docs/indexes.md))
 - [x] Index Scan: the `IndexScan` executor reads a table through a B+Tree, fetching each row by `Rid` ([`scan.rs`](src/execution/scan.rs), [`tests/execution_index_scan.rs`](tests/execution_index_scan.rs), [docs](docs/execution.md#index-scan)). The operator is under Query Execution.
 - [x] Range Scan: `BPlusTree::range` and `IndexScan` over inclusive, exclusive and open bounds, converted to the key type ([`key_bounds.rs`](src/execution/key_bounds.rs), [`b_plus_tree.rs`](src/index/b_plus_tree.rs), [docs](docs/execution.md#bounds-in-the-keys-type))
-- [ ] Unique Index. Every index is unique, and the Insert and Update executors refuse a repeated key (`23505`); there is no `CREATE UNIQUE INDEX` statement yet.
+- [x] Unique Index: `CREATE UNIQUE INDEX name ON t (column)`, indexing the rows already there; the Insert and Update executors refuse a repeated key (`23505`) ([`run.rs`](src/planner/run.rs), [docs](docs/planner.md#statements))
 - [ ] Composite Index
 
 ## SQL
 
 - [x] Lexer: words folded to lowercase with their keywords, quoted identifiers, strings, numbers as written, operators (`!=` as `<>`), nested comments, syntax errors (`42601`) at a character position ([`lexer.rs`](src/sql/lexer.rs), [`tests/sql_lexer.rs`](tests/sql_lexer.rs), [docs](docs/sql.md))
-- [x] SQL Parser: recursive descent for `SELECT` (projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`) and expressions by precedence climbing, with `42601`, `42704`, `22023` and `0A000` errors ([`parser.rs`](src/sql/parser.rs), [`tests/sql_parser.rs`](tests/sql_parser.rs), [docs](docs/sql.md#parser)). Only `SELECT` so far: `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `CREATE INDEX` and `DROP TABLE` come next.
-- [x] AST: statements with names and literal text, printed back as canonical SQL ([`ast.rs`](src/sql/ast.rs), [docs](docs/sql.md#ast)). Only `SELECT` so far.
-- [ ] DDL
-- [ ] DML
-- [ ] Query Validation
+- [x] SQL Parser: recursive descent for `SELECT` (projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`) and expressions by precedence climbing, with `42601`, `42704`, `22023` and `0A000` errors ([`parser.rs`](src/sql/parser.rs), [`tests/sql_parser.rs`](tests/sql_parser.rs), [docs](docs/sql.md#parser)). Also `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, `INSERT … VALUES`, `UPDATE` and `DELETE`; `DROP TABLE` and `ALTER TABLE` not yet.
+- [x] AST: statements with names and literal text, printed back as canonical SQL ([`ast.rs`](src/sql/ast.rs), [docs](docs/sql.md#ast)).
+- [x] DDL: `CREATE TABLE` (types, `NOT NULL`) and `CREATE UNIQUE INDEX` run against the catalog ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs), [docs](docs/planner.md)). `PRIMARY KEY`, `UNIQUE` columns and `DROP TABLE` not yet.
+- [x] DML: `INSERT`, `UPDATE` and `DELETE` bound and run through the executors ([`binder.rs`](src/planner/binder.rs), [`run.rs`](src/planner/run.rs), [docs](docs/planner.md))
+- [ ] Query Validation. Names and literals are bound for statements on one table (`42703`, `42P01`, `42803`); the validation of `SELECT` (groups, aggregates, joins) comes with the query planner.
 
 ## Query Planning
 
@@ -120,7 +120,7 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 
 - [ ] PRIMARY KEY
 - [ ] UNIQUE
-- [ ] NOT NULL. The `Schema` already enforces a per-column `NOT NULL` flag; the item is marked when DDL (`CREATE TABLE ... NOT NULL`) exists.
+- [x] NOT NULL: `CREATE TABLE … NOT NULL`, enforced by the schema on every insert and update (`23502`) ([`run.rs`](src/planner/run.rs), [`schema.rs`](src/table/schema.rs))
 - [ ] FOREIGN KEY
 - [ ] CHECK
 - [ ] DEFAULT

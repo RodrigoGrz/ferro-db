@@ -8,8 +8,8 @@
 //! `IN`, `||`, `+ -`, `* / %`, then a prefix sign. Names are not resolved and numbers keep their
 //! text: that is the planner's job. A keyword names something only when `is_reserved` says it
 //! may; after `AS`, a column label may be any word, as in PostgreSQL. Expressions and table
-//! references nest at most `MAX_NESTING` levels deep (54001 beyond), so no statement can
-//! exhaust the stack.
+//! references nest at most `MAX_NESTING` levels deep, each operator or join of a chain counting
+//! as one (54001 beyond), so no statement can exhaust the stack.
 
 use std::num::NonZeroU16;
 
@@ -17,13 +17,15 @@ use crate::types::DataType;
 
 use super::lexer::character_position;
 use super::{
-    BinaryOp, BooleanTest, Expr, FunctionArgs, JoinKind, Keyword, Literal, OrderItem, Select,
-    SelectItem, SqlError, Statement, TableRef, Token, TokenKind, UnaryOp, tokenize,
+    Assignment, BinaryOp, BooleanTest, ColumnDef, Expr, FunctionArgs, JoinKind, Keyword, Literal,
+    OrderItem, Select, SelectItem, SqlError, Statement, TableRef, Token, TokenKind, UnaryOp,
+    tokenize,
 };
 
-/// How deeply expressions and joins may nest. The parser recurses once per level, and so do
-/// `Display`, dropping the tree and the planner, so a limit here keeps any statement from
-/// exhausting the stack (PostgreSQL stops at `max_stack_depth` with the same SQLSTATE).
+/// How deep the tree of a statement may be: a nested expression or table reference is a level,
+/// and so is each operator or join of a chain, since `a + b + c` is `(a + b) + c`. The parser,
+/// `Display`, dropping the tree, the binder and evaluation all recurse once per level, so a
+/// limit here keeps any statement from exhausting the stack.
 const MAX_NESTING: usize = 200;
 
 /// Every statement of the text, separated by `;` (empty statements are skipped).
@@ -38,7 +40,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>, SqlError> {
 }
 
 /// A cursor over the tokens of one text; `next` is the index of the first unread token and
-/// `depth` how many expressions and table references are being read inside one another.
+/// `depth` how deep in the tree the parser is (see `MAX_NESTING`).
 struct Parser<'a> {
     sql: &'a str,
     tokens: Vec<Token>,
@@ -62,8 +64,154 @@ impl Parser<'_> {
     }
 
     fn statement(&mut self) -> Result<Statement, SqlError> {
-        self.expect_keyword(Keyword::Select)?;
-        Ok(Statement::Select(self.select()?))
+        match self.peek_keyword() {
+            Some(Keyword::Select) => {
+                self.next += 1;
+                Ok(Statement::Select(Box::new(self.select()?)))
+            }
+            Some(Keyword::Create) => {
+                self.next += 1;
+                self.create()
+            }
+            Some(Keyword::Insert) => {
+                self.next += 1;
+                self.insert()
+            }
+            Some(Keyword::Update) => {
+                self.next += 1;
+                self.update()
+            }
+            Some(Keyword::Delete) => {
+                self.next += 1;
+                self.delete()
+            }
+            _ => Err(self.error_here("a statement")),
+        }
+    }
+
+    /// The rest of `INSERT INTO table [(columns)] VALUES (…) [, (…) …]`, after `INSERT`.
+    fn insert(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::Into)?;
+        let table = self.name("a table name")?;
+        let columns = match self.eat(&TokenKind::LeftParen) {
+            true => {
+                let columns = self.comma_list(|parser| parser.name("a column name"))?;
+                self.expect(&TokenKind::RightParen, "\",\" or \")\"")?;
+                columns
+            }
+            false => Vec::new(),
+        };
+        if self.peek_keyword() == Some(Keyword::Select) {
+            return Err(self.unsupported("INSERT … SELECT"));
+        }
+        self.expect_keyword(Keyword::Values)?;
+        let rows = self.comma_list(Self::row)?;
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    /// `(expr [, …])`: one row of `VALUES`.
+    fn row(&mut self) -> Result<Vec<Expr>, SqlError> {
+        self.expect(&TokenKind::LeftParen, "\"(\"")?;
+        let values = self.comma_list(Self::expression)?;
+        self.expect(&TokenKind::RightParen, "\",\" or \")\"")?;
+        Ok(values)
+    }
+
+    /// The rest of `UPDATE table SET column = expr [, …] [WHERE expr]`, after `UPDATE`.
+    fn update(&mut self) -> Result<Statement, SqlError> {
+        let table = self.name("a table name")?;
+        self.expect_keyword(Keyword::Set)?;
+        let assignments = self.comma_list(Self::assignment)?;
+        let selection = self.optional_clause(Keyword::Where)?;
+        Ok(Statement::Update {
+            table,
+            assignments,
+            selection,
+        })
+    }
+
+    fn assignment(&mut self) -> Result<Assignment, SqlError> {
+        let column = self.name("a column name")?;
+        self.expect(&TokenKind::Eq, "\"=\"")?;
+        let value = self.expression()?;
+        Ok(Assignment { column, value })
+    }
+
+    /// The rest of `DELETE FROM table [WHERE expr]`, after `DELETE`.
+    fn delete(&mut self) -> Result<Statement, SqlError> {
+        self.expect_keyword(Keyword::From)?;
+        let table = self.name("a table name")?;
+        let selection = self.optional_clause(Keyword::Where)?;
+        Ok(Statement::Delete { table, selection })
+    }
+
+    /// The rest of `CREATE TABLE` or `CREATE [UNIQUE] INDEX`, after `CREATE`.
+    fn create(&mut self) -> Result<Statement, SqlError> {
+        if self.eat_keyword(Keyword::Table) {
+            return self.create_table();
+        }
+        if self.eat_keyword(Keyword::Unique) {
+            self.expect_keyword(Keyword::Index)?;
+            return self.create_index(true);
+        }
+        if self.eat_keyword(Keyword::Index) {
+            return self.create_index(false);
+        }
+        Err(self.error_here("TABLE, INDEX or UNIQUE INDEX"))
+    }
+
+    fn create_table(&mut self) -> Result<Statement, SqlError> {
+        let name = self.name("a table name")?;
+        self.expect(&TokenKind::LeftParen, "\"(\"")?;
+        let columns = self.comma_list(Self::column_def)?;
+        self.expect(&TokenKind::RightParen, "\",\" or \")\"")?;
+        Ok(Statement::CreateTable { name, columns })
+    }
+
+    /// `name type [NOT NULL | NULL]`. Column constraints other than nullability are the
+    /// Constraints section's, still to come.
+    fn column_def(&mut self) -> Result<ColumnDef, SqlError> {
+        let name = self.name("a column name")?;
+        let data_type = self.data_type()?;
+        let is_not_null = if self.eat_keyword(Keyword::Not) {
+            self.expect_keyword(Keyword::Null)?;
+            true
+        } else {
+            self.eat_keyword(Keyword::Null);
+            false
+        };
+        match self.peek_keyword() {
+            Some(Keyword::Primary) => Err(self.unsupported("PRIMARY KEY")),
+            Some(Keyword::Unique) => Err(self.unsupported("UNIQUE columns")),
+            _ => Ok(ColumnDef {
+                name,
+                data_type,
+                is_not_null,
+            }),
+        }
+    }
+
+    /// The rest of `CREATE [UNIQUE] INDEX name ON table (column)`, after `INDEX`.
+    fn create_index(&mut self, is_unique: bool) -> Result<Statement, SqlError> {
+        let name = self.name("an index name")?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.name("a table name")?;
+        self.expect(&TokenKind::LeftParen, "\"(\"")?;
+        let column = self.name("a column name")?;
+        if self.peek_kind() == Some(&TokenKind::Comma) {
+            return Err(self.unsupported("indexes on more than one column"));
+        }
+        self.expect(&TokenKind::RightParen, "\")\"")?;
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            column,
+            is_unique,
+        })
     }
 
     /// The rest of a `SELECT`, after the keyword.
@@ -150,39 +298,45 @@ impl Parser<'_> {
 
     /// Joined tables separated by commas; a comma is a `CROSS JOIN`.
     fn table_expression(&mut self) -> Result<TableRef, SqlError> {
-        let mut from = self.joined_table()?;
-        while self.eat(&TokenKind::Comma) {
-            let right = self.joined_table()?;
-            from = TableRef::Join {
-                left: Box::new(from),
-                right: Box::new(right),
-                kind: JoinKind::Cross,
-                on: None,
-            };
-        }
-        Ok(from)
+        self.within_depth(|parser| {
+            let mut from = parser.joined_table()?;
+            while parser.eat(&TokenKind::Comma) {
+                let right = parser.joined_table()?;
+                from = TableRef::Join {
+                    left: Box::new(from),
+                    right: Box::new(right),
+                    kind: JoinKind::Cross,
+                    on: None,
+                };
+                parser.deeper()?;
+            }
+            Ok(from)
+        })
     }
 
     /// Tables joined left to right: `a JOIN b ON x JOIN c ON y` is `(a JOIN b) JOIN c`.
     fn joined_table(&mut self) -> Result<TableRef, SqlError> {
-        let mut left = self.table_primary()?;
-        while let Some(kind) = self.join_kind()? {
-            let right = self.table_primary()?;
-            let on = match kind {
-                JoinKind::Cross => None,
-                _ => {
-                    self.expect_keyword(Keyword::On)?;
-                    Some(self.expression()?)
-                }
-            };
-            left = TableRef::Join {
-                left: Box::new(left),
-                right: Box::new(right),
-                kind,
-                on,
-            };
-        }
-        Ok(left)
+        self.within_depth(|parser| {
+            let mut left = parser.table_primary()?;
+            while let Some(kind) = parser.join_kind()? {
+                let right = parser.table_primary()?;
+                let on = match kind {
+                    JoinKind::Cross => None,
+                    _ => {
+                        parser.expect_keyword(Keyword::On)?;
+                        Some(parser.expression()?)
+                    }
+                };
+                left = TableRef::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind,
+                    on,
+                };
+                parser.deeper()?;
+            }
+            Ok(left)
+        })
     }
 
     /// `[INNER] JOIN`, `LEFT | RIGHT | FULL [OUTER] JOIN`, `CROSS JOIN`, or `None`.
@@ -309,14 +463,17 @@ impl Parser<'_> {
     }
 
     fn climb(&mut self, min: Precedence) -> Result<Expr, SqlError> {
-        let mut left = self.prefix()?;
-        while let Some(precedence) = self.infix_precedence() {
-            if precedence < min {
-                break;
+        self.within_depth(|parser| {
+            let mut left = parser.prefix()?;
+            while let Some(precedence) = parser.infix_precedence() {
+                if precedence < min {
+                    break;
+                }
+                left = parser.infix(left, precedence)?;
+                parser.deeper()?;
             }
-            left = self.infix(left, precedence)?;
-        }
-        Ok(left)
+            Ok(left)
+        })
     }
 
     fn prefix(&mut self) -> Result<Expr, SqlError> {
@@ -738,15 +895,33 @@ impl Parser<'_> {
         &mut self,
         parse: impl FnOnce(&mut Self) -> Result<T, SqlError>,
     ) -> Result<T, SqlError> {
+        self.within_depth(|parser| {
+            parser.deeper()?;
+            parse(parser)
+        })
+    }
+
+    /// Runs `parse`, then puts the depth back: the levels it adds end with it.
+    fn within_depth<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, SqlError>,
+    ) -> Result<T, SqlError> {
+        let depth = self.depth;
+        let result = parse(self);
+        self.depth = depth;
+        result
+    }
+
+    /// One level more, or `TooDeep` past `MAX_NESTING`. Each operator or join folded into a
+    /// chain adds one too: `a + b + c` is `(a + b) + c`, a tree as deep as the chain is long.
+    fn deeper(&mut self) -> Result<(), SqlError> {
         if self.depth >= MAX_NESTING {
             return Err(SqlError::TooDeep {
                 position: self.position_here(),
             });
         }
         self.depth += 1;
-        let result = parse(self);
-        self.depth -= 1;
-        result
+        Ok(())
     }
 
     /// The position of the next token, or of the end of the text.
@@ -853,14 +1028,14 @@ pub(super) fn is_reserved(keyword: Keyword) -> bool {
 mod tests {
     use super::*;
     use crate::sql::{
-        BinaryOp, BooleanTest, FunctionArgs, JoinKind, Literal, OrderItem, SelectItem, TableRef,
-        UnaryOp,
+        Assignment, BinaryOp, BooleanTest, ColumnDef, FunctionArgs, JoinKind, Literal, OrderItem,
+        SelectItem, TableRef, UnaryOp,
     };
     use std::num::NonZeroU16;
 
     fn select(sql: &str) -> Select {
         match parse(sql).unwrap().as_slice() {
-            [Statement::Select(select)] => select.clone(),
+            [Statement::Select(select)] => (**select).clone(),
             other => panic!("{other:?}"),
         }
     }
@@ -1093,8 +1268,269 @@ mod tests {
     }
 
     #[test]
-    fn a_statement_should_start_with_select() {
-        assert_eq!(parse_err("WHERE a"), unexpected("WHERE", "SELECT", 1));
+    fn a_statement_should_start_with_its_keyword() {
+        assert_eq!(parse_err("WHERE a"), unexpected("WHERE", "a statement", 1));
+    }
+
+    fn statement(sql: &str) -> Statement {
+        match parse(sql).unwrap().as_slice() {
+            [statement] => statement.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn column_def(name: &str, data_type: DataType, is_not_null: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            is_not_null,
+        }
+    }
+
+    #[test]
+    fn create_table_should_take_columns_types_and_null_markers() {
+        let sql = "CREATE TABLE Users (id INTEGER NOT NULL, name VARCHAR(20) NULL, born DATE, \
+                   \"Score\" DOUBLE PRECISION)";
+
+        let parsed = statement(sql);
+
+        assert_eq!(
+            parsed,
+            Statement::CreateTable {
+                name: "users".to_string(),
+                columns: vec![
+                    column_def("id", DataType::Integer, true),
+                    column_def(
+                        "name",
+                        DataType::Varchar(NonZeroU16::new(20).unwrap()),
+                        false
+                    ),
+                    column_def("born", DataType::Date, false),
+                    column_def("Score", DataType::Double, false),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn create_table_should_take_non_reserved_keywords_as_names() {
+        let parsed = statement("CREATE TABLE rows (date DATE, key INT)");
+
+        assert_eq!(
+            parsed,
+            Statement::CreateTable {
+                name: "rows".to_string(),
+                columns: vec![
+                    column_def("date", DataType::Date, false),
+                    column_def("key", DataType::Integer, false),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn primary_key_and_unique_columns_should_be_unsupported() {
+        assert_eq!(
+            parse_err("CREATE TABLE t (id INT PRIMARY KEY)"),
+            SqlError::Unsupported {
+                feature: "PRIMARY KEY",
+                position: 24
+            }
+        );
+        assert_eq!(
+            parse_err("CREATE TABLE t (id INT NOT NULL UNIQUE)"),
+            SqlError::Unsupported {
+                feature: "UNIQUE columns",
+                position: 33
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_create_table_should_fail() {
+        assert_eq!(
+            parse_err("CREATE TABLE t ()"),
+            unexpected(")", "a column name", 17)
+        );
+        assert_eq!(
+            parse_err("CREATE TABLE t (id)"),
+            unexpected(")", "a type", 19)
+        );
+        assert_eq!(
+            parse_err("CREATE TABLE t (id INT"),
+            SqlError::UnexpectedEnd {
+                expected: "\",\" or \")\"".to_string()
+            }
+        );
+        assert_eq!(
+            parse_err("CREATE TABLE select (a INT)"),
+            unexpected("select", "a table name", 14)
+        );
+        assert_eq!(
+            parse_err("CREATE TABLE t (a INT NOT)"),
+            unexpected(")", "NULL", 26)
+        );
+    }
+
+    #[test]
+    fn create_index_should_take_one_column_and_say_whether_it_is_unique() {
+        let index = |is_unique| Statement::CreateIndex {
+            name: "users_id".to_string(),
+            table: "users".to_string(),
+            column: "id".to_string(),
+            is_unique,
+        };
+
+        assert_eq!(
+            statement("CREATE UNIQUE INDEX users_id ON users (id)"),
+            index(true)
+        );
+        assert_eq!(
+            statement("create index users_id on users (id)"),
+            index(false)
+        );
+    }
+
+    fn text(value: &str) -> Expr {
+        Expr::Literal(Literal::String(value.to_string()))
+    }
+
+    #[test]
+    fn insert_should_take_rows_with_or_without_a_column_list() {
+        let without = statement("INSERT INTO t VALUES (1, 'a'), (2, NULL)");
+        let with = statement("INSERT INTO t (id, \"Name\") VALUES (1, 'x')");
+
+        assert_eq!(
+            without,
+            Statement::Insert {
+                table: "t".to_string(),
+                columns: vec![],
+                rows: vec![
+                    vec![number("1"), text("a")],
+                    vec![number("2"), Expr::Literal(Literal::Null)],
+                ],
+            }
+        );
+        assert_eq!(
+            with,
+            Statement::Insert {
+                table: "t".to_string(),
+                columns: vec!["id".to_string(), "Name".to_string()],
+                rows: vec![vec![number("1"), text("x")]],
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_insert_should_fail() {
+        assert_eq!(
+            parse_err("INSERT INTO t () VALUES (1)"),
+            unexpected(")", "a column name", 16)
+        );
+        assert_eq!(
+            parse_err("INSERT INTO t VALUES ()"),
+            unexpected(")", "an expression", 23)
+        );
+        assert_eq!(parse_err("INSERT t VALUES (1)"), unexpected("t", "INTO", 8));
+        assert_eq!(
+            parse_err("INSERT INTO t VALUES (1"),
+            SqlError::UnexpectedEnd {
+                expected: "\",\" or \")\"".to_string()
+            }
+        );
+        assert_eq!(
+            parse_err("INSERT INTO t SELECT 1"),
+            SqlError::Unsupported {
+                feature: "INSERT … SELECT",
+                position: 15
+            }
+        );
+    }
+
+    #[test]
+    fn update_should_take_assignments_and_an_optional_where() {
+        let with_where = statement("UPDATE t SET v = v + 1, s = 'x' WHERE id > 2");
+        let without = statement("UPDATE t SET v = NULL");
+
+        assert_eq!(
+            with_where,
+            Statement::Update {
+                table: "t".to_string(),
+                assignments: vec![
+                    Assignment {
+                        column: "v".to_string(),
+                        value: expr("v + 1"),
+                    },
+                    Assignment {
+                        column: "s".to_string(),
+                        value: text("x"),
+                    },
+                ],
+                selection: Some(expr("id > 2")),
+            }
+        );
+        assert_eq!(
+            without,
+            Statement::Update {
+                table: "t".to_string(),
+                assignments: vec![Assignment {
+                    column: "v".to_string(),
+                    value: Expr::Literal(Literal::Null),
+                }],
+                selection: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_update_should_fail() {
+        assert_eq!(parse_err("UPDATE t v = 1"), unexpected("v", "SET", 10));
+        assert_eq!(parse_err("UPDATE t SET v 1"), unexpected("1", "\"=\"", 16));
+        assert_eq!(
+            parse_err("UPDATE t SET"),
+            SqlError::UnexpectedEnd {
+                expected: "a column name".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_should_take_an_optional_where() {
+        assert_eq!(
+            statement("DELETE FROM t WHERE id = 1"),
+            Statement::Delete {
+                table: "t".to_string(),
+                selection: Some(expr("id = 1")),
+            }
+        );
+        assert_eq!(
+            statement("DELETE FROM t"),
+            Statement::Delete {
+                table: "t".to_string(),
+                selection: None,
+            }
+        );
+        assert_eq!(parse_err("DELETE t"), unexpected("t", "FROM", 8));
+    }
+
+    #[test]
+    fn a_malformed_create_index_should_fail() {
+        assert_eq!(
+            parse_err("CREATE UNIQUE INDEX i ON t (a, b)"),
+            SqlError::Unsupported {
+                feature: "indexes on more than one column",
+                position: 30
+            }
+        );
+        assert_eq!(
+            parse_err("CREATE UNIQUE TABLE t (a INT)"),
+            unexpected("TABLE", "INDEX", 15)
+        );
+        assert_eq!(
+            parse_err("CREATE VIEW v"),
+            unexpected("VIEW", "TABLE, INDEX or UNIQUE INDEX", 8)
+        );
+        assert_eq!(parse_err("CREATE INDEX i t (a)"), unexpected("t", "ON", 16));
     }
 
     /// The expression as the parser read it, every compound part in parentheses.
@@ -1227,6 +1663,46 @@ mod tests {
         );
     }
 
+    /// `SELECT` followed by `operators` binary operators: `1 + 1 + … + 1`.
+    fn chain(operator: &str, operators: usize) -> String {
+        format!("SELECT {}1", format!("1 {operator} ").repeat(operators))
+    }
+
+    /// `SELECT 1 FROM t` followed by `joins` more tables, each after `separator`.
+    fn joins(separator: &str, joins: usize) -> String {
+        format!("SELECT 1 FROM t{}", format!("{separator}t").repeat(joins))
+    }
+
+    #[test]
+    fn chains_up_to_the_limit_should_parse_and_beyond_it_should_fail() {
+        for operator in ["+", "*", "||", "AND", "OR"] {
+            assert!(
+                parse(&chain(operator, MAX_NESTING - 1)).is_ok(),
+                "{operator}"
+            );
+
+            let err = parse_err(&chain(operator, MAX_NESTING));
+
+            assert!(
+                matches!(err, SqlError::TooDeep { .. }),
+                "{operator}: {err:?}"
+            );
+            assert_eq!(err.sqlstate(), "54001");
+        }
+        // An expression is a level before its first operand; FROM is not, so a chain of joins
+        // fits one more.
+        for separator in [", ", " CROSS JOIN "] {
+            assert!(parse(&joins(separator, MAX_NESTING)).is_ok(), "{separator}");
+
+            let err = parse_err(&joins(separator, MAX_NESTING + 1));
+
+            assert!(
+                matches!(err, SqlError::TooDeep { .. }),
+                "{separator}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn very_deep_nesting_should_fail_without_exhausting_a_small_stack() {
         let statements = [
@@ -1234,6 +1710,10 @@ mod tests {
             nested("- ", "", 10_000),
             nested("NOT ", "", 10_000),
             nested_tables(10_000),
+            chain("+", 100_000),
+            chain("OR", 100_000),
+            joins(", ", 100_000),
+            joins(" CROSS JOIN ", 100_000),
         ];
 
         for sql in statements {
@@ -1761,6 +2241,67 @@ mod tests {
                 offset: self.chance(3).then(|| self.expr(1)),
             }
         }
+
+        fn data_type(&mut self) -> DataType {
+            self.pick(&[
+                DataType::SmallInt,
+                DataType::BigInt,
+                DataType::Real,
+                DataType::Boolean,
+                DataType::Date,
+                DataType::Varchar(NonZeroU16::new(12).unwrap()),
+            ])
+        }
+
+        fn statement(&mut self) -> Statement {
+            let table = self.name();
+            match self.below(6) {
+                0 => Statement::Select(Box::new(self.select())),
+                1 => Statement::CreateTable {
+                    name: table,
+                    columns: (0..1 + self.below(3))
+                        .map(|_| ColumnDef {
+                            name: self.name(),
+                            data_type: self.data_type(),
+                            is_not_null: self.chance(2),
+                        })
+                        .collect(),
+                },
+                2 => Statement::CreateIndex {
+                    name: self.name(),
+                    table,
+                    column: self.name(),
+                    is_unique: self.chance(2),
+                },
+                3 => {
+                    let width = 1 + self.below(3);
+                    Statement::Insert {
+                        table,
+                        columns: match self.chance(2) {
+                            true => (0..width).map(|_| self.name()).collect(),
+                            false => Vec::new(),
+                        },
+                        rows: (0..1 + self.below(3))
+                            .map(|_| (0..width).map(|_| self.expr(2)).collect())
+                            .collect(),
+                    }
+                }
+                4 => Statement::Update {
+                    table,
+                    assignments: (0..1 + self.below(3))
+                        .map(|_| Assignment {
+                            column: self.name(),
+                            value: self.expr(2),
+                        })
+                        .collect(),
+                    selection: self.chance(2).then(|| self.expr(2)),
+                },
+                _ => Statement::Delete {
+                    table,
+                    selection: self.chance(2).then(|| self.expr(2)),
+                },
+            }
+        }
     }
 
     const BINARY_OPS: [BinaryOp; 14] = [
@@ -1847,11 +2388,11 @@ mod tests {
     }
 
     #[test]
-    fn random_selects_should_print_and_parse_back_to_themselves() {
+    fn random_statements_should_print_and_parse_back_to_themselves() {
         let mut rng = Rng(0xD6E8_FEB8_6659_FD93);
 
-        for _ in 0..1_000 {
-            let statement = Statement::Select(rng.select());
+        for _ in 0..2_000 {
+            let statement = rng.statement();
             let sql = statement.to_string();
 
             let parsed = parse(&sql).unwrap_or_else(|err| panic!("{err}\n{sql}"));
