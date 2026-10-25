@@ -50,7 +50,7 @@ pub enum TokenKind {
 }
 ```
 
-- **A word** is folded to lowercase and carries its `Keyword` when it is one of the 70 the parser will use (`SELECT`, `FROM`, `JOIN`, `INTEGER`, `NULLS`…). The keyword does not replace the text: whether a keyword may also name a table or a column (`first`, `key`, `index`) is the parser's call, in context, as PostgreSQL's grammar decides for its non-reserved keywords. The keywords live in one sorted table, searched by binary search and printed in uppercase by `Display`.
+- **A word** is folded to lowercase and carries its `Keyword` when it is one of the 71 the parser will use (`SELECT`, `FROM`, `JOIN`, `INTEGER`, `NULLS`…). The keyword does not replace the text: whether a keyword may also name a table or a column (`first`, `key`, `index`) is the parser's call, in context, as PostgreSQL's grammar decides for its non-reserved keywords. The keywords live in one sorted table, searched by binary search and printed in uppercase by `Display`.
 - **A quoted identifier** keeps its text and case, and is never a keyword: `"select"` is a name.
 - **A number** keeps its source text (`42`, `1.`, `.5`, `3.25`, `6.02e+23`); its type is decided later, by context. A sign is always an operator: `-1` is `Minus`, `Number("1")`.
 - **Spans** are byte offsets into the statement, increasing and on character boundaries; lexing the text of one span gives back that token.
@@ -126,14 +126,14 @@ CREATE [UNIQUE] INDEX name ON table ( column )
 INSERT INTO table [( column [, …] )] VALUES ( expr [, …] ) [, ( … ) …]
 UPDATE table SET column = expr [, …] [WHERE expr]
 DELETE FROM table [WHERE expr]
-EXPLAIN SELECT …
+EXPLAIN [LOGICAL] SELECT …
 ```
 
 - The types are those of a `CAST` (below).
 - `PRIMARY KEY` and `UNIQUE` after a column are refused with `Unsupported` (`0A000`): they belong to the Constraints section, still to come. An index on more than one column is refused the same way.
 - `CREATE INDEX` without `UNIQUE` parses; the planner refuses it, since every index of ferroDB is unique.
 - `INSERT … SELECT` is refused with `0A000`; a column list, when given, must name at least one column.
-- `EXPLAIN` takes a `SELECT`; before another statement (`EXPLAIN INSERT …`) it is refused with `0A000`. The planner gives the plan as text ([planner.md](planner.md#explain)).
+- `EXPLAIN` takes a `SELECT`, with `LOGICAL` before it for the logical plan instead of the physical one; before another statement (`EXPLAIN INSERT …`) it is refused with `0A000`. The planner gives the plan as text ([planner.md](planner.md#explain)).
 
 ### Expressions
 
@@ -161,7 +161,7 @@ Operands: a number, a string, `TRUE`, `FALSE`, `NULL`, `DATE '…'` and `TIMESTA
 The lexer marks keywords; the parser decides which ones may name a table, a column or an alias (`is_reserved`):
 
 - **reserved**, a name only when quoted: `all and as asc between by cast create cross default delete desc distinct drop false fetch from full group having in inner insert into is join left limit not null offset on or order outer right select set table true unique update values where`;
-- **non-reserved**, valid names: `bigint boolean char character date double explain first index int integer key last next nulls only precision primary real row rows smallint timestamp unknown varchar varying`, so columns named `date`, `key`, `first` or `rows` work, as in PostgreSQL.
+- **non-reserved**, valid names: `bigint boolean char character date double explain first index int integer key last logical next nulls only precision primary real row rows smallint timestamp unknown varchar varying`, so columns named `date`, `key`, `first` or `rows` work, as in PostgreSQL.
 
 After `AS`, a column alias may be any word, a keyword included (`SELECT 1 AS from`), as in PostgreSQL; a bare alias (`SELECT a b`) and a table alias must be non-reserved.
 
@@ -247,7 +247,7 @@ Literals keep their text where the planner gives them a type: a number may becom
 - `random_selects_should_print_and_parse_back_to_themselves`: 1,000 random `SELECT`s (every expression kind to depth 3, joins to depth 2, every clause, names that need quotes or are non-reserved keywords); printing and parsing back gives the same AST.
 - `random_token_soup_should_never_panic`: 20,000 random sequences of keywords, names, literals and symbols; the parser never panics and every error has one of the layer's SQLSTATEs.
 - Mutations checked by hand, each caught: `+` and `-` at the level of `*` and `/`, and reserved words printed without quotes (by the random tests); the nesting limit off by one (by the boundary test); a chain of joins not counted against the limit (by the chain boundary test).
-- `parser.rs`, other statements: `CREATE TABLE` with every column form and non-reserved keywords as names, `PRIMARY KEY` and `UNIQUE` (`0A000`), malformed tables (no columns, no type, unclosed, a reserved name, `NOT` without `NULL`); `CREATE UNIQUE INDEX` and `CREATE INDEX`, an index on two columns (`0A000`), `CREATE UNIQUE TABLE`, `CREATE VIEW`, a missing `ON`; `INSERT` with and without a column list and several rows, an empty column list or row, a missing `INTO`, an unclosed row, `INSERT … SELECT` (`0A000`); `UPDATE` with several assignments, with and without `WHERE`, a missing `SET` or `=`; `DELETE` with and without `WHERE`, a missing `FROM`; `EXPLAIN SELECT` and `explain` as a name, `EXPLAIN` before another statement (`0A000`), before a name or nothing. The random round trip prints and parses back 2,000 statements of all seven kinds.
+- `parser.rs`, other statements: `CREATE TABLE` with every column form and non-reserved keywords as names, `PRIMARY KEY` and `UNIQUE` (`0A000`), malformed tables (no columns, no type, unclosed, a reserved name, `NOT` without `NULL`); `CREATE UNIQUE INDEX` and `CREATE INDEX`, an index on two columns (`0A000`), `CREATE UNIQUE TABLE`, `CREATE VIEW`, a missing `ON`; `INSERT` with and without a column list and several rows, an empty column list or row, a missing `INTO`, an unclosed row, `INSERT … SELECT` (`0A000`); `UPDATE` with several assignments, with and without `WHERE`, a missing `SET` or `=`; `DELETE` with and without `WHERE`, a missing `FROM`; `EXPLAIN SELECT`, `EXPLAIN LOGICAL SELECT` and `explain` and `logical` as names, `EXPLAIN [LOGICAL]` before another statement (`0A000`), before a name or nothing. The random round trip prints and parses back 2,000 statements of all seven kinds.
 - Integration in [`tests/sql_parser.rs`](../tests/sql_parser.rs): a `SELECT` with a join, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY … NULLS LAST`, `LIMIT` and `OFFSET` checked clause by clause; the `OFFSET … FETCH NEXT` form; a script with comments; a complex query printed and parsed back; errors deep in a query with their positions and SQLSTATEs.
 
 ## Limitations

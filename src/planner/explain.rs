@@ -1,5 +1,6 @@
-//! The text of `EXPLAIN`: one node of the logical plan per line, each input indented two spaces
-//! under the node that reads it, the columns of the expressions by name instead of position.
+//! The text of `EXPLAIN`: one node of a plan (logical or physical) per line, each input
+//! indented two spaces under the node that reads it, the columns of the expressions by name
+//! instead of position.
 
 use std::fmt;
 
@@ -9,12 +10,35 @@ use crate::execution::{
 use crate::sql::ast::{Literal, Name};
 use crate::types::Value;
 
-use super::logical_plan::{ColumnName, LogicalPlan};
+use super::logical_plan::{ColumnName, LogicalPlan, OutputColumn, table_columns};
+use super::physical_plan::PhysicalPlan;
 
 impl fmt::Display for LogicalPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_node(f, self, 0)
+        write_tree(f, self, 0, &logical_line, &LogicalPlan::inputs)
     }
+}
+
+impl fmt::Display for PhysicalPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_tree(f, self, 0, &physical_line, &PhysicalPlan::inputs)
+    }
+}
+
+/// `node` on a line at `depth`, then its inputs one level deeper.
+fn write_tree<T>(
+    f: &mut fmt::Formatter<'_>,
+    node: &T,
+    depth: usize,
+    line: &dyn Fn(&T) -> String,
+    inputs: &dyn Fn(&T) -> Vec<&T>,
+) -> fmt::Result {
+    write!(f, "{:indent$}{}", "", line(node), indent = 2 * depth)?;
+    for input in inputs(node) {
+        writeln!(f)?;
+        write_tree(f, input, depth + 1, line, inputs)?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for ColumnName {
@@ -54,22 +78,16 @@ pub(super) fn aggregate_text(aggregate: &Aggregate, columns: &[ColumnName]) -> S
     format!("{function}({})", Shown::top(argument, columns))
 }
 
-fn write_node(f: &mut fmt::Formatter<'_>, plan: &LogicalPlan, depth: usize) -> fmt::Result {
-    write!(f, "{:indent$}", "", indent = 2 * depth)?;
+fn logical_line(plan: &LogicalPlan) -> String {
     let input_columns = || match plan.inputs().as_slice() {
         [input] => input.columns(),
         _ => Vec::new(),
     };
     match plan {
-        LogicalPlan::Scan { table, alias, .. } => {
-            write!(f, "Scan: {}", Name(table))?;
-            if let Some(alias) = alias {
-                write!(f, " AS {}", Name(alias))?;
-            }
-        }
-        LogicalPlan::OneRow => f.write_str("OneRow")?,
+        LogicalPlan::Scan { table, alias, .. } => format!("Scan: {}", table_text(table, alias)),
+        LogicalPlan::OneRow => "OneRow".to_string(),
         LogicalPlan::Filter { predicate, .. } => {
-            write!(f, "Filter: {}", Shown::top(predicate, &input_columns()))?;
+            format!("Filter: {}", expr_text(predicate, &input_columns()))
         }
         LogicalPlan::Join {
             left,
@@ -77,84 +95,230 @@ fn write_node(f: &mut fmt::Formatter<'_>, plan: &LogicalPlan, depth: usize) -> f
             join_type,
             on,
         } => {
-            let join_type = match (join_type, on) {
-                (JoinType::Inner, None) => "CROSS",
-                (JoinType::Inner, Some(_)) => "INNER",
-                (JoinType::Left, _) => "LEFT",
-                (JoinType::Right, _) => "RIGHT",
-                (JoinType::Full, _) => "FULL",
-            };
-            write!(f, "Join {join_type}")?;
-            if let Some(on) = on {
-                let mut columns = left.columns();
-                columns.extend(right.columns());
-                write!(f, ": {}", Shown::top(on, &columns))?;
-            }
+            let mut columns = left.columns();
+            columns.extend(right.columns());
+            let on: Vec<String> = on.iter().map(|on| expr_text(on, &columns)).collect();
+            with_parts(
+                format!("Join {}", join_type_text(*join_type, on.is_empty())),
+                on,
+            )
         }
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
             ..
-        } => {
-            let columns = input_columns();
-            let mut parts = Vec::new();
-            if !group_by.is_empty() {
-                let groups: Vec<String> = group_by
-                    .iter()
-                    .map(|expr| expr_text(expr, &columns))
-                    .collect();
-                parts.push(format!("group by {}", groups.join(", ")));
-            }
-            if !aggregates.is_empty() {
-                let aggregates: Vec<String> = aggregates
-                    .iter()
-                    .map(|aggregate| aggregate_text(aggregate, &columns))
-                    .collect();
-                parts.push(aggregates.join(", "));
-            }
-            match parts.is_empty() {
-                true => f.write_str("Aggregate: one group")?,
-                false => write!(f, "Aggregate: {}", parts.join("; "))?,
-            }
-        }
+        } => format!(
+            "Aggregate: {}",
+            aggregation_text(group_by, aggregates, &input_columns())
+        ),
         LogicalPlan::Sort { keys, .. } => {
-            let columns = input_columns();
-            let keys: Vec<String> = keys
-                .iter()
-                .map(|key| sort_key_text(key, &columns))
-                .collect();
-            write!(f, "Sort: {}", keys.join(", "))?;
+            format!("Sort: {}", sort_keys_text(keys, &input_columns()))
         }
         LogicalPlan::Limit { count, offset, .. } => {
-            f.write_str("Limit: ")?;
-            match count {
-                Some(count) => write!(f, "{}", Shown::top(count, &[]))?,
-                None => f.write_str("ALL")?,
-            }
-            if let Some(offset) = offset {
-                write!(f, " OFFSET {}", Shown::top(offset, &[]))?;
-            }
+            format!("Limit: {}", row_count_text(count.as_ref(), offset.as_ref()))
         }
         LogicalPlan::Project { columns, .. } => {
-            let input = input_columns();
-            let columns: Vec<String> = columns
-                .iter()
-                .map(|column| {
-                    format!(
-                        "{} AS {}",
-                        Shown::top(&column.expr, &input),
-                        Name(&column.name)
-                    )
-                })
-                .collect();
-            write!(f, "Project: {}", columns.join(", "))?;
+            format!("Project: {}", outputs_text(columns, &input_columns()))
         }
     }
-    for input in plan.inputs() {
-        writeln!(f)?;
-        write_node(f, input, depth + 1)?;
+}
+
+fn physical_line(plan: &PhysicalPlan) -> String {
+    let input_columns = || match plan.inputs().as_slice() {
+        [input] => input.columns(),
+        _ => Vec::new(),
+    };
+    match plan {
+        PhysicalPlan::SeqScan { table, alias, .. } => {
+            format!("SeqScan: {}", table_text(table, alias))
+        }
+        PhysicalPlan::IndexScan {
+            table,
+            alias,
+            index,
+            key,
+            ..
+        } => format!(
+            "IndexScan: {} (index {} = {})",
+            table_text(table, alias),
+            Name(index),
+            expr_text(key, &[])
+        ),
+        PhysicalPlan::OneRow => "OneRow".to_string(),
+        PhysicalPlan::Filter { predicate, .. } => {
+            format!("Filter: {}", expr_text(predicate, &input_columns()))
+        }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            keys,
+            join_type,
+            predicate,
+        } => {
+            let (left, right) = (left.columns(), right.columns());
+            let mut parts = Vec::new();
+            if !keys.is_empty() {
+                let keys: Vec<String> = keys
+                    .iter()
+                    .map(|(left_key, right_key)| {
+                        format!(
+                            "{} = {}",
+                            expr_text(left_key, &left),
+                            expr_text(right_key, &right)
+                        )
+                    })
+                    .collect();
+                parts.push(keys.join(", "));
+            }
+            if let Some(predicate) = predicate {
+                let joined = [left, right].concat();
+                parts.push(format!("filter: {}", expr_text(predicate, &joined)));
+            }
+            let is_cross = parts.is_empty();
+            with_parts(
+                format!("HashJoin {}", join_type_text(*join_type, is_cross)),
+                parts,
+            )
+        }
+        PhysicalPlan::IndexNestedLoopJoin {
+            outer,
+            outer_key,
+            index,
+            index_column,
+            table,
+            alias,
+            columns,
+            join_type,
+            predicate,
+        } => {
+            let outer = outer.columns();
+            let inner = table_columns(table, alias.as_deref(), columns);
+            let inner_key = match inner.get(*index_column) {
+                Some(column) => column.to_string(),
+                None => format!("#{index_column}"),
+            };
+            let mut parts = vec![format!(
+                "{inner_key} = {} (index {} ON {})",
+                expr_text(outer_key, &outer),
+                Name(index),
+                table_text(table, alias)
+            )];
+            if let Some(predicate) = predicate {
+                let joined = [outer, inner].concat();
+                parts.push(format!("filter: {}", expr_text(predicate, &joined)));
+            }
+            with_parts(
+                format!("IndexNestedLoopJoin {}", join_type_text(*join_type, false)),
+                parts,
+            )
+        }
+        PhysicalPlan::Aggregation {
+            group_by,
+            aggregates,
+            ..
+        } => format!(
+            "Aggregation: {}",
+            aggregation_text(group_by, aggregates, &input_columns())
+        ),
+        PhysicalPlan::Sort { keys, .. } => {
+            format!("Sort: {}", sort_keys_text(keys, &input_columns()))
+        }
+        PhysicalPlan::TopN {
+            keys,
+            count,
+            offset,
+            ..
+        } => format!(
+            "TopN: {}; {}",
+            sort_keys_text(keys, &input_columns()),
+            row_count_text(Some(count), offset.as_ref())
+        ),
+        PhysicalPlan::Limit { count, offset, .. } => {
+            format!("Limit: {}", row_count_text(count.as_ref(), offset.as_ref()))
+        }
+        PhysicalPlan::Projection { columns, .. } => {
+            format!("Projection: {}", outputs_text(columns, &input_columns()))
+        }
     }
-    Ok(())
+}
+
+/// `head`, then `: ` and the parts separated by `; `, if there are any.
+fn with_parts(head: String, parts: Vec<String>) -> String {
+    match parts.is_empty() {
+        true => head,
+        false => format!("{head}: {}", parts.join("; ")),
+    }
+}
+
+fn table_text(table: &str, alias: &Option<String>) -> String {
+    match alias {
+        Some(alias) => format!("{} AS {}", Name(table), Name(alias)),
+        None => Name(table).to_string(),
+    }
+}
+
+/// An inner join with nothing to match on is a cross product.
+fn join_type_text(join_type: JoinType, has_no_condition: bool) -> &'static str {
+    match join_type {
+        JoinType::Inner if has_no_condition => "CROSS",
+        JoinType::Inner => "INNER",
+        JoinType::Left => "LEFT",
+        JoinType::Right => "RIGHT",
+        JoinType::Full => "FULL",
+    }
+}
+
+fn aggregation_text(group_by: &[Expr], aggregates: &[Aggregate], columns: &[ColumnName]) -> String {
+    let mut parts = Vec::new();
+    if !group_by.is_empty() {
+        let groups: Vec<String> = group_by
+            .iter()
+            .map(|expr| expr_text(expr, columns))
+            .collect();
+        parts.push(format!("group by {}", groups.join(", ")));
+    }
+    if !aggregates.is_empty() {
+        let aggregates: Vec<String> = aggregates
+            .iter()
+            .map(|aggregate| aggregate_text(aggregate, columns))
+            .collect();
+        parts.push(aggregates.join(", "));
+    }
+    match parts.is_empty() {
+        true => "one group".to_string(),
+        false => parts.join("; "),
+    }
+}
+
+fn sort_keys_text(keys: &[SortKey], columns: &[ColumnName]) -> String {
+    let keys: Vec<String> = keys.iter().map(|key| sort_key_text(key, columns)).collect();
+    keys.join(", ")
+}
+
+/// The counts of a `LIMIT`: `5`, `5 OFFSET 2`, or `ALL OFFSET 2` without a count.
+fn row_count_text(count: Option<&Expr>, offset: Option<&Expr>) -> String {
+    let count = match count {
+        Some(count) => expr_text(count, &[]),
+        None => "ALL".to_string(),
+    };
+    match offset {
+        Some(offset) => format!("{count} OFFSET {}", expr_text(offset, &[])),
+        None => count,
+    }
+}
+
+fn outputs_text(columns: &[OutputColumn], input: &[ColumnName]) -> String {
+    let columns: Vec<String> = columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{} AS {}",
+                expr_text(&column.expr, input),
+                Name(&column.name)
+            )
+        })
+        .collect();
+    columns.join(", ")
 }
 
 fn sort_key_text(key: &SortKey, columns: &[ColumnName]) -> String {

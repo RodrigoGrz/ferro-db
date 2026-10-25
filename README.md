@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,325 tests). Tables and unique indexes are created, and rows inserted, updated and deleted, with SQL (`run_sql`); a `SELECT` is validated and planned, and `EXPLAIN` shows its logical plan, but queries still run through executors built in Rust until the physical plan comes next. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,354 tests). Tables and unique indexes are created, rows inserted, updated and deleted, and queries run, all with SQL (`run_sql`): a `SELECT` is validated, planned and run by executors chosen by fixed rules, and `EXPLAIN` shows the plan. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -33,15 +33,15 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **B+Tree index** | A unique index from keys of any type (text included) to row ids, with range scans; nodes of variable-size entries split, merge and redistribute by bytes, and a failed operation changes nothing. |
 | **Executors** | Iterator-model executors over expressions with SQL semantics: sequential scan, index scan (points and ranges, in key order), values, filter (`WHERE` keeps TRUE only), projection, hash aggregation (`GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`; `HAVING` as a filter), sort (several keys, `NULLS FIRST`/`LAST`), limit and offset, top-N with a bounded heap, index nested loop join (`INNER` and `LEFT`), hash join (`INNER`, `LEFT`, `RIGHT`, `FULL`), insert, update and delete. Writes keep the indexes in step and validate a whole statement before writing (a refused statement leaves no trace). |
 | **SQL lexer and parser** | Text to an AST: `SELECT` (joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`), `CREATE TABLE`, `CREATE UNIQUE INDEX`, `INSERT`, `UPDATE`, `DELETE` and `EXPLAIN`; expressions by precedence climbing, syntax errors at a character position, a nesting limit that keeps any statement from exhausting the stack. |
-| **Planner** | `run_sql` binds names to column positions and literals to types, runs DDL against the catalog and DML through the executors; a `SELECT` becomes a validated logical plan (the scope of its `FROM`, the grouping rules, `ORDER BY` by position, name or expression) that `EXPLAIN` shows. |
+| **Planner** | `run_sql` binds names to column positions and literals to types, runs DDL against the catalog and DML through the executors; a `SELECT` becomes a validated logical plan (the scope of its `FROM`, the grouping rules, `ORDER BY` by position, name or expression), then executors chosen by fixed rules (hash joins on the equalities of the `ON`, index joins and index scans where an index serves, `TopN` for `ORDER BY … LIMIT`) that run it; `EXPLAIN` shows the physical plan, `EXPLAIN LOGICAL` the logical one. |
 
 **Partially there:**
 
-- `INSERT`, `UPDATE` and `DELETE` run from SQL; a `SELECT` is validated and planned (`EXPLAIN` shows its logical plan) but does not run: queries run through executors built in Rust until the physical plan exists.
-- `CREATE UNIQUE INDEX` creates an index and the executors keep it in step, but nothing chooses an index scan for a query yet.
+- Plans are chosen by fixed rules, without statistics or costs: an index serves only an equality with a literal on one table and the right table of an index join, filters stay above joins, and joins run in the order written.
+- A query's rows are collected in memory and returned all at once; there is no client to stream them to yet.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
-**Planned (not implemented):** the physical plan that runs a `SELECT`, query optimization, more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
+**Planned (not implemented):** query optimization (statistics, costs, join order), more joins (sort-merge join, the plain nested loop for any condition), more data types (`NUMERIC`), constraints, transactions and concurrency control, WAL and crash recovery, a client/server interface. The [roadmap](ROADMAP.md) has the complete list in order.
 
 ## Architecture
 
@@ -135,7 +135,7 @@ Page 0 holds the database header and pages 1–2 the catalog heaps, so the table
 ## Testing
 
 ```sh
-cargo test --all-targets   # 1,222 unit tests + 103 integration tests
+cargo test --all-targets   # 1,248 unit tests + 106 integration tests
 ```
 
 The suite is the main way the implementation is verified:
@@ -157,7 +157,7 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - [docs/indexes.md](docs/indexes.md): the B+Tree, key encoding, node format, splits and merges
 - [docs/execution.md](docs/execution.md): expressions, executors, two-phase writes and index maintenance
 - [docs/sql.md](docs/sql.md): the SQL layer: the lexer (tokens, keywords, identifiers, literals, comments) and the parser and AST for `SELECT` (grammar, precedence, reserved words, errors)
-- [docs/planner.md](docs/planner.md): the planner layer: `run_sql`, the scope and the binder (names, literal types, `BETWEEN`/`IN`, grouping), how each statement runs, the logical plan of a `SELECT` and `EXPLAIN`, errors
+- [docs/planner.md](docs/planner.md): the planner layer: `run_sql`, the scope and the binder (names, literal types, `BETWEEN`/`IN`, grouping), how each statement runs, the logical and physical plans of a `SELECT` and `EXPLAIN`, errors
 - [docs/decisions/](docs/decisions/README.md): architectural decision records
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and conventions
 

@@ -1,6 +1,6 @@
 # Planner
 
-This document describes ferroDB's planner layer (`src/planner/`): how a parsed statement becomes work. It runs DDL against the catalog and DML through the executors, after the **binder** has turned names into column positions and literals into typed values. A `SELECT` becomes a validated **logical plan**, which `EXPLAIN` shows; running it waits for the physical plan, which will choose the executors. The parser is in [sql.md](sql.md); the executors in [execution.md](execution.md).
+This document describes ferroDB's planner layer (`src/planner/`): how a parsed statement becomes work. It runs DDL against the catalog and DML through the executors, after the **binder** has turned names into column positions and literals into typed values. A `SELECT` becomes a validated **logical plan**, then a **physical plan** of executors chosen by fixed rules, and runs; `EXPLAIN` shows the physical plan, `EXPLAIN LOGICAL` the logical one. The parser is in [sql.md](sql.md); the executors in [execution.md](execution.md).
 
 Dependencies point downward: `planner` → `sql`, `execution`, `catalog`, `table`, `types`.
 
@@ -11,7 +11,8 @@ Dependencies point downward: `planner` → `sql`, `execution`, `catalog`, `table
 | `binder.rs` | AST expressions as executor expressions; the grouped mode above the groups of a query |
 | `select.rs` | `plan_select`: a `SELECT` as a `LogicalPlan`, clause by clause |
 | `logical_plan.rs` | `LogicalPlan`, `OutputColumn`, `ColumnName` |
-| `explain.rs` | the text of `EXPLAIN` |
+| `physical_plan.rs` | `plan_physical`: the executors of a logical plan, chosen by fixed rules, as a `PhysicalPlan` that becomes `Box<dyn Executor>` |
+| `explain.rs` | the text of `EXPLAIN`, for both plans |
 | `error.rs` | `PlannerError` |
 
 - [Running SQL](#running-sql)
@@ -20,6 +21,7 @@ Dependencies point downward: `planner` → `sql`, `execution`, `catalog`, `table
 - [Statements](#statements)
 - [Logical plan](#logical-plan)
 - [Planning a SELECT](#planning-a-select)
+- [Physical plan](#physical-plan)
 - [EXPLAIN](#explain)
 - [Errors](#errors)
 - [Design decisions](#design-decisions)
@@ -33,7 +35,10 @@ Dependencies point downward: `planner` → `sql`, `execution`, `catalog`, `table
 ```rust
 pub fn run_sql(sql: &str, ctx: &mut ExecutionContext<'_>) -> Result<Vec<StatementOutcome>, PlannerError>;
 
-pub enum StatementOutcome { CreateTable, CreateIndex, Insert(u64), Update(u64), Delete(u64), Explain(String) }
+pub enum StatementOutcome {
+    CreateTable, CreateIndex, Insert(u64), Update(u64), Delete(u64), Explain(String),
+    Rows { columns: Vec<String>, rows: Vec<Vec<Value>> },
+}
 
 let outcomes = run_sql(
     "CREATE TABLE accounts (id INTEGER NOT NULL, owner VARCHAR(40), balance BIGINT);
@@ -41,15 +46,17 @@ let outcomes = run_sql(
      INSERT INTO accounts VALUES (1, 'ana', 100), (2, NULL, 0);
      UPDATE accounts SET balance = balance + 1 WHERE id BETWEEN 1 AND 2;
      DELETE FROM accounts WHERE owner IS NULL;
+     SELECT owner, balance FROM accounts WHERE id = 1;
      EXPLAIN SELECT owner FROM accounts WHERE balance > 10",
     &mut ExecutionContext { catalog: &mut catalog, bpm: &mut bpm },
 )?;
-// [CreateTable, CreateIndex, Insert(2), Update(2), Delete(1), Explain("Project: …")]
+// [CreateTable, CreateIndex, Insert(2), Update(2), Delete(1),
+//  Rows { columns: ["owner", "balance"], rows: [["ana", 101]] }, Explain("Projection: …")]
 ```
 
 - **The whole text is parsed first:** a syntax error in any statement runs none of them.
 - **Then each statement runs in order**, and the first failure stops the rest. There are no transactions: the statements before the failure stay done. Each statement on its own is atomic: the write executors validate the whole statement before writing, and the catalog checks everything before creating.
-- **`StatementOutcome`** is what each statement did, like PostgreSQL's command tags (`INSERT 0 2`); `Explain` carries the text of the plan.
+- **`StatementOutcome`** is what each statement did, like PostgreSQL's command tags (`INSERT 0 2`); `Explain` carries the text of the plan, `Rows` the result of a `SELECT`.
 
 ## Scope
 
@@ -108,8 +115,8 @@ Above the groups of a grouped query, `bind_grouped(expr, scope, &mut grouping)` 
 | `INSERT INTO table [(columns)] VALUES (…), …` | `Insert(Values)`: each row in table order, the columns outside the list `NULL` (the default of a column without `DEFAULT`); a repeated column is `42701`, a row of another length `42601`; the values are assigned to the column types by the table (`42804`, `22001`, `22003`, `23502`) and the unique indexes checked (`23505`) |
 | `UPDATE table SET column = expr, … [WHERE expr]` | `Update(Filter(SeqScan))`; each assignment reads the row as it was before the statement; a column set twice is `42601` |
 | `DELETE FROM table [WHERE expr]` | `Delete(Filter(SeqScan))` |
-| `EXPLAIN SELECT …` | `plan_select`, then the text of the plan |
-| `SELECT` | `Unsupported` (`0A000`) until the physical plan |
+| `SELECT …` | `plan_select`, `plan_physical`, then the executors, pulled to the end: `Rows` with the output names and the values of each row |
+| `EXPLAIN [LOGICAL] SELECT …` | the text of the physical plan, or with `LOGICAL` of the logical one |
 
 The plans of DML are fixed: choosing an `IndexScan` for a `WHERE` is optimization, still to come.
 
@@ -164,14 +171,51 @@ Scan / Join → Filter (WHERE) → Aggregate → Filter (HAVING) → Sort → Li
    - without `NULLS FIRST` or `LAST`, a `NULL` sorts as the greatest value: last ascending, first descending.
 7. **`LIMIT`, `OFFSET`:** bound over no columns: a column is `ColumnInRowCount` (`42P10`), an aggregate `42803`. Their values are checked when they run (`2201W`, `2201X`).
 
-The `Sort` reads the rows before the `Project` so that `ORDER BY` reaches columns outside the list without hidden columns; an output column named by position or name is sorted by its expression, evaluated again. The `Limit` sits right above the `Sort`, where the physical plan can turn the pair into a `TopN`.
+The `Sort` reads the rows before the `Project` so that `ORDER BY` reaches columns outside the list without hidden columns; an output column named by position or name is sorted by its expression, evaluated again. The `Limit` sits right above the `Sort`, where the physical plan turns the pair into a `TopN`.
+
+## Physical plan
+
+`plan_physical(plan, catalog)` (`physical_plan.rs`) turns the logical plan into a `PhysicalPlan`: the executors that will run it, as a tree that can be printed and compared, which `into_executor()` then builds into `Box<dyn Executor>`. There are no statistics yet, so the executors are chosen by **fixed rules**, each the better choice in almost every case (a hash table instead of trying every pair, an index descent instead of a scan for an equality, a bounded heap instead of a full sort):
+
+| Logical | Physical |
+|---|---|
+| `Scan` | `SeqScan` |
+| `Filter` over a `Scan` with a conjunct `column = literal` | `Filter` (the whole predicate) over an `IndexScan` point, if the table has an index on the column and the literal converts to the key's type; else `Filter` over `SeqScan` |
+| `Join` | `IndexNestedLoopJoin` or `HashJoin` (below) |
+| `Limit` with a count over a `Sort` | `TopN` |
+| `OneRow`, `Filter`, `Aggregate`, `Sort`, `Limit`, `Project` | `OneRow` (a `Values` of one empty row), `Filter`, `Aggregation`, `Sort`, `Limit`, `Projection` |
+
+**Joins.** The `ON` is split into its conjuncts. A conjunct `l = r` where one side reads only columns of the left input and the other only of the right is a **key**; the right expression is rebased onto the right row (the left's width taken off its columns), because the `HashJoin` evaluates it there. The other conjuncts, joined by `AND` again, are the **filter** over the joined row.
+
+- **`IndexNestedLoopJoin`** when the join is `INNER` or `LEFT`, the right input is a table with an index, and a key has that index's column on the right and, on the left, a column whose type converts to the key's; the other keys go back into the filter as equalities.
+- **`HashJoin`** otherwise, on the keys and the filter; without keys every pair is tried with the whole `ON` as the filter, and `CROSS JOIN` has neither.
+
+**Why a type check before using an index.** An index scan or an index nested loop join converts its key as a bound of the index's type (store assignment): a float for an integer key, or a `TIMESTAMP` for a `DATE` key, is `42804` there, while `=` in a `Filter` or a `HashJoin` compares them (or fails with `42883` across families). `converts_to_key` (in `execution/key_bounds.rs`, next to the conversion it describes, and tested against it for a value of every type and every key type) tells which value types convert without an error, and the rules use an index only then. So **the choice of plan never changes the rows of a query whose expressions do not fail**, nor the error of a conversion or a comparison, which the random test checks against the plan with every rule off.
+
+**What the plan does change: which rows an expression is evaluated on.** An expression that fails on some rows (`10 / (id - 1)` where `id` is `1`) can fail in one plan and not in the other, either way, as the standard allows by leaving the order of evaluation to the implementation:
+
+- **an index can avoid the error:** `WHERE id = 2 AND 10 / (id - 1) > 0` reads only the row of `id` `2` through the index, while a `SeqScan` evaluates the filter on the row of `id` `1` too (`22012`);
+- **hash keys can bring one:** the `HashJoin` builds the right input, computing its keys for every right row, even when the left input turns out to be empty, so `FROM empty e JOIN orders o ON e.x = 10 / (o.total - 5)` fails where trying every pair (none) would give no rows; and a filter evaluated on every pair can fail on a pair the keys never compare (`ON a = b AND 1 / c > 0`).
+
+**Running a SELECT.** `run_sql` plans it (`plan_select`, `plan_physical`), builds the executors and pulls the root to the end; the outcome is `Rows { columns, rows }`, the output names and each row's values (without `Rid`). An error while running is the executor's (`PlannerError::Execution`, with its SQLSTATE). Without `ORDER BY`, the order is whatever the plan gives (an `IndexScan` in key order, a `SeqScan` in heap order), as the standard leaves it to the implementation.
 
 ## EXPLAIN
 
-`EXPLAIN SELECT …` gives the logical plan as text (`explain.rs`, the `Display` of `LogicalPlan`): one node per line, each input indented two spaces under the node that reads it, the columns by name instead of position.
+`EXPLAIN SELECT …` gives the physical plan as text, `EXPLAIN LOGICAL SELECT …` the logical one (`explain.rs`, the `Display` of both): one node per line, each input indented two spaces under the node that reads it, the columns by name instead of position.
 
 ```
-EXPLAIN SELECT c.city, count(*) AS orders, sum(o.total)
+EXPLAIN SELECT c.name, o.total FROM orders o JOIN customers c ON c.id = o.customer_id
+        WHERE o.total > 10 ORDER BY o.total DESC LIMIT 3
+
+Projection: c.name AS name, o.total AS total
+  TopN: o.total DESC NULLS FIRST; 3
+    Filter: o.total > 10
+      IndexNestedLoopJoin INNER: c.id = o.customer_id (index customers_id ON customers AS c)
+        SeqScan: orders AS o
+```
+
+```
+EXPLAIN LOGICAL SELECT c.city, count(*) AS orders, sum(o.total)
         FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
         WHERE o.placed >= DATE '2024-01-01'
         GROUP BY c.city HAVING sum(o.total) > 100
@@ -193,6 +237,7 @@ Project: c.city AS city, count(*) AS orders, sum(o.total) AS sum
 - Names that need quotes have them (`"Users"."select"`); the columns above an aggregate are shown as their text (`count(*)`).
 - `BETWEEN` and `IN` show rewritten (`(t.a >= 1) AND (t.a <= 2)`), which is what the binder made of them.
 - `Join CROSS`, `Join INNER: …`, `Join LEFT: …`; `Limit: ALL OFFSET 3` without a count; `Aggregate: one group` for a `HAVING` without groups or aggregates.
+- Physical: `HashJoin INNER: keys; filter: …`, `HashJoin LEFT: filter: …` without keys, `HashJoin CROSS`; `IndexScan: t (index t_id = 5)`; `TopN: keys; 3 OFFSET 1`; the inner table of an `IndexNestedLoopJoin` is named in its line, not as an input, since it is read through the index.
 
 ## Errors
 
@@ -223,13 +268,22 @@ Project: c.city AS city, count(*) AS orders, sum(o.total) AS sum
 - **A binder apart from the statements**, instead of translating inside each one: DML and `SELECT` share it.
 - **One binder with modes** (plain, aggregate argument, grouped), instead of a second binder or a rewrite after binding: the rules for literals, `BETWEEN` and `IN` live in one place.
 - **Groups compared bound** (`PartialEq` of `Expr`), not as text: `a`, `t.a` and `A` are the same group.
-- **The executors' expressions in the logical plan**, instead of a tree of its own: no second `Expr`, and the physical plan will be close to a one-to-one translation. The cost is that the logical plan depends on `execution`, which keeps the layers pointing downward.
+- **The executors' expressions in the logical plan**, instead of a tree of its own: no second `Expr`, and the physical plan is close to a one-to-one translation. The cost is that the logical plan depends on `execution`, which keeps the layers pointing downward.
 - **`Sort` before `Project`**, instead of hidden columns in the projection: `ORDER BY` by alias or position uses the item's expression again, safe without volatile functions.
 - **`Limit` above `Sort` and below `Project`:** both orders give the same rows, and this one keeps `Sort` and `Limit` together for a `TopN`.
 - **`CROSS JOIN` as `Inner` without `ON`**, reusing `JoinType`: the way the `HashJoin` already runs a join without keys.
 - **Repeated aggregates computed once.**
 - **`ORDER BY` by position, output name or expression; `GROUP BY` only by expressions over the input** (decided with the author): positions are common in practice; in `GROUP BY` an output name would compete with an input column of the same name.
 - **`EXPLAIN` with names instead of positions** (decided with the author): readable for someone studying the plan; the positions are in its `Debug`.
+- **A physical tree of its own** instead of building `Box<dyn Executor>` straight away: it can be printed and compared, and the translation to executors lives in one place (`into_executor`).
+- **Fixed rules instead of a cost model**: there are no statistics yet; costs are the Query Optimization section.
+- **`IndexNestedLoopJoin` only with a table on the right, `INNER` or `LEFT`**: that is what the executor does; swapping sides would reorder the columns and need one more projection.
+- **An index only when the key converts without an error** (`converts_to_key`), instead of the same type family as first planned: the conversion of a bound is stricter than `=`, and the plan must not change the error of a conversion. The cost is not using the index for a float against an integer key, a rare and slow case anyway.
+- **The whole `Filter` kept above an `IndexScan`**, instead of removing the conjunct the index served: simpler and certainly the same rows, for one equality evaluated again per row found.
+- **`EXPLAIN` physical by default, `EXPLAIN LOGICAL` for the logical plan** (decided with the author): the default shows what runs.
+- **An index only for an equality with a literal** (decided with the author); ranges and computed constants wait for optimization.
+- **`Rules` for the tests**, instead of an oracle written apart: the plan with every rule off uses the same executors, already tested, in the plainest way (`SeqScan`, `HashJoin` without keys, `Limit(Sort)`), so comparing both tests the rules and not the executors.
+- **`Rows` collects every row**: the result goes to a client that does not exist yet; streaming waits for the CLI and the protocol.
 - **No types in the plan:** inferring them is the Type System item; an expression of the wrong type fails when it runs.
 - **`BETWEEN` and `IN` rewritten by the binder**, instead of new executor nodes: they are the standard's definitions, and evaluating `x` twice has no side effect (there are no volatile functions).
 - **Literal types chosen by the binder**, not the parser: the parser keeps the text, and the sign joins the number where its type is decided.
@@ -247,22 +301,27 @@ Project: c.city AS city, count(*) AS orders, sum(o.total) AS sum
 - `scope.rs`: a column qualified or not, unknown names, the alias hiding the table's name, a join shifting the right table's columns, a column in two tables (`42702`), a name twice in one `FROM` (`42712`), `*` and `t.*`, an unknown `t.*`, `*` without tables.
 - `binder.rs`: columns as positions (qualified, any case), an unknown column, a column of another table and a column in `VALUES`; integers at the limits of `INTEGER` and `BIGINT` with and without a sign, past `BIGINT` (`22003`); decimals and exponents as `DOUBLE PRECISION`, `1e400` (`22003`); strings, booleans, `NULL`, dates and timestamps, invalid dates (`22007`, `22008`); operators, `NOT`, signs, `CAST`; `IS` tests with `NULL`; `BETWEEN` at, inside and outside its bounds, reversed and with `NULL`, `NOT BETWEEN`; `IN` with and without `NULL` in the list or the value, `NOT IN`, a list of 1,000 values as a tree 12 nodes deep, the first failing value's error; aggregates (`42803`, naming the clause) and unknown functions (`42883`).
 - `logical_plan.rs`: the columns of a scan (by alias or table), a join, a filter, an aggregate (groups by name or text, aggregates by call), a projection and a limit.
+- `physical_plan.rs`: hand-built plans running as their executors (scans by table and by index, one row, a hash join with keys and filter, a cross product, an index join with its `NULL`-padded outer row, filter, aggregation, `TopN` equal to `Limit(Sort)`, projection) and their columns and text; `SELECT`s through `plan_physical` (filter, without `FROM`, grouping with `ORDER BY`, `ORDER BY … LIMIT`, `count(*)` of nothing, every join type); equalities between the two sides as keys either way round, with a filter, several; conjuncts that stay a filter (a constant, both sides on one side of `=`, `OR`, `<`, `TRUE`); keys in `LEFT`, `RIGHT` and `FULL` joins; the index join chosen for `INNER` and `LEFT` with the other keys and conjuncts in its filter and a `BIGINT` key, and not for `RIGHT`, `FULL`, an index on the left, a text or `DOUBLE PRECISION` key, a computed key or a join on the right; a key of another family failing `42883` with the rules and without; `TopN` for `ORDER BY … LIMIT`, `Limit(Sort)` for `OFFSET` alone, `Limit` without `ORDER BY`; the index scan for `id = 2`, `2 = id`, inside an `AND`, with an alias and with a `BIGINT` past the key, and not for `NULL`, text, `1.0`, `OR`, a computed column, a column without an index, `>` or a filter above a join; every rule off giving the plain plan; a predicate failing on a row the index skips (rows with the rules, `22012` without) and on keys computed over a join with an empty left input (`22012` with the rules, no rows without); empty tables on either side of `LEFT`, `RIGHT` and index joins, aggregates over nothing, `LIMIT 0` and an `OFFSET` past the rows, the same with the rules and without; text and `TIMESTAMP` indexes serving a text literal (also longer than the column) and a `DATE`.
+- `random_queries_should_give_the_rows_of_the_plain_plan`: five tables (unique indexes on two integer columns and a text one, `NULL`s and repeated values, a `DOUBLE PRECISION` and a `BIGINT` column, one table always empty) and 1,000 random `SELECT`s (joins of every type with equalities, extra conditions or none, rarely two kinds that fail; `WHERE` with indexed equalities; grouping; `ORDER BY` on every output column, with `LIMIT` and `OFFSET`); with the rules and without, the rows must be the same (the same sequence when ordered) or the SQLSTATE the same, and each rule, and the text index, must have been chosen at least 10 times.
+- `key_bounds.rs` (execution): `converts_to_key` agreeing with the conversion of a bound for a value of every type against every key type.
 - `explain.rs`: a plan with every node indented under its reader; `OneRow` and names that need quotes; literals of every type; compound expressions in parentheses, negative numbers inside others, a position past the row (`#7`); every aggregate; every join type; limits with and without a count; aggregates with groups, aggregates or neither; sort keys.
 - `select.rs`: projections and output names; wildcards in the order of the tables; every join kind left to right, parenthesized joins; `WHERE` over a join; `SELECT` without `FROM`; unknown, ambiguous and duplicate names, `t.*` and `*` errors; an `ON` that reads a later table or one before a comma (`42P01`); aggregates in `WHERE` and `ON`; `GROUP BY` with `HAVING`; aggregates and `HAVING` without `GROUP BY`; group expressions inside others and qualified differently; repeated aggregates; every way a column falls outside the groups (list, `HAVING`, `*`, `t.*`, an expression); nested aggregates, aggregates in `GROUP BY`, wrong arguments; `ORDER BY` by position, alias and expression with explicit and default `NULLS`; the output name winning; ambiguous and out-of-range `ORDER BY`, an alias inside an expression; `ORDER BY` in grouped queries (an aggregate, one group, a column outside the groups); `LIMIT` and `OFFSET` above the sort, `OFFSET` alone; counts with a column or an aggregate; two output columns of the same expression under one name (repeated, qualified differently, through `*`) accepted by `ORDER BY`, two different ones through `*` ambiguous; positions with leading zeros, past `usize` and `0`; `GROUP BY 1` refused, `GROUP BY 1 + 0` and `1.5` as expressions; `HAVING` not seeing output names (`42703`); a group expression matching only with the same literal types (`id + 1.0` against `GROUP BY id + 1` is `42803`); the `EXPLAIN` of 190 nested signs, a 190-operator group expression and 199 joins on a 2 MB stack.
 - `random_selects_should_plan_with_every_column_in_range`: 2,000 random `SELECT`s over three tables (aliases, every join kind, aggregates, `GROUP BY`, `HAVING`, `ORDER BY` by position, alias and expression, `LIMIT`, sometimes a wrong name); a plan that comes out must have every column of every node inside the row it reads, and each item written as a column must read the input column of that name and table; an error must have one of the planner's SQLSTATEs; more than 400 of them plan.
-- `run.rs`: `CREATE TABLE` (the schema in the catalog), an existing table and a repeated column with nothing created; `CREATE UNIQUE INDEX` over rows already there, a column with repeated values (`23505`), unknown table and column, an existing name, `CREATE INDEX` (`0A000`); a syntax error running nothing; `SELECT` (`0A000`); `EXPLAIN` among other statements, and of an invalid query; `INSERT` with and without a column list; every failing `INSERT` (`23502`, `42804`, `22001`, `23505`, `42601` both ways, `42701`, `42703`, `42P01`, a column in `VALUES`, `42803`, `22012`) leaving the table and the index as they were; aggregates refused naming `VALUES`, `SET` and `WHERE`; `UPDATE` of some rows, all rows and the indexed key; every failing `UPDATE` (`42601`, `42703`, `23502`, `23505`, `42P01`, a non-boolean `WHERE`, an unknown table) changing nothing; `DELETE` with a `WHERE` and without; a `DELETE … IN` of 100,000 values on a 2 MB stack; every column type taking its literals (`BIGINT` at its maximum, `SMALLINT` at its minimum, an `INTEGER` literal widened to `SMALLINT`, `BIGINT` and `DOUBLE PRECISION`, `BOOLEAN`, `DATE`, `TIMESTAMP`) and refusing others (`22003`, `22001`, `42804` for a decimal in `BIGINT` and a string in `DATE`); a write executor without its count (`XX000`); several statements running in order and stopping at the first failure.
+- `run.rs`: `CREATE TABLE` (the schema in the catalog), an existing table and a repeated column with nothing created; `CREATE UNIQUE INDEX` over rows already there, a column with repeated values (`23505`), unknown table and column, an existing name, `CREATE INDEX` (`0A000`); a syntax error running nothing; `SELECT` giving its column names and rows (also aggregates over an empty table), a `SELECT` failing while it runs (`42883`, as `Execution`); `EXPLAIN` and `EXPLAIN LOGICAL` among other statements, and of an invalid query; `INSERT` with and without a column list; every failing `INSERT` (`23502`, `42804`, `22001`, `23505`, `42601` both ways, `42701`, `42703`, `42P01`, a column in `VALUES`, `42803`, `22012`) leaving the table and the index as they were; aggregates refused naming `VALUES`, `SET` and `WHERE`; `UPDATE` of some rows, all rows and the indexed key; every failing `UPDATE` (`42601`, `42703`, `23502`, `23505`, `42P01`, a non-boolean `WHERE`, an unknown table) changing nothing; `DELETE` with a `WHERE` and without; a `DELETE … IN` of 100,000 values on a 2 MB stack; every column type taking its literals (`BIGINT` at its maximum, `SMALLINT` at its minimum, an `INTEGER` literal widened to `SMALLINT`, `BIGINT` and `DOUBLE PRECISION`, `BOOLEAN`, `DATE`, `TIMESTAMP`) and refusing others (`22003`, `22001`, `42804` for a decimal in `BIGINT` and a string in `DATE`); a write executor without its count (`XX000`); several statements running in order and stopping at the first failure.
 - `random_statements_should_keep_the_table_like_a_model`: 400 random statements on `(id INTEGER NOT NULL, v INTEGER, s VARCHAR(10))` with a unique index on `id`: multi-row inserts (some with a repeated or `NULL` id), `UPDATE … SET v = v + k WHERE id BETWEEN a AND b`, `UPDATE … SET id = id + k` over a range, `DELETE … WHERE id IN (…)` or `v IS NULL`; a `BTreeMap` model predicts each outcome or SQLSTATE (`23502`, `23505`), and after every statement the table and the index must match it.
-- Mutations checked by hand, each caught: `BETWEEN` with `>` instead of `>=` (by the random test, which showed the unit test lacked the bounds themselves; they were added); `IN` as a chain of `OR`s again (by the depth test); the output name losing to an input column in `ORDER BY`; repeated aggregates not reused; the right side of a join not shifted (by the scope tests and, after it was strengthened to check the names columns read, by the random `SELECT` test, which at first only checked the positions were in range). An `ON` that sees a later table cannot be written as a mutation: the `ON` is bound inside the recursion over the `FROM`, before the later tables exist.
+- Mutations checked by hand, each caught: `BETWEEN` with `>` instead of `>=` (by the random test, which showed the unit test lacked the bounds themselves; they were added); `IN` as a chain of `OR`s again (by the depth test); the output name losing to an input column in `ORDER BY`; repeated aggregates not reused; in the physical plan, the right side of a key not rebased, an index join for `RIGHT`, an index scan without the type check and a `TopN` dropping its `OFFSET` (each by the random comparison with the plain plan); the right side of a join not shifted (by the scope tests and, after it was strengthened to check the names columns read, by the random `SELECT` test, which at first only checked the positions were in range). An `ON` that sees a later table cannot be written as a mutation: the `ON` is bound inside the recursion over the `FROM`, before the later tables exist.
 - Integration in [`tests/planner_statements.rs`](../tests/planner_statements.rs), with 8 KB pages and an 8-frame pool: SQL creates a table and a unique index, inserts 3,000 rows in 30 statements, updates half of them and deletes a range; after reopening, a `SeqScan` and the index give the expected rows; keys moved by `UPDATE … SET id = id + 10000` survive reopening in the index; a failure in the middle of a script keeps the statements before it.
-- Integration in [`tests/planner_select.rs`](../tests/planner_select.rs): the `EXPLAIN` of a report (a `LEFT JOIN`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` by position and column, `LIMIT`) gives the same plan after reopening the database; a script mixes DDL, DML and `EXPLAIN` in order; an invalid query (`42803`, `42702`) stops its script and the next statements still run.
+- Integration in [`tests/planner_physical.rs`](../tests/planner_physical.rs), with an 8-frame pool: SQL creates 300 customers with an index and 1,000 orders without one; a lookup by key, a grouped report over an index join, a top 5 and a `LEFT JOIN` count give the rows computed in the test, before and after reopening; `EXPLAIN` shows the `IndexScan`, the `IndexNestedLoopJoin`, the `TopN` and a `HashJoin` where the index is on the left; a script's `SELECT`s see the `DELETE` and the `UPDATE` before them.
+- Integration in [`tests/planner_select.rs`](../tests/planner_select.rs): the `EXPLAIN LOGICAL` of a report (a `LEFT JOIN`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` by position and column, `LIMIT`) gives the same plan after reopening the database; a script mixes DDL, DML and `EXPLAIN` in order; an invalid query (`42803`, `42702`) stops its script and the next statements still run.
 
 ## Limitations
 
-- **`SELECT` is planned but does not run** yet: the physical plan comes next. There is no `INSERT … SELECT`.
+- **`Rows` holds the whole result** in memory; there is no streaming to a client yet. There is no `INSERT … SELECT`.
+- **An expression that fails on some rows can fail in one plan and not another:** the plan decides which rows and pairs an expression is evaluated on, so an index can skip the row that fails, and hash keys computed for a whole input can fail where no pair would have been tried (see [Physical plan](#physical-plan)). When nothing fails, every plan gives the same rows.
 - **No `SELECT DISTINCT`, subqueries, set operations, `CASE`, `LIKE`, `JOIN … USING` or `NATURAL JOIN`** (the parser does not read them).
 - **No functional dependencies:** with a primary key, `SELECT * … GROUP BY pk` would be valid; here every column must be grouped.
 - **`GROUP BY` only by expressions over the input**, not by output name or position (a bare integer is refused).
-- **No optimization:** filters stay above joins, joins in the order written.
+- **No optimization:** filters stay above joins (so a `WHERE` on a joined table does not use its index), joins run in the order written, an index serves only an equality with a literal on one table and an index join only the right table of an `INNER` or `LEFT` join; nothing is chosen by cost.
 - **No `PRIMARY KEY`, `UNIQUE` columns, `DEFAULT`, `CHECK` or foreign keys**; no `DROP TABLE` or `ALTER TABLE`.
 - **Indexes are unique and of one column**, created only with `CREATE UNIQUE INDEX`.
 - **No transactions:** a script that fails midway keeps the statements before the failure.

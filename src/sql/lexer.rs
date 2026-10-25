@@ -106,6 +106,7 @@ pub enum Keyword {
     Last,
     Left,
     Limit,
+    Logical,
     Next,
     Not,
     Null,
@@ -138,7 +139,7 @@ pub enum Keyword {
 }
 
 /// Every keyword by its lowercase text, sorted for a binary search.
-const KEYWORDS: [(&str, Keyword); 70] = [
+const KEYWORDS: [(&str, Keyword); 71] = [
     ("all", Keyword::All),
     ("and", Keyword::And),
     ("as", Keyword::As),
@@ -180,6 +181,7 @@ const KEYWORDS: [(&str, Keyword); 70] = [
     ("last", Keyword::Last),
     ("left", Keyword::Left),
     ("limit", Keyword::Limit),
+    ("logical", Keyword::Logical),
     ("next", Keyword::Next),
     ("not", Keyword::Not),
     ("null", Keyword::Null),

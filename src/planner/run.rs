@@ -1,8 +1,8 @@
 //! Running statements: DDL straight against the catalog, DML through the executors with a
 //! fixed plan (`Insert(Values)`, `Update` and `Delete` over `Filter(SeqScan)`). The whole text
 //! is parsed before any statement runs; each statement is atomic, but a failure keeps the
-//! statements before it (there are no transactions). A `SELECT` is only planned, for `EXPLAIN`:
-//! running it waits for the physical plan.
+//! statements before it (there are no transactions). A `SELECT` runs through its logical and
+//! physical plans and gives back all its rows.
 
 use crate::execution::{
     Delete, ExecutionContext, Executor, Expr, Filter, Insert, SeqScan, Update, Values, execute,
@@ -13,10 +13,12 @@ use crate::types::Value;
 
 use super::PlannerError;
 use super::binder::bind;
+use super::physical_plan::plan_physical;
 use super::scope::Scope;
 use super::select::plan_select;
 
-/// What each statement did: its command tag, which a client prints as it is.
+/// What each statement did: its command tag, which a client prints as it is, or the rows of a
+/// query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementOutcome {
     CreateTable,
@@ -26,6 +28,11 @@ pub enum StatementOutcome {
     Delete(u64),
     /// The text of the plan, one node per line.
     Explain(String),
+    /// The names of the columns of a `SELECT`, and its rows in the order the plan gives them.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 /// Parses every statement of `sql` (a syntax error runs none), then runs them in order; the
@@ -46,10 +53,15 @@ fn run_statement(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<StatementOutcome, PlannerError> {
     match statement {
-        Statement::Select(_) => Err(PlannerError::Unsupported { feature: "SELECT" }),
-        Statement::Explain(select) => Ok(StatementOutcome::Explain(
-            plan_select(&select, ctx.catalog)?.to_string(),
-        )),
+        Statement::Select(select) => query(&select, ctx),
+        Statement::Explain { select, is_logical } => {
+            let logical = plan_select(&select, ctx.catalog)?;
+            let text = match is_logical {
+                true => logical.to_string(),
+                false => plan_physical(logical, ctx.catalog)?.to_string(),
+            };
+            Ok(StatementOutcome::Explain(text))
+        }
         Statement::CreateTable { name, columns } => create_table(ctx, &name, columns),
         Statement::CreateIndex {
             is_unique: false, ..
@@ -190,6 +202,25 @@ fn matching_rows(
         Some(selection) => Box::new(Filter::new(scan, bind(selection, scope, "WHERE")?)),
         None => scan,
     })
+}
+
+/// The rows of a `SELECT`, through its logical and physical plans, with its column names.
+fn query(
+    select: &ast::Select,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<StatementOutcome, PlannerError> {
+    let plan = plan_physical(plan_select(select, ctx.catalog)?, ctx.catalog)?;
+    let columns = plan
+        .columns()
+        .into_iter()
+        .map(|column| column.name)
+        .collect();
+    let mut root = plan.into_executor();
+    let rows = execute(root.as_mut(), ctx)?
+        .into_iter()
+        .map(|row| row.values)
+        .collect();
+    Ok(StatementOutcome::Rows { columns, rows })
 }
 
 /// The number of rows a write executor reports in its single BIGINT row.
@@ -340,16 +371,38 @@ mod tests {
     }
 
     #[test]
-    fn select_should_be_unsupported_for_now() {
+    fn select_should_give_its_columns_and_rows() {
         let mut db = TestDb::new(8);
 
-        let err = run_err(&mut db, "SELECT 1");
+        let outcomes = run(
+            &mut db,
+            "SELECT 1 AS one, 'a'; CREATE TABLE e (x INTEGER); SELECT count(*), max(x) FROM e",
+        );
 
-        assert!(matches!(
-            err,
-            PlannerError::Unsupported { feature: "SELECT" }
-        ));
-        assert_eq!(err.sqlstate(), "0A000");
+        assert_eq!(
+            outcomes,
+            [
+                StatementOutcome::Rows {
+                    columns: vec!["one".to_string(), "?column?".to_string()],
+                    rows: vec![vec![int(1), text("a")]],
+                },
+                StatementOutcome::CreateTable,
+                StatementOutcome::Rows {
+                    columns: vec!["count".to_string(), "max".to_string()],
+                    rows: vec![vec![Value::BigInt(0), Value::Null]],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_select_failing_while_it_runs_should_report_the_executor_error() {
+        let mut db = filled_db();
+
+        let err = run_err(&mut db, "SELECT v FROM t WHERE s > 1");
+
+        assert!(matches!(err, PlannerError::Execution(_)), "{err:?}");
+        assert_eq!(err.sqlstate(), "42883");
     }
 
     /// `t (id INTEGER NOT NULL, v INTEGER, s VARCHAR(5))` with the unique index `t_id`.
@@ -494,12 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn explain_should_give_the_plan_of_a_select() {
+    fn explain_should_give_the_physical_plan_and_explain_logical_the_logical() {
         let mut db = filled_db();
 
         let outcomes = run(
             &mut db,
-            "EXPLAIN SELECT v FROM t WHERE id > 1; INSERT INTO t VALUES (9, 9, 'z')",
+            "EXPLAIN SELECT v FROM t WHERE id = 2; EXPLAIN LOGICAL SELECT v FROM t WHERE id = 2; \
+             INSERT INTO t VALUES (9, 9, 'z'); SELECT v FROM t WHERE id = 9",
         );
         let unknown = run_err(&mut db, "EXPLAIN SELECT zz FROM t");
 
@@ -507,9 +561,17 @@ mod tests {
             outcomes,
             [
                 StatementOutcome::Explain(
-                    "Project: t.v AS v\n  Filter: t.id > 1\n    Scan: t".to_string()
+                    "Projection: t.v AS v\n  Filter: t.id = 2\n    IndexScan: t (index t_id = 2)"
+                        .to_string()
+                ),
+                StatementOutcome::Explain(
+                    "Project: t.v AS v\n  Filter: t.id = 2\n    Scan: t".to_string()
                 ),
                 StatementOutcome::Insert(1),
+                StatementOutcome::Rows {
+                    columns: vec!["v".to_string()],
+                    rows: vec![vec![int(9)]],
+                },
             ]
         );
         assert_eq!(unknown.sqlstate(), "42703");

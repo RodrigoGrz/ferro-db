@@ -42,7 +42,7 @@ fn run(
 }
 
 fn explain(bpm: &mut BufferPoolManager, catalog: &mut Catalog, sql: &str) -> String {
-    match run(bpm, catalog, &format!("EXPLAIN {sql}")).as_deref() {
+    match run(bpm, catalog, &format!("EXPLAIN LOGICAL {sql}")).as_deref() {
         Ok([StatementOutcome::Explain(text)]) => text.clone(),
         other => panic!("{sql}: {other:?}"),
     }
@@ -93,7 +93,7 @@ fn a_script_should_mix_explain_and_writes_in_order() {
         &mut catalog,
         &format!(
             "{SCHEMA}; INSERT INTO customers VALUES (1, 'ana', 'porto'), (2, 'rui', NULL); \
-             EXPLAIN SELECT * FROM customers WHERE city IS NULL; \
+             EXPLAIN LOGICAL SELECT * FROM customers WHERE city IS NULL; \
              DELETE FROM customers WHERE city IS NULL"
         ),
     )

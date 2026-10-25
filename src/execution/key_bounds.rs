@@ -81,6 +81,15 @@ pub(crate) fn point_key(value: Value, key_type: DataType) -> Result<Option<Value
     })
 }
 
+/// Whether every value of `value_type` converts to a bound of a `key_type` key without an
+/// error: the same family, but neither a float for an integer key nor a TIMESTAMP for a DATE
+/// key, which assignment refuses (42804) where `=` compares them.
+pub(crate) fn converts_to_key(value_type: DataType, key_type: DataType) -> bool {
+    value_type.family() == key_type.family()
+        && !(value_type.is_float() && key_type.is_integer())
+        && !(value_type == DataType::Timestamp && key_type == DataType::Date)
+}
+
 enum Converted {
     Key(Value),
     /// Every key is on the right side of the bound.
@@ -124,6 +133,46 @@ mod tests {
 
     fn converted(bound: Bound<Value>, key_type: DataType, side: Side) -> Option<Bound<Value>> {
         key_bound(bound, key_type, side).unwrap()
+    }
+
+    #[test]
+    fn converts_to_key_should_agree_with_the_conversion_of_a_bound() {
+        let day = Date::from_ymd(2024, 3, 15).unwrap();
+        let values = [
+            Value::SmallInt(1),
+            Value::Integer(1),
+            Value::BigInt(i64::MAX),
+            Value::Real(Finite32::new(0.5).unwrap()),
+            Value::Double(Finite64::new(1e300).unwrap()),
+            Value::Text("abcd".to_string()),
+            Value::Boolean(true),
+            Value::Date(day),
+            Value::Timestamp(Timestamp::at_midnight(day)),
+        ];
+        let key_types = [
+            DataType::SmallInt,
+            DataType::Integer,
+            DataType::BigInt,
+            DataType::Real,
+            DataType::Double,
+            DataType::Varchar(NonZeroU16::new(3).unwrap()),
+            DataType::Boolean,
+            DataType::Date,
+            DataType::Timestamp,
+        ];
+
+        for value in &values {
+            for key_type in key_types {
+                let value_type = value.data_type().unwrap();
+                let converts = point_key(value.clone(), key_type).is_ok();
+
+                assert_eq!(
+                    converts_to_key(value_type, key_type),
+                    converts,
+                    "{value_type} into a {key_type} key"
+                );
+            }
+        }
     }
 
     #[test]

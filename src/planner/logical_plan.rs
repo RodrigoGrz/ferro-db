@@ -71,6 +71,50 @@ impl ColumnName {
     }
 }
 
+/// The columns of a table, qualified by `alias` or else by the table's name.
+pub(super) fn table_columns(
+    table: &str,
+    alias: Option<&str>,
+    columns: &[String],
+) -> Vec<ColumnName> {
+    let table = alias.unwrap_or(table);
+    columns
+        .iter()
+        .map(|name| ColumnName {
+            table: Some(table.to_string()),
+            name: name.clone(),
+        })
+        .collect()
+}
+
+/// The row of an aggregation over `input`: each group (a column keeps its name, an expression
+/// is named by its text), then each aggregate by its call.
+pub(super) fn aggregate_columns(
+    input: &[ColumnName],
+    group_by: &[Expr],
+    aggregates: &[Aggregate],
+) -> Vec<ColumnName> {
+    let groups = group_by.iter().map(|expr| {
+        let column = match expr {
+            Expr::Column(position) => input.get(*position).cloned(),
+            _ => None,
+        };
+        column.unwrap_or_else(|| ColumnName::unqualified(explain::operand_text(expr, input)))
+    });
+    let aggregates = aggregates
+        .iter()
+        .map(|aggregate| ColumnName::unqualified(explain::aggregate_text(aggregate, input)));
+    groups.chain(aggregates).collect()
+}
+
+/// The names of the output columns of a projection.
+pub(super) fn output_names(columns: &[OutputColumn]) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|column| ColumnName::unqualified(column.name.clone()))
+        .collect()
+}
+
 impl LogicalPlan {
     /// The names of the values of each row this node gives.
     pub fn columns(&self) -> Vec<ColumnName> {
@@ -79,16 +123,7 @@ impl LogicalPlan {
                 table,
                 alias,
                 columns,
-            } => {
-                let table = alias.as_ref().unwrap_or(table);
-                columns
-                    .iter()
-                    .map(|name| ColumnName {
-                        table: Some(table.clone()),
-                        name: name.clone(),
-                    })
-                    .collect()
-            }
+            } => table_columns(table, alias.as_deref(), columns),
             LogicalPlan::OneRow => Vec::new(),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Sort { input, .. }
@@ -102,26 +137,8 @@ impl LogicalPlan {
                 input,
                 group_by,
                 aggregates,
-            } => {
-                let input = input.columns();
-                let groups = group_by.iter().map(|expr| {
-                    let column = match expr {
-                        Expr::Column(position) => input.get(*position).cloned(),
-                        _ => None,
-                    };
-                    column.unwrap_or_else(|| {
-                        ColumnName::unqualified(explain::operand_text(expr, &input))
-                    })
-                });
-                let aggregates = aggregates.iter().map(|aggregate| {
-                    ColumnName::unqualified(explain::aggregate_text(aggregate, &input))
-                });
-                groups.chain(aggregates).collect()
-            }
-            LogicalPlan::Project { columns, .. } => columns
-                .iter()
-                .map(|column| ColumnName::unqualified(column.name.clone()))
-                .collect(),
+            } => aggregate_columns(&input.columns(), group_by, aggregates),
+            LogicalPlan::Project { columns, .. } => output_names(columns),
         }
     }
 

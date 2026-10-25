@@ -6,6 +6,7 @@ pub mod filter;
 pub mod hash_join;
 pub mod join;
 mod key_bounds;
+pub(crate) use key_bounds::converts_to_key;
 pub mod limit;
 mod materialized;
 pub mod modify;

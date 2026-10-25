@@ -10,8 +10,12 @@ use super::parser::is_reserved;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Select(Box<Select>),
-    /// `EXPLAIN SELECT …`: the plan of the query, not its rows.
-    Explain(Box<Select>),
+    /// `EXPLAIN [LOGICAL] SELECT …`: the plan of the query, not its rows; the physical plan
+    /// unless `is_logical`.
+    Explain {
+        select: Box<Select>,
+        is_logical: bool,
+    },
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
@@ -219,7 +223,10 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Select(select) => write!(f, "{select}"),
-            Statement::Explain(select) => write!(f, "EXPLAIN {select}"),
+            Statement::Explain { select, is_logical } => {
+                let logical = if *is_logical { "LOGICAL " } else { "" };
+                write!(f, "EXPLAIN {logical}{select}")
+            }
             Statement::CreateTable { name, columns } => {
                 write!(f, "CREATE TABLE {} (", Name(name))?;
                 write_list(f, columns)?;

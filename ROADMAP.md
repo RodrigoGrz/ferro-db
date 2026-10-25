@@ -43,7 +43,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Table Metadata: tables persisted in the catalog ([`src/catalog/`](src/catalog/), [`tests/catalog_table_metadata.rs`](tests/catalog_table_metadata.rs))
 - [x] Table Heap: typed `insert` / `get` / `update` / `delete` / `scan`, combining `Schema` and `HeapFile`, found by table name through the catalog, which keeps one handle per table ([`table_heap.rs`](src/table/table_heap.rs), [`catalog.rs`](src/catalog/catalog.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs))
 - [x] INSERT: `INSERT INTO t [(columns)] VALUES …` through `run_sql`, the columns outside the list `NULL` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs), [docs](docs/planner.md#statements))
-- [ ] SELECT. Parsed and planned (`EXPLAIN SELECT` shows the logical plan); it runs with the physical plan.
+- [x] SELECT: run through `run_sql` by its logical and physical plans, giving its column names and rows ([`run.rs`](src/planner/run.rs), [`physical_plan.rs`](src/planner/physical_plan.rs), [`tests/planner_physical.rs`](tests/planner_physical.rs), [docs](docs/planner.md#physical-plan))
 - [x] UPDATE: `UPDATE t SET … [WHERE …]` through `run_sql` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs))
 - [x] DELETE: `DELETE FROM t [WHERE …]` through `run_sql` ([`run.rs`](src/planner/run.rs), [`tests/planner_statements.rs`](tests/planner_statements.rs))
 - [x] Sequential Scan: typed table scan in heap order, `TableHeap::scan` ([`table_heap.rs`](src/table/table_heap.rs), [`tests/table_table_heap.rs`](tests/table_table_heap.rs)). The scan operator of the executor is under Query Execution.
@@ -69,7 +69,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 ## Query Planning
 
 - [x] Logical Query Plan: a `SELECT` as `Scan/Join → Filter → Aggregate → Filter → Sort → Limit → Project` over the executors' expressions, shown by `EXPLAIN` with the columns by name ([`logical_plan.rs`](src/planner/logical_plan.rs), [`select.rs`](src/planner/select.rs), [`explain.rs`](src/planner/explain.rs), [`tests/planner_select.rs`](tests/planner_select.rs), [docs](docs/planner.md#logical-plan))
-- [ ] Physical Query Plan
+- [x] Physical Query Plan: executors chosen by fixed rules (hash keys from the `ON`, `IndexNestedLoopJoin` on an index of the right table, `IndexScan` for `column = literal`, `TopN`), giving the rows of the plain plan whenever no expression fails, checked against it; `EXPLAIN` shows it, `EXPLAIN LOGICAL` the logical one ([`physical_plan.rs`](src/planner/physical_plan.rs), [`explain.rs`](src/planner/explain.rs), [`tests/planner_physical.rs`](tests/planner_physical.rs), [docs](docs/planner.md#physical-plan))
 
 ## Query Execution
 
@@ -81,7 +81,7 @@ When an item is finished, mark it here in the same change that adds the code, an
 - [x] Limit: `LIMIT`/`OFFSET` counts validated as the standard says (`2201W`, `2201X`), never pulling the child past the count ([`limit.rs`](src/execution/limit.rs), [`tests/execution_sort.rs`](tests/execution_sort.rs), [docs](docs/execution.md#counts))
 - [x] Aggregation: hash aggregation in memory with `COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, skipping `NULL` as the standard does ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs), [docs](docs/execution.md#aggregation))
 - [x] GROUP BY: groups by any expressions, `NULL` keys in one group, in order of first appearance; `HAVING` is a `Filter` over the groups ([`aggregation.rs`](src/execution/aggregation.rs), [`tests/execution_aggregation.rs`](tests/execution_aggregation.rs))
-- [ ] JOIN. `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` exist through the `IndexNestedLoopJoin` and the `HashJoin`, and the syntax is parsed and planned (`Join` in the logical plan); running a join from SQL waits for the physical plan.
+- [x] JOIN: `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` from SQL, run by the `HashJoin` or the `IndexNestedLoopJoin` the physical plan picks ([`physical_plan.rs`](src/planner/physical_plan.rs), [`tests/planner_physical.rs`](tests/planner_physical.rs), [docs](docs/planner.md#physical-plan))
 - [x] Hash Join: in-memory build of the right input and probe by normalized keys (`1 = 1.0`), `INNER`, `LEFT`, `RIGHT` and `FULL` with a residual predicate, several keys or none (`CROSS`) ([`hash_join.rs`](src/execution/hash_join.rs), [`tests/execution_hash_join.rs`](tests/execution_hash_join.rs), [docs](docs/execution.md#hash-join))
 - [ ] Nested Loop Join. Not implemented on purpose: the plain loop scans the inner table for every outer row; the index nested loop join below replaces it.
 - [x] Index Nested Loop Join: one B+Tree descent per outer row, `INNER` and `LEFT` with a residual predicate, the key converted like an `IndexScan` point ([`join.rs`](src/execution/join.rs), [`tests/execution_join.rs`](tests/execution_join.rs), [docs](docs/execution.md#index-nested-loop-join))
@@ -113,7 +113,7 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 - [ ] Cost Model
 - [ ] Statistics
 - [ ] Cardinality Estimation
-- [ ] Index Selection
+- [ ] Index Selection. A fixed rule already reads an index for `column = literal` in the `WHERE` of one table, and an index join uses the right table's index; ranges, filters above joins and choosing between indexes wait for costs.
 - [ ] Join Ordering
 
 ## Constraints

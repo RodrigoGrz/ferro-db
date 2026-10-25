@@ -94,13 +94,17 @@ impl Parser<'_> {
         }
     }
 
-    /// The rest of `EXPLAIN SELECT …`, after `EXPLAIN`; the plan of another statement is valid
-    /// SQL elsewhere, not yet here.
+    /// The rest of `EXPLAIN [LOGICAL] SELECT …`, after `EXPLAIN`; the plan of another statement
+    /// is valid SQL elsewhere, not yet here.
     fn explain(&mut self) -> Result<Statement, SqlError> {
+        let is_logical = self.eat_keyword(Keyword::Logical);
         match self.peek_keyword() {
             Some(Keyword::Select) => {
                 self.next += 1;
-                Ok(Statement::Explain(Box::new(self.select()?)))
+                Ok(Statement::Explain {
+                    select: Box::new(self.select()?),
+                    is_logical,
+                })
             }
             Some(
                 Keyword::Create
@@ -1473,12 +1477,33 @@ mod tests {
 
     #[test]
     fn explain_should_wrap_a_select() {
-        let explained = statement("EXPLAIN SELECT a FROM t");
-        let as_names = statement("SELECT explain FROM explain");
+        let physical = statement("EXPLAIN SELECT a FROM t");
+        let logical = statement("EXPLAIN LOGICAL SELECT a FROM t");
+        let as_names = statement("SELECT explain, logical FROM explain");
 
-        assert!(matches!(&explained, Statement::Explain(_)), "{explained:?}");
-        assert_eq!(explained.to_string(), "EXPLAIN SELECT a FROM t");
-        assert_eq!(as_names.to_string(), "SELECT explain FROM explain");
+        assert!(
+            matches!(
+                &physical,
+                Statement::Explain {
+                    is_logical: false,
+                    ..
+                }
+            ),
+            "{physical:?}"
+        );
+        assert!(
+            matches!(
+                &logical,
+                Statement::Explain {
+                    is_logical: true,
+                    ..
+                }
+            ),
+            "{logical:?}"
+        );
+        assert_eq!(physical.to_string(), "EXPLAIN SELECT a FROM t");
+        assert_eq!(logical.to_string(), "EXPLAIN LOGICAL SELECT a FROM t");
+        assert_eq!(as_names.to_string(), "SELECT explain, logical FROM explain");
     }
 
     #[test]
@@ -1491,6 +1516,13 @@ mod tests {
         assert_eq!(parse_err("EXPLAIN INSERT INTO t VALUES (1)"), unsupported);
         assert_eq!(parse_err("EXPLAIN DELETE FROM t"), unsupported);
         assert_eq!(parse_err("EXPLAIN EXPLAIN SELECT 1"), unsupported);
+        assert_eq!(
+            parse_err("EXPLAIN LOGICAL UPDATE t SET a = 1"),
+            SqlError::Unsupported {
+                feature: "EXPLAIN of statements other than SELECT",
+                position: 17,
+            }
+        );
         assert_eq!(parse_err("EXPLAIN t"), unexpected("t", "SELECT", 9));
         assert_eq!(
             parse_err("EXPLAIN"),
@@ -2349,7 +2381,10 @@ mod tests {
                         .collect(),
                     selection: self.chance(2).then(|| self.expr(2)),
                 },
-                5 => Statement::Explain(Box::new(self.select())),
+                5 => Statement::Explain {
+                    select: Box::new(self.select()),
+                    is_logical: self.chance(2),
+                },
                 _ => Statement::Delete {
                     table,
                     selection: self.chance(2).then(|| self.expr(2)),
