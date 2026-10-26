@@ -1,6 +1,6 @@
 # Architecture
 
-ferroDB is a single Rust crate (`ferro_db` library + a demo binary). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the SQL layer: a lexer, a parser and a planner that runs `CREATE TABLE`, `CREATE UNIQUE INDEX`, `INSERT`, `UPDATE` and `DELETE`, and runs a `SELECT` through a validated logical plan and a physical plan of executors chosen by fixed rules, which `EXPLAIN` shows.
+ferroDB is a single Rust crate (`ferro_db` library + the `ferro-db` command-line client). The implemented part is the lower half of a relational database: everything needed to store typed rows in tables that survive restarts, query and change them through executors, and the SQL layer: a lexer, a parser and a planner that runs `CREATE TABLE`, `CREATE UNIQUE INDEX`, `INSERT`, `UPDATE` and `DELETE`, and runs a `SELECT` through a validated logical plan and a physical plan of executors chosen by fixed rules, which `EXPLAIN` shows.
 
 This page explains the components and how data moves between them. Byte formats and invariants live in [storage-engine.md](storage-engine.md) and [data-model.md](data-model.md).
 
@@ -8,7 +8,9 @@ This page explains the components and how data moves between them. Byte formats 
 
 ```mermaid
 flowchart TD
-    demo["Demo binary<br/>src/main.rs"]
+    subgraph connectivity["Connectivity (src/connectivity/)"]
+        cli["CLI<br/>read → run → print, meta-commands, aligned tables"]
+    end
 
     subgraph upper["Typed data"]
         catalog["Catalog<br/>src/catalog/<br/>tables, columns, page 0 header"]
@@ -44,8 +46,9 @@ flowchart TD
 
     file[("Database file<br/>8 KB pages")]
 
-    demo --> catalog
-    demo --> tableheap
+    cli --> planner
+    cli --> parser
+    cli --> catalog
     parser --> lexer
     planner --> parser
     planner --> exec
@@ -100,6 +103,7 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 | `Catalog` | Persist which tables and indexes exist, their columns, first data page and tree; bootstrap from page 0; create and fill indexes; keep one open `TableHeap` per table and one `BPlusTree` per index used. | Expose SQL, or update indexes when a table changes. |
 | Lexer (`tokenize`) | Turn the text of a statement into tokens with their byte spans: words folded to lowercase and marked as keywords, quoted identifiers, strings, numbers as written, operators; skip whitespace and nested comments; report syntax errors (`42601`) at a character position. | Parse statements, check names against the catalog, or depend on any other layer. |
 | Parser and AST (`parse`) | Turn tokens into statements (`SELECT`, `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN [LOGICAL] SELECT`) by recursive descent: projection, joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, expressions by precedence climbing; decide which keywords are reserved; print the AST back as canonical SQL. | Resolve names or types against the catalog, run anything, or parse other statements yet. |
+| CLI (`ferro-db`, `connectivity::cli::run`) | Open a database file; gather lines into complete commands with the lexer; run each statement through the planner and print its rows as an aligned table, its command tag or its error with the SQLSTATE; answer `\d`, `\i`, `\?`, `\q`; write every dirty page after each typed command and at the end of a script. | Talk over a network, edit lines, or make a command atomic (no WAL). |
 | Planner (`run_sql`, `plan_select`, `plan_physical`) | Parse a whole text, then run each statement: bind names to column positions and literals to typed values, run DDL against the catalog and DML through a fixed plan of executors; turn a `SELECT` into a logical plan (scope of the `FROM`, grouping rules, `ORDER BY` by position, name or expression), then into executors by fixed rules (hash keys, index joins, index scans for an equality, `TopN`), run it and give back its rows; print either plan for `EXPLAIN`; report each outcome like a command tag. | Choose plans by cost or join order, push filters below joins, or undo the statements before a failure (no transactions). |
 | Executors (`SeqScan`, `IndexScan`, `Values`, `Filter`, `Projection`, `Aggregation`, `Sort`, `Limit`, `TopN`, `IndexNestedLoopJoin`, `HashJoin`, `Insert`, `Delete`, `Update`) | Run a plan in the iterator model, one row per `next`; evaluate expressions with SQL semantics; group rows in a hash table and compute aggregates; sort rows in memory and cut them with `LIMIT`/`OFFSET`; join two tables through an index of the inner one or an in-memory hash table; write in two phases (read the child, validate the whole statement, write) keeping every index of the table in step. | Parse SQL, choose plans, or survive an I/O failure halfway through a write. |
 | `BPlusTree` | Map unique keys of one type to `Rid`s in pages of the buffer pool; search, insert, remove and range scans; split, merge and redistribute nodes; reuse freed pages. | Know tables, columns or `NULL`; allow duplicate keys. |
@@ -170,6 +174,13 @@ An arrow means "uses". Dashed nodes and arrows are planned work from the [roadma
 2. An index is used only when its key converts without an error (`converts_to_key`), so the choice never changes the rows of a query whose expressions do not fail; an expression that fails on some rows can fail in one plan and not another, since the plan decides which rows it is evaluated on.
 3. `into_executor` builds the tree of executors, `execute` pulls its root to the end, and `run_sql` returns `Rows` with the output names; `EXPLAIN` prints the physical plan. See [planner.md](planner.md#physical-plan).
 
+### A CLI session
+
+1. `ferro-db FILE` opens the buffer pool and the catalog (`Session::open`) and reads standard input, with prompts only from a terminal.
+2. Lines join a buffer until the lexer reads it whole with a `;` as its last token; a `;` in a string or a comment does not count, and a line starting with `\` is a meta-command.
+3. The text is parsed, and each statement runs through `run_statement` and is printed at once: rows as an aligned table, other outcomes as command tags, errors with their SQLSTATE (the first one stops the rest of the text).
+4. `flush_all` writes every dirty page after each typed command, so what the screen showed as done survives a killed process; a script is written once, at its end. See [connectivity.md](connectivity.md).
+
 ### Running a query
 
 1. A plan is a tree of executors (for example `Projection(Filter(SeqScan))`); `execute` pulls its root until it ends, passing the `ExecutionContext` (catalog and buffer pool) down on every call.
@@ -234,7 +245,7 @@ Every module has unit tests next to the code; [`tests/`](../tests/) holds integr
 
 These are verified properties of the current code, not bugs to be fixed in passing:
 
-- **Plans by rule, not by cost.** `SELECT` runs through `run_sql`, with executors chosen by fixed rules; there are no statistics, filters stay above joins and joins run in the order written. The result is collected in memory. `cargo run` is a fixed demo.
+- **Plans by rule, not by cost.** `SELECT` runs through `run_sql`, with executors chosen by fixed rules; there are no statistics, filters stay above joins and joins run in the order written. The result is collected in memory.
 - **Single-threaded.** Every buffer pool operation takes `&mut self`; there are no latches, locks or transactions.
 - **No crash atomicity.** There is no WAL. A dirty page lives only in memory until it is written, and pages are written in no particular order. Documented consequences: an update that moves a tuple is not atomic, a crash in the middle of `create_table` can leave orphan columns or a table without columns, and an I/O error while extending a heap can leave an unreachable page. The `LSN` field is reserved in every page header for this work.
 - **No space reclamation across pages.** There is no `VACUUM`; empty pages stay in their heap (and are reused by it), and pages orphaned by failures are never reclaimed.

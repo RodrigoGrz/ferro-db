@@ -256,6 +256,21 @@ impl BufferPoolManager {
         self.flush_frame(frame_id)
     }
 
+    /// Writes every dirty page of the pool, in page order, keeping each one in its frame with
+    /// its pins. The first write that fails stops it; the pages after it stay dirty.
+    pub fn flush_all(&mut self) -> Result<(), BufferPoolError> {
+        let mut pages: Vec<(u32, usize)> = self
+            .page_table
+            .iter()
+            .map(|(&page_id, &frame_id)| (page_id, frame_id))
+            .collect();
+        pages.sort_unstable();
+        for (_, frame_id) in pages {
+            self.flush_frame(frame_id)?;
+        }
+        Ok(())
+    }
+
     fn flush_frame(&mut self, frame_id: usize) -> Result<(), BufferPoolError> {
         let Some(page_id) = self.pages[frame_id].page_id() else {
             return Ok(());
@@ -938,5 +953,46 @@ mod tests {
 
         assert!(matches!(err, BufferPoolError::PageIdOverflow));
         assert_eq!(err.to_string(), "no page ids left");
+    }
+
+    #[test]
+    fn flush_all_should_write_every_dirty_page_and_keep_it_in_the_pool() {
+        let mut pool = TestPool::new(4, TEST_PAGE_SIZE);
+        let (first, second, untouched) = (
+            allocate(&mut pool),
+            allocate(&mut pool),
+            allocate(&mut pool),
+        );
+        pool.bpm().flush_page(untouched).unwrap();
+        write_value(&mut pool, first, 7);
+        write_value(&mut pool, second, 9);
+        pool.bpm().fetch_page(first).unwrap();
+
+        pool.bpm().flush_all().unwrap();
+
+        assert_eq!(read_page(pool.path(), first)[DATA_BYTE], 7);
+        assert_eq!(read_page(pool.path(), second)[DATA_BYTE], 9);
+        for page_id in [first, second, untouched] {
+            let page = pool.bpm().fetch_page(page_id).unwrap();
+            assert!(!page.is_dirty(), "{page_id}");
+            assert!(pool.bpm().unpin_page(page_id, false));
+        }
+        // The pin taken before the flush is still there.
+        assert!(pool.bpm().unpin_page(first, false));
+        assert!(!pool.bpm().unpin_page(first, false));
+    }
+
+    #[test]
+    fn flush_all_should_not_rewrite_a_clean_page() {
+        let mut pool = TestPool::new(2, TEST_PAGE_SIZE);
+        let page_id = allocate(&mut pool);
+        pool.bpm().flush_page(page_id).unwrap();
+        // Bytes changed on disk behind the pool's back stay as they are if the page is clean.
+        flip_byte(pool.path(), page_id, DATA_BYTE);
+        let on_disk = read_page(pool.path(), page_id);
+
+        pool.bpm().flush_all().unwrap();
+
+        assert_eq!(read_page(pool.path(), page_id), on_disk);
     }
 }

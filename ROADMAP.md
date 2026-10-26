@@ -127,7 +127,7 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 
 ## Connectivity
 
-- [ ] CLI. `cargo run` is a fixed demo, not an interactive client.
+- [x] CLI: `ferro-db [FILE]` reads SQL from a terminal with prompts or from a script, prints rows as aligned tables, command tags and errors with their SQLSTATE, and answers `\d`, `\d TABLE`, `\i FILE`, `\?`, `\q` ([`cli.rs`](src/connectivity/cli.rs), [`output.rs`](src/connectivity/output.rs), [`main.rs`](src/main.rs), [`tests/connectivity_cli.rs`](tests/connectivity_cli.rs), [docs](docs/connectivity.md))
 - [ ] Client Protocol
 - [ ] TCP Server
 - [ ] Prepared Statements

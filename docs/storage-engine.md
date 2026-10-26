@@ -80,6 +80,7 @@ pub struct BufferPoolManager {
 - **`unpin_page(id, is_dirty)`:** decrements the pin count and ORs the dirty flag; when the count reaches 0 the frame becomes evictable. Unpinning a page that is not resident, or whose count is already 0, returns `false`.
 - **`new_page()`:** see [page allocation](#page-allocation).
 - **`flush_page(id)`:** writes the page if it is dirty and marks it clean.
+- **`flush_all()`:** writes every dirty page, in page order, keeping each in its frame with its pins; the first failed write stops it. The CLI calls it after each typed command and at the end of a script, since a killed process never runs `Drop`.
 - **Write-back:** every write stamps the checksum first (`checksum::stamp_page`) and then calls `DiskManager::write_page`.
 - **`Drop`:** flushes every resident dirty page when the pool is dropped.
 
@@ -89,7 +90,7 @@ pub struct BufferPoolManager {
 
 **Not supported yet:** concurrent access (every operation takes `&mut self`), and RAII pin guards (callers must pair every fetch with an unpin; the heap file does this through helpers that unpin on every path).
 
-**Tests** (unit, in the module): constructor validation without creating a file, fetch miss and hit, pin counting, unpin rules (unknown page, count already 0), pinned pages never evicted, `NoAvailableFrame` with every frame pinned, LRU-K victim choice, dirty pages written on eviction and on drop, an unpin without the dirty flag not persisted, a failed read keeping the free list usable, checksum stamping and every corruption case (data byte, header byte, checksum field, unstamped page), unknown type and other format version rejected without taking a frame, and the page allocation rules (see [below](#page-allocation)). `flush_page` has no test of its own, but several of these tests call it to put a page on disk before inspecting the file. A test-only failure hook (`fail_fetch_after`) lets higher layers inject a failure in the middle of an operation.
+**Tests** (unit, in the module): constructor validation without creating a file, fetch miss and hit, pin counting, unpin rules (unknown page, count already 0), pinned pages never evicted, `NoAvailableFrame` with every frame pinned, LRU-K victim choice, dirty pages written on eviction and on drop, an unpin without the dirty flag not persisted, a failed read keeping the free list usable, checksum stamping and every corruption case (data byte, header byte, checksum field, unstamped page), unknown type and other format version rejected without taking a frame, and the page allocation rules (see [below](#page-allocation)). `flush_page` has no test of its own, but several of these tests call it to put a page on disk before inspecting the file. `flush_all` writes every dirty page (read back through a second disk manager while the pool lives) without touching their pins, and leaves a clean page alone. A test-only failure hook (`fail_fetch_after`) lets higher layers inject a failure in the middle of an operation.
 
 ---
 

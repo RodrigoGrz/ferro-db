@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,354 tests). Tables and unique indexes are created, rows inserted, updated and deleted, and queries run, all with SQL (`run_sql`): a `SELECT` is validated, planned and run by executors chosen by fixed rules, and `EXPLAIN` shows the plan. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,391 tests). Tables and unique indexes are created, rows inserted, updated and deleted, and queries run, all with SQL, from the `ferro-db` command-line client or `run_sql`: a `SELECT` is validated, planned and run by executors chosen by fixed rules, and `EXPLAIN` shows the plan. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -34,6 +34,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 | **Executors** | Iterator-model executors over expressions with SQL semantics: sequential scan, index scan (points and ranges, in key order), values, filter (`WHERE` keeps TRUE only), projection, hash aggregation (`GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`; `HAVING` as a filter), sort (several keys, `NULLS FIRST`/`LAST`), limit and offset, top-N with a bounded heap, index nested loop join (`INNER` and `LEFT`), hash join (`INNER`, `LEFT`, `RIGHT`, `FULL`), insert, update and delete. Writes keep the indexes in step and validate a whole statement before writing (a refused statement leaves no trace). |
 | **SQL lexer and parser** | Text to an AST: `SELECT` (joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`), `CREATE TABLE`, `CREATE UNIQUE INDEX`, `INSERT`, `UPDATE`, `DELETE` and `EXPLAIN`; expressions by precedence climbing, syntax errors at a character position, a nesting limit that keeps any statement from exhausting the stack. |
 | **Planner** | `run_sql` binds names to column positions and literals to types, runs DDL against the catalog and DML through the executors; a `SELECT` becomes a validated logical plan (the scope of its `FROM`, the grouping rules, `ORDER BY` by position, name or expression), then executors chosen by fixed rules (hash joins on the equalities of the `ON`, index joins and index scans where an index serves, `TopN` for `ORDER BY … LIMIT`) that run it; `EXPLAIN` shows the physical plan, `EXPLAIN LOGICAL` the logical one. |
+| **CLI** | `ferro-db [FILE]` opens a database and reads SQL from a terminal (with prompts) or a script: multi-line commands ending in `;`, rows printed as aligned tables, command tags, errors with their SQLSTATE, and the meta-commands `\d`, `\d TABLE`, `\i FILE`, `\?`, `\q`. |
 
 **Partially there:**
 
@@ -47,7 +48,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 
 ```mermaid
 flowchart TD
-    app["Rust API / demo binary"]
+    app["ferro-db CLI / Rust API"]
     catalog["Catalog<br/>tables and columns, page 0"]
     tableheap["Table Heap<br/>typed rows of a table"]
     btree["B+Tree index<br/>keys → row ids"]
@@ -90,52 +91,58 @@ cargo build
 cargo test
 ```
 
-`cargo run` runs a small end-to-end demo ([`src/main.rs`](src/main.rs)). It is a fixed program, not an interactive SQL shell:
-
-1. Opens `data.db` in the **current directory**, creating the database if the file does not exist.
-2. Creates the table `accounts (id INTEGER NOT NULL, age SMALLINT, balance BIGINT)` on the first run.
-3. Inserts **one new row on every run** (every third row has a `NULL` age).
-4. Prints the catalog and every row with its `Rid` as `(page, slot)`.
-
-Because the demo adds a row each time and writes to the current directory, run it from an empty directory to reproduce the output below:
-
-```sh
-cargo build
-mkdir -p /tmp/ferro-demo && cd /tmp/ferro-demo
-/path/to/ferro-db/target/debug/ferro-db   # run it three times
-```
-
-Output captured from three consecutive runs in an empty directory (each run is a separate process, so the rows come back from disk):
+`cargo run -- shop.db` opens the database in `shop.db` (creating it if needed; `data.db` without an argument) and starts an interactive SQL prompt ([docs/connectivity.md](docs/connectivity.md)). A command may span lines and ends with `;`:
 
 ```text
-$ ferro-db
-tables:
-  accounts (id INTEGER NOT NULL, age SMALLINT, balance BIGINT)
-rows of accounts:
-  (3, 0) -> (1, 19, 1000)
+$ cargo run -- shop.db
+ferro-db: type \? for help, \q to quit
+ferro=> CREATE TABLE customers (id INTEGER NOT NULL, name VARCHAR(20), city VARCHAR(20));
+CREATE TABLE
+ferro=> CREATE UNIQUE INDEX customers_id ON customers (id);
+CREATE INDEX
+ferro=> CREATE TABLE orders (id INTEGER NOT NULL, customer_id INTEGER, total BIGINT);
+CREATE TABLE
+ferro=> INSERT INTO customers VALUES (1, 'Ana', 'Lisboa'), (2, 'Rui', 'Porto'), (3, 'Inês', NULL);
+INSERT 0 3
+ferro=> INSERT INTO orders VALUES (10, 1, 50), (11, 1, 70), (12, 2, 20);
+INSERT 0 3
+ferro=> SELECT c.name, count(*) AS orders, sum(o.total) AS spent
+ferro->   FROM orders o JOIN customers c ON c.id = o.customer_id
+ferro->   GROUP BY c.name ORDER BY spent DESC;
+ name | orders | spent
+------+--------+-------
+ Ana  |      2 |   120
+ Rui  |      1 |    20
+(2 rows)
 
-$ ferro-db
-tables:
-  accounts (id INTEGER NOT NULL, age SMALLINT, balance BIGINT)
-rows of accounts:
-  (3, 0) -> (1, 19, 1000)
-  (3, 1) -> (2, 20, 2000)
+ferro=> EXPLAIN SELECT c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.total > 30;
+Projection: c.name AS name
+  Filter: o.total > 30
+    IndexNestedLoopJoin INNER: c.id = o.customer_id (index customers_id ON customers AS c)
+      SeqScan: orders AS o
 
-$ ferro-db
-tables:
-  accounts (id INTEGER NOT NULL, age SMALLINT, balance BIGINT)
-rows of accounts:
-  (3, 0) -> (1, 19, 1000)
-  (3, 1) -> (2, 20, 2000)
-  (3, 2) -> (3, NULL, 3000)
+ferro=> \d customers
+Table "customers"
+ column |    type     | nullable
+--------+-------------+----------
+ id     | INTEGER     | not null
+ name   | VARCHAR(20) |
+ city   | VARCHAR(20) |
+(3 rows)
+Indexes:
+    "customers_id" UNIQUE (id)
+
+ferro=> SELECT nome FROM customers;
+ERROR: column "nome" does not exist (SQLSTATE 42703)
+ferro=> \q
 ```
 
-Page 0 holds the database header and pages 1–2 the catalog heaps, so the table's rows start on page 3. If an older `data.db` from a previous on-disk format is found, the demo stops with a message asking you to delete it.
+Without a terminal it reads a script instead, without prompts: `cargo run -- shop.db < setup.sql`. `\i FILE` runs a file from the prompt, `\d` lists the tables and `\?` shows the meta-commands. Every typed command's pages are written to the file before the next prompt (a script's, at its end), so the data is there the next time you open it. `ferro-db --help` prints the usage.
 
 ## Testing
 
 ```sh
-cargo test --all-targets   # 1,248 unit tests + 106 integration tests
+cargo test --all-targets   # 1,283 unit tests + 108 integration tests
 ```
 
 The suite is the main way the implementation is verified:
@@ -157,13 +164,14 @@ CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on ever
 - [docs/indexes.md](docs/indexes.md): the B+Tree, key encoding, node format, splits and merges
 - [docs/execution.md](docs/execution.md): expressions, executors, two-phase writes and index maintenance
 - [docs/sql.md](docs/sql.md): the SQL layer: the lexer (tokens, keywords, identifiers, literals, comments) and the parser and AST for `SELECT` (grammar, precedence, reserved words, errors)
+- [docs/connectivity.md](docs/connectivity.md): the command-line client: usage, when a command is complete, meta-commands, output format
 - [docs/planner.md](docs/planner.md): the planner layer: `run_sql`, the scope and the binder (names, literal types, `BETWEEN`/`IN`, grouping), how each statement runs, the logical and physical plans of a `SELECT` and `EXPLAIN`, errors
 - [docs/decisions/](docs/decisions/README.md): architectural decision records
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and conventions
 
 ## Limitations
 
-- **No SQL yet.** Everything is driven through the Rust API.
+- **One embedded client.** The CLI opens the database file itself; there is no server, network protocol or concurrent access.
 - **Single-threaded.** No concurrent access, locks or transactions.
 - **No crash safety.** Without a WAL, a crash can lose pages that were not yet written, and multi-page operations (moving an updated row, creating a table) are not atomic. Errors *inside* the process return without leaving half-applied changes in a page or in the buffer pool; multi-page operations fall back to a best-effort undo.
 - **Few types:** integers, floats, `VARCHAR(n)`, `BOOLEAN`, `DATE`, `TIMESTAMP` and `NULL`; no `NUMERIC` yet. Text compares by bytes (no collations), and a value must fit in one page.

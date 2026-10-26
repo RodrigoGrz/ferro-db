@@ -48,7 +48,8 @@ pub fn run_sql(
         .collect()
 }
 
-fn run_statement(
+/// Runs one parsed statement; `run_sql` is this for each statement of a text, in order.
+pub fn run_statement(
     statement: Statement,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<StatementOutcome, PlannerError> {

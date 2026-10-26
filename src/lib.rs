@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod config;
+pub mod connectivity;
 pub mod execution;
 pub mod index;
 pub mod planner;
