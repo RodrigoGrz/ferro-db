@@ -3,6 +3,8 @@ pub mod error;
 mod explain;
 pub mod logical_plan;
 pub mod physical_plan;
+mod predicate;
+mod pushdown;
 pub mod run;
 mod scope;
 pub mod select;

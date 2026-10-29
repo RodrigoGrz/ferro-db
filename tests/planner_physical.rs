@@ -109,6 +109,17 @@ const TOP: &str = "SELECT o.id, o.total FROM orders o ORDER BY o.total DESC, o.i
 const EVERY_CUSTOMER: &str =
     "SELECT count(*) FROM customers c LEFT JOIN orders o ON o.customer_id = c.id";
 
+/// A filter on the indexed table of a join: pushed down to it, it is read through the index.
+const ORDERS_OF_ONE: &str = "SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id \
+     WHERE c.id = 42 ORDER BY o.id";
+
+fn expected_orders_of_one() -> Vec<Vec<Value>> {
+    (0..ORDERS)
+        .filter(|id| customer_of(*id) == Some(42))
+        .map(|id| vec![Value::Integer(id as i32)])
+        .collect()
+}
+
 fn expected_report() -> Vec<Vec<Value>> {
     let mut cities = BTreeMap::<&str, (i64, i64)>::new();
     for id in 0..ORDERS {
@@ -157,6 +168,7 @@ fn assert_queries(bpm: &mut BufferPoolManager, catalog: &mut Catalog) {
     );
     assert_eq!(rows(bpm, catalog, REPORT), expected_report());
     assert_eq!(rows(bpm, catalog, TOP), expected_top());
+    assert_eq!(rows(bpm, catalog, ORDERS_OF_ONE), expected_orders_of_one());
     assert_eq!(
         rows(bpm, catalog, EVERY_CUSTOMER),
         [vec![Value::BigInt(expected_every_customer())]]
@@ -188,6 +200,7 @@ fn explain_should_show_the_index_where_one_serves_and_a_hash_join_elsewhere() {
     let report = explain(&mut bpm, &mut catalog, REPORT);
     let top = explain(&mut bpm, &mut catalog, TOP);
     let every_customer = explain(&mut bpm, &mut catalog, EVERY_CUSTOMER);
+    let orders_of_one = explain(&mut bpm, &mut catalog, ORDERS_OF_ONE);
 
     assert!(
         by_key.contains("IndexScan: customers (index customers_id = 42)"),
@@ -200,6 +213,10 @@ fn explain_should_show_the_index_where_one_serves_and_a_hash_join_elsewhere() {
         "{report}"
     );
     assert!(top.contains("TopN:"), "{top}");
+    assert!(
+        orders_of_one.contains("IndexScan: customers AS c (index customers_id = 42)"),
+        "{orders_of_one}"
+    );
     // The index is on the left table, which a LEFT join cannot look up.
     assert!(
         every_customer.contains("HashJoin LEFT: c.id = o.customer_id"),

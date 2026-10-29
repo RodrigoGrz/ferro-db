@@ -1079,6 +1079,10 @@ mod tests {
                     planned += 1;
                     assert_columns_in_range(&plan, &sql);
                     assert_columns_read_their_names(&select, &plan, &sql);
+                    // Pushing the filters down moves them across joins: every column they read
+                    // must still be inside the row of the node they land on.
+                    let pushed = super::super::pushdown::push_down_filters(plan.clone());
+                    assert_columns_in_range(&pushed, &sql);
                 }
                 Err(err) => assert!(expected_errors.contains(&err.sqlstate()), "{sql}: {err}"),
             }

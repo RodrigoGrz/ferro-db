@@ -11,6 +11,8 @@ Dependencies point downward: `planner` → `sql`, `execution`, `catalog`, `table
 | `binder.rs` | AST expressions as executor expressions; the grouped mode above the groups of a query |
 | `select.rs` | `plan_select`: a `SELECT` as a `LogicalPlan`, clause by clause |
 | `logical_plan.rs` | `LogicalPlan`, `OutputColumn`, `ColumnName` |
+| `predicate.rs` | what the rewrite and the physical plan share about expressions: conjuncts, the side of a join an expression reads, rebasing onto the right row |
+| `pushdown.rs` | `push_down_filters`: each conjunct of a `WHERE` or an `ON` as far down as it may go |
 | `physical_plan.rs` | `plan_physical`: the executors of a logical plan, chosen by fixed rules, as a `PhysicalPlan` that becomes `Box<dyn Executor>` |
 | `explain.rs` | the text of `EXPLAIN`, for both plans |
 | `error.rs` | `PlannerError` |
@@ -21,6 +23,7 @@ Dependencies point downward: `planner` → `sql`, `execution`, `catalog`, `table
 - [Statements](#statements)
 - [Logical plan](#logical-plan)
 - [Planning a SELECT](#planning-a-select)
+- [Pushing filters down](#pushing-filters-down)
 - [Physical plan](#physical-plan)
 - [EXPLAIN](#explain)
 - [Errors](#errors)
@@ -173,9 +176,63 @@ Scan / Join → Filter (WHERE) → Aggregate → Filter (HAVING) → Sort → Li
 
 The `Sort` reads the rows before the `Project` so that `ORDER BY` reaches columns outside the list without hidden columns; an output column named by position or name is sorted by its expression, evaluated again. The `Limit` sits right above the `Sort`, where the physical plan turns the pair into a `TopN`.
 
+## Pushing filters down
+
+Before the translation, `plan_physical` rewrites the logical plan (`pushdown.rs`): each conjunct of a `WHERE` and of the `ON` of a join goes as far down as it may without changing the rows of the query. A filter right above a table can then use its index, rows are dropped before they are joined, and an equality between the two tables of an inner join becomes its condition, so a hash key: `FROM a, b WHERE a.x = b.y` is no longer a cross product. `EXPLAIN LOGICAL` shows the plan as written (decided with the author); `EXPLAIN` shows the effect.
+
+The conjuncts go down from the top in one pass. A `Filter` adds its conjuncts to those pending and disappears; at a `Scan` they become one `Filter` again, in order. Nothing goes below an `Aggregate`, a `Sort`, a `Limit` or a `Project`, whose rows are other rows: a conjunct pending there stays above it (the `HAVING` stays above the `Aggregate`), and the rewrite goes on inside. At a join, the side of each conjunct is what its columns read, the left input's width the border (the rule of the hash keys); a conjunct that goes right is rebased onto the right row:
+
+| Conjunct | `INNER` / `CROSS` | `LEFT` | `RIGHT` | `FULL` |
+|---|---|---|---|---|
+| of the `WHERE`, left only | down left | down left | stays above | stays above |
+| of the `WHERE`, right only | down right | stays above | down right | stays above |
+| of the `WHERE`, both sides | into the `ON` (a `CROSS` becomes `INNER`) | stays above | stays above | stays above |
+| of the `WHERE`, no column | stays above | stays above | stays above | stays above |
+| of the `ON`, left only | down left | stays in the `ON` | down left | stays in the `ON` |
+| of the `ON`, right only | down right | down right | stays in the `ON` | stays in the `ON` |
+| of the `ON`, both sides | stays in the `ON` | stays in the `ON` | stays in the `ON` | stays in the `ON` |
+
+- **The `WHERE` filters the joined rows**, padded ones included. Below the side a join keeps whole (the left of a `LEFT` join), it drops the same rows it would drop above. Below the padded side it would drop rows before they are padded, and the padded row would then come out where the `WHERE` above would have dropped it: `LEFT JOIN orders o ON … WHERE o.total > 10` keeps no customer without orders, while the filter on `orders` would let them all through, padded.
+- **The `ON` only chooses pairs.** On the padded side, a row it rejects matches nothing anyway, so it may go down. On the kept side, a row it rejects must still come out, padded, so it stays.
+- An `ON` left without conjuncts on an inner join is a cross product again (`Join CROSS`), its conditions now on the tables.
+
+```
+EXPLAIN LOGICAL SELECT 1 FROM users u LEFT JOIN orders o
+        ON o.user_id = u.id AND o.total > 10 AND u.name = 'a'
+        WHERE u.id > 1 AND o.id > 5
+
+Project: 1 AS "?column?"                                 (as written: one filter above the join)
+  Filter: (u.id > 1) AND (o.id > 5)
+    Join LEFT: ((o.user_id = u.id) AND (o.total > 10)) AND (u.name = 'a')
+      Scan: users AS u
+      Scan: orders AS o
+
+the logical plan after pushing down (no command prints it; the tests of pushdown.rs do):
+
+Project: 1 AS "?column?"
+  Filter: o.id > 5                                       (right of a LEFT join: stays above)
+    Join LEFT: (o.user_id = u.id) AND (u.name = 'a')     (left of the ON: stays, to pad)
+      Filter: u.id > 1                                   (left of the WHERE: down)
+        Scan: users AS u
+      Filter: o.total > 10                               (right of the ON: down)
+        Scan: orders AS o
+
+EXPLAIN of the same query, the physical plan made from it:
+
+Projection: 1 AS "?column?"
+  Filter: o.id > 5
+    HashJoin LEFT: u.id = o.user_id; filter: u.name = 'a'
+      Filter: u.id > 1
+        SeqScan: users AS u
+      Filter: o.total > 10
+        SeqScan: orders AS o
+```
+
+A filter that lands on the outer table of a join keeps the `IndexNestedLoopJoin` (the types of the outer columns are read through it). One that lands on the inner table makes it a `Filter` over a `Scan`, so the join becomes a `HashJoin` over that filtered table, read by an `IndexScan` when the filter is an equality on its index: better for `WHERE c.id = 42`, maybe worse for a filter that keeps most rows, which only costs could tell.
+
 ## Physical plan
 
-`plan_physical(plan, catalog)` (`physical_plan.rs`) turns the logical plan into a `PhysicalPlan`: the executors that will run it, as a tree that can be printed and compared, which `into_executor()` then builds into `Box<dyn Executor>`. There are no statistics yet, so the executors are chosen by **fixed rules**, each the better choice in almost every case (a hash table instead of trying every pair, an index descent instead of a scan for an equality, a bounded heap instead of a full sort):
+`plan_physical(plan, catalog)` (`physical_plan.rs`) pushes the filters down, then turns the logical plan into a `PhysicalPlan`: the executors that will run it, as a tree that can be printed and compared, which `into_executor()` then builds into `Box<dyn Executor>`. There are no statistics yet, so the executors are chosen by **fixed rules**, each the better choice in almost every case (a hash table instead of trying every pair, an index descent instead of a scan for an equality, a bounded heap instead of a full sort):
 
 | Logical | Physical |
 |---|---|
@@ -209,8 +266,8 @@ EXPLAIN SELECT c.name, o.total FROM orders o JOIN customers c ON c.id = o.custom
 
 Projection: c.name AS name, o.total AS total
   TopN: o.total DESC NULLS FIRST; 3
-    Filter: o.total > 10
-      IndexNestedLoopJoin INNER: c.id = o.customer_id (index customers_id ON customers AS c)
+    IndexNestedLoopJoin INNER: c.id = o.customer_id (index customers_id ON customers AS c)
+      Filter: o.total > 10
         SeqScan: orders AS o
 ```
 
@@ -282,6 +339,11 @@ Project: c.city AS city, count(*) AS orders, sum(o.total) AS sum
 - **The whole `Filter` kept above an `IndexScan`**, instead of removing the conjunct the index served: simpler and certainly the same rows, for one equality evaluated again per row found.
 - **`EXPLAIN` physical by default, `EXPLAIN LOGICAL` for the logical plan** (decided with the author): the default shows what runs.
 - **An index only for an equality with a literal** (decided with the author); ranges and computed constants wait for optimization.
+- **Pushing filters down in the planner** (`pushdown.rs`, decided with the author), not in a new `optimizer` layer: the logical plan and `run_sql` live here, and an optimizer layer waits for costs and statistics.
+- **`EXPLAIN LOGICAL` before the rewrite** (decided with the author): the plan of the query as written; `EXPLAIN` shows what the rewrite did.
+- **One pass from the top**, the conjuncts going down as pending, instead of rewriting until nothing moves: in a tree of joins one pass already takes each conjunct as low as it goes.
+- **Conjuncts without columns stay above the join**: `WHERE FALSE` gives the same rows anywhere, and above is simplest.
+- **The index join still needs a bare table on the right**: a filter pushed onto the inner table turns the join into a `HashJoin` over the filtered table (see [Pushing filters down](#pushing-filters-down)).
 - **`Rules` for the tests**, instead of an oracle written apart: the plan with every rule off uses the same executors, already tested, in the plainest way (`SeqScan`, `HashJoin` without keys, `Limit(Sort)`), so comparing both tests the rules and not the executors.
 - **`Rows` collects every row**: the result goes to a client that does not exist yet; streaming waits for the CLI and the protocol.
 - **No types in the plan:** inferring them is the Type System item; an expression of the wrong type fails when it runs.
@@ -302,16 +364,19 @@ Project: c.city AS city, count(*) AS orders, sum(o.total) AS sum
 - `binder.rs`: columns as positions (qualified, any case), an unknown column, a column of another table and a column in `VALUES`; integers at the limits of `INTEGER` and `BIGINT` with and without a sign, past `BIGINT` (`22003`); decimals and exponents as `DOUBLE PRECISION`, `1e400` (`22003`); strings, booleans, `NULL`, dates and timestamps, invalid dates (`22007`, `22008`); operators, `NOT`, signs, `CAST`; `IS` tests with `NULL`; `BETWEEN` at, inside and outside its bounds, reversed and with `NULL`, `NOT BETWEEN`; `IN` with and without `NULL` in the list or the value, `NOT IN`, a list of 1,000 values as a tree 12 nodes deep, the first failing value's error; aggregates (`42803`, naming the clause) and unknown functions (`42883`).
 - `logical_plan.rs`: the columns of a scan (by alias or table), a join, a filter, an aggregate (groups by name or text, aggregates by call), a projection and a limit.
 - `physical_plan.rs`: hand-built plans running as their executors (scans by table and by index, one row, a hash join with keys and filter, a cross product, an index join with its `NULL`-padded outer row, filter, aggregation, `TopN` equal to `Limit(Sort)`, projection) and their columns and text; `SELECT`s through `plan_physical` (filter, without `FROM`, grouping with `ORDER BY`, `ORDER BY … LIMIT`, `count(*)` of nothing, every join type); equalities between the two sides as keys either way round, with a filter, several; conjuncts that stay a filter (a constant, both sides on one side of `=`, `OR`, `<`, `TRUE`); keys in `LEFT`, `RIGHT` and `FULL` joins; the index join chosen for `INNER` and `LEFT` with the other keys and conjuncts in its filter and a `BIGINT` key, and not for `RIGHT`, `FULL`, an index on the left, a text or `DOUBLE PRECISION` key, a computed key or a join on the right; a key of another family failing `42883` with the rules and without; `TopN` for `ORDER BY … LIMIT`, `Limit(Sort)` for `OFFSET` alone, `Limit` without `ORDER BY`; the index scan for `id = 2`, `2 = id`, inside an `AND`, with an alias and with a `BIGINT` past the key, and not for `NULL`, text, `1.0`, `OR`, a computed column, a column without an index, `>` or a filter above a join; every rule off giving the plain plan; a predicate failing on a row the index skips (rows with the rules, `22012` without) and on keys computed over a join with an empty left input (`22012` with the rules, no rows without); empty tables on either side of `LEFT`, `RIGHT` and index joins, aggregates over nothing, `LIMIT 0` and an `OFFSET` past the rows, the same with the rules and without; text and `TIMESTAMP` indexes serving a text literal (also longer than the column) and a `DATE`.
-- `random_queries_should_give_the_rows_of_the_plain_plan`: five tables (unique indexes on two integer columns and a text one, `NULL`s and repeated values, a `DOUBLE PRECISION` and a `BIGINT` column, one table always empty) and 1,000 random `SELECT`s (joins of every type with equalities, extra conditions or none, rarely two kinds that fail; `WHERE` with indexed equalities; grouping; `ORDER BY` on every output column, with `LIMIT` and `OFFSET`); with the rules and without, the rows must be the same (the same sequence when ordered) or the SQLSTATE the same, and each rule, and the text index, must have been chosen at least 10 times.
+- `random_queries_should_give_the_rows_of_the_plain_plan`: five tables (unique indexes on two integer columns and a text one, `NULL`s and repeated values, a `DOUBLE PRECISION` and a `BIGINT` column, one table always empty) and 1,000 random `SELECT`s (joins of every type with equalities, extra conditions or none, rarely two kinds that fail; `WHERE` with indexed equalities; grouping; `ORDER BY` on every output column, with `LIMIT` and `OFFSET`); with the rules and without, the rows must be the same (the same sequence when ordered) or the SQLSTATE the same, and each rule, the text index and the rewrite must have been chosen at least 10 times. Only a query with the rare comparison between kinds that fail may fail in one plan and not the other, and only with that comparison's `42883`: the plans evaluate it on other rows.
+- `pushdown.rs`: a conjunct of one table going down to it, on either side, with the names right after rebasing; an equality between two tables becoming the `ON` (a comma join becoming an inner one); the conjuncts of one side of an inner `ON` going down, and an `ON` emptied back to a cross product; a conjunct crossing two joins and one reading the first and third tables stopping at the upper join; filters meeting on a table as one; a conjunct without columns staying above; every cell of `LEFT`, `RIGHT` and `FULL` for the `WHERE` and the `ON`; a conjunct stopping at a `LEFT` join inside an inner one; the anti-join `LEFT JOIN … WHERE o.id IS NULL` keeping its filter above the join; a right-only conjunct of a `LEFT` join's `ON` reaching a table inside the inner join on its right; a grouped query (the `WHERE` down, the `HAVING` above the `Aggregate`, `ORDER BY` and `LIMIT` as they were); a filter never going below a `Limit`; plans without a join to cross unchanged.
+- `predicate.rs`: the side of an expression (none, left, right, both, through `NOT` and `IS NULL`), rebasing every kind of expression, conjuncts of left- and right-deep `AND`s and their conjunction.
+- `physical_plan.rs`, with the rewrite: a `WHERE` on the indexed table of a join reaching its `IndexScan` (a `HashJoin` over the filtered table), an equality in a `WHERE` turning a cross product into a `HashJoin` with a key, a filter on the outer table keeping the `IndexNestedLoopJoin`, and a filter left above a `LEFT` join keeping the index join above it; the anti-join giving the user without orders and `SELECT 1 WHERE FALSE` no rows, with the rules and without; the plan without the rules keeping the `WHERE` above the join.
 - `key_bounds.rs` (execution): `converts_to_key` agreeing with the conversion of a bound for a value of every type against every key type.
 - `explain.rs`: a plan with every node indented under its reader; `OneRow` and names that need quotes; literals of every type; compound expressions in parentheses, negative numbers inside others, a position past the row (`#7`); every aggregate; every join type; limits with and without a count; aggregates with groups, aggregates or neither; sort keys.
 - `select.rs`: projections and output names; wildcards in the order of the tables; every join kind left to right, parenthesized joins; `WHERE` over a join; `SELECT` without `FROM`; unknown, ambiguous and duplicate names, `t.*` and `*` errors; an `ON` that reads a later table or one before a comma (`42P01`); aggregates in `WHERE` and `ON`; `GROUP BY` with `HAVING`; aggregates and `HAVING` without `GROUP BY`; group expressions inside others and qualified differently; repeated aggregates; every way a column falls outside the groups (list, `HAVING`, `*`, `t.*`, an expression); nested aggregates, aggregates in `GROUP BY`, wrong arguments; `ORDER BY` by position, alias and expression with explicit and default `NULLS`; the output name winning; ambiguous and out-of-range `ORDER BY`, an alias inside an expression; `ORDER BY` in grouped queries (an aggregate, one group, a column outside the groups); `LIMIT` and `OFFSET` above the sort, `OFFSET` alone; counts with a column or an aggregate; two output columns of the same expression under one name (repeated, qualified differently, through `*`) accepted by `ORDER BY`, two different ones through `*` ambiguous; positions with leading zeros, past `usize` and `0`; `GROUP BY 1` refused, `GROUP BY 1 + 0` and `1.5` as expressions; `HAVING` not seeing output names (`42703`); a group expression matching only with the same literal types (`id + 1.0` against `GROUP BY id + 1` is `42803`); the `EXPLAIN` of 190 nested signs, a 190-operator group expression and 199 joins on a 2 MB stack.
-- `random_selects_should_plan_with_every_column_in_range`: 2,000 random `SELECT`s over three tables (aliases, every join kind, aggregates, `GROUP BY`, `HAVING`, `ORDER BY` by position, alias and expression, `LIMIT`, sometimes a wrong name); a plan that comes out must have every column of every node inside the row it reads, and each item written as a column must read the input column of that name and table; an error must have one of the planner's SQLSTATEs; more than 400 of them plan.
+- `random_selects_should_plan_with_every_column_in_range`: 2,000 random `SELECT`s over three tables (aliases, every join kind, aggregates, `GROUP BY`, `HAVING`, `ORDER BY` by position, alias and expression, `LIMIT`, sometimes a wrong name); a plan that comes out must have every column of every node inside the row it reads, and each item written as a column must read the input column of that name and table; an error must have one of the planner's SQLSTATEs; more than 400 of them plan; and once the filters are pushed down, every column must still be inside the row it reads.
 - `run.rs`: `CREATE TABLE` (the schema in the catalog), an existing table and a repeated column with nothing created; `CREATE UNIQUE INDEX` over rows already there, a column with repeated values (`23505`), unknown table and column, an existing name, `CREATE INDEX` (`0A000`); a syntax error running nothing; `SELECT` giving its column names and rows (also aggregates over an empty table), a `SELECT` failing while it runs (`42883`, as `Execution`); `EXPLAIN` and `EXPLAIN LOGICAL` among other statements, and of an invalid query; `INSERT` with and without a column list; every failing `INSERT` (`23502`, `42804`, `22001`, `23505`, `42601` both ways, `42701`, `42703`, `42P01`, a column in `VALUES`, `42803`, `22012`) leaving the table and the index as they were; aggregates refused naming `VALUES`, `SET` and `WHERE`; `UPDATE` of some rows, all rows and the indexed key; every failing `UPDATE` (`42601`, `42703`, `23502`, `23505`, `42P01`, a non-boolean `WHERE`, an unknown table) changing nothing; `DELETE` with a `WHERE` and without; a `DELETE … IN` of 100,000 values on a 2 MB stack; every column type taking its literals (`BIGINT` at its maximum, `SMALLINT` at its minimum, an `INTEGER` literal widened to `SMALLINT`, `BIGINT` and `DOUBLE PRECISION`, `BOOLEAN`, `DATE`, `TIMESTAMP`) and refusing others (`22003`, `22001`, `42804` for a decimal in `BIGINT` and a string in `DATE`); a write executor without its count (`XX000`); several statements running in order and stopping at the first failure.
 - `random_statements_should_keep_the_table_like_a_model`: 400 random statements on `(id INTEGER NOT NULL, v INTEGER, s VARCHAR(10))` with a unique index on `id`: multi-row inserts (some with a repeated or `NULL` id), `UPDATE … SET v = v + k WHERE id BETWEEN a AND b`, `UPDATE … SET id = id + k` over a range, `DELETE … WHERE id IN (…)` or `v IS NULL`; a `BTreeMap` model predicts each outcome or SQLSTATE (`23502`, `23505`), and after every statement the table and the index must match it.
-- Mutations checked by hand, each caught: `BETWEEN` with `>` instead of `>=` (by the random test, which showed the unit test lacked the bounds themselves; they were added); `IN` as a chain of `OR`s again (by the depth test); the output name losing to an input column in `ORDER BY`; repeated aggregates not reused; in the physical plan, the right side of a key not rebased, an index join for `RIGHT`, an index scan without the type check and a `TopN` dropping its `OFFSET` (each by the random comparison with the plain plan); the right side of a join not shifted (by the scope tests and, after it was strengthened to check the names columns read, by the random `SELECT` test, which at first only checked the positions were in range). An `ON` that sees a later table cannot be written as a mutation: the `ON` is bound inside the recursion over the `FROM`, before the later tables exist.
+- Mutations checked by hand, each caught: `BETWEEN` with `>` instead of `>=` (by the random test, which showed the unit test lacked the bounds themselves; they were added); `IN` as a chain of `OR`s again (by the depth test); the output name losing to an input column in `ORDER BY`; repeated aggregates not reused; in the physical plan, the right side of a key not rebased, an index join for `RIGHT`, an index scan without the type check and a `TopN` dropping its `OFFSET` (each by the random comparison with the plain plan); the right side of a join not shifted (by the scope tests and, after it was strengthened to check the names columns read, by the random `SELECT` test, which at first only checked the positions were in range). An `ON` that sees a later table cannot be written as a mutation: the `ON` is bound inside the recursion over the `FROM`, before the later tables exist. Pushing filters down: a `WHERE` conjunct on the right going down a `LEFT` join, an `ON` conjunct on the left going down a `LEFT` join (both also by the random comparison), the right side not rebased, a filter going below a `Limit`. Running the binary showed what no test did: a filter pushed onto the outer table dropped the `IndexNestedLoopJoin`, since the types of its columns were not read through the filter (the rows were the same, so the comparison could not see it); a test now fixes that plan.
 - Integration in [`tests/planner_statements.rs`](../tests/planner_statements.rs), with 8 KB pages and an 8-frame pool: SQL creates a table and a unique index, inserts 3,000 rows in 30 statements, updates half of them and deletes a range; after reopening, a `SeqScan` and the index give the expected rows; keys moved by `UPDATE … SET id = id + 10000` survive reopening in the index; a failure in the middle of a script keeps the statements before it.
-- Integration in [`tests/planner_physical.rs`](../tests/planner_physical.rs), with an 8-frame pool: SQL creates 300 customers with an index and 1,000 orders without one; a lookup by key, a grouped report over an index join, a top 5 and a `LEFT JOIN` count give the rows computed in the test, before and after reopening; `EXPLAIN` shows the `IndexScan`, the `IndexNestedLoopJoin`, the `TopN` and a `HashJoin` where the index is on the left; a script's `SELECT`s see the `DELETE` and the `UPDATE` before them.
+- Integration in [`tests/planner_physical.rs`](../tests/planner_physical.rs), with an 8-frame pool: SQL creates 300 customers with an index and 1,000 orders without one; a lookup by key, a grouped report over an index join, a top 5 and a `LEFT JOIN` count give the rows computed in the test, before and after reopening; `EXPLAIN` shows the `IndexScan`, the `IndexNestedLoopJoin`, the `TopN` and a `HashJoin` where the index is on the left; a script's `SELECT`s see the `DELETE` and the `UPDATE` before them; a `WHERE` on the indexed table of a join gives its rows through an `IndexScan` inside the join, before and after reopening.
 - Integration in [`tests/planner_select.rs`](../tests/planner_select.rs): the `EXPLAIN LOGICAL` of a report (a `LEFT JOIN`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` by position and column, `LIMIT`) gives the same plan after reopening the database; a script mixes DDL, DML and `EXPLAIN` in order; an invalid query (`42803`, `42702`) stops its script and the next statements still run.
 
 ## Limitations
@@ -321,7 +386,7 @@ Project: c.city AS city, count(*) AS orders, sum(o.total) AS sum
 - **No `SELECT DISTINCT`, subqueries, set operations, `CASE`, `LIKE`, `JOIN … USING` or `NATURAL JOIN`** (the parser does not read them).
 - **No functional dependencies:** with a primary key, `SELECT * … GROUP BY pk` would be valid; here every column must be grouped.
 - **`GROUP BY` only by expressions over the input**, not by output name or position (a bare integer is refused).
-- **No optimization:** filters stay above joins (so a `WHERE` on a joined table does not use its index), joins run in the order written, an index serves only an equality with a literal on one table and an index join only the right table of an `INNER` or `LEFT` join; nothing is chosen by cost.
+- **Rule-based optimization only:** a filter goes down to its table, but a `LEFT` join is never turned into an inner one when its `WHERE` rejects the padded rows, the `HAVING` never goes below the `Aggregate`, no condition is derived from others, joins run in the order written, an index serves only an equality with a literal on one table and an index join only the right table of an `INNER` or `LEFT` join; nothing is chosen by cost.
 - **No `PRIMARY KEY`, `UNIQUE` columns, `DEFAULT`, `CHECK` or foreign keys**; no `DROP TABLE` or `ALTER TABLE`.
 - **Indexes are unique and of one column**, created only with `CREATE UNIQUE INDEX`.
 - **No transactions:** a script that fails midway keeps the statements before the failure.

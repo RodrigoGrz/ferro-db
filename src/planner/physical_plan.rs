@@ -15,6 +15,8 @@ use super::PlannerError;
 use super::logical_plan::{
     ColumnName, LogicalPlan, OutputColumn, aggregate_columns, output_names, table_columns,
 };
+use super::predicate::{Side, conjunct_refs, conjunction, conjuncts, rebased, side};
+use super::pushdown::push_down_filters;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalPlan {
@@ -215,11 +217,13 @@ pub fn plan_physical(plan: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPla
     plan_physical_with(plan, catalog, Rules::ALL)
 }
 
-/// Which rules apply. With none, every table is read by a `SeqScan`, every join tries every
-/// pair with the whole `ON` as its filter, and `ORDER BY … LIMIT` sorts everything: the plain
-/// plan the random test compares the rules against.
+/// Which rules apply. With none, the filters stay where the query wrote them, every table is
+/// read by a `SeqScan`, every join tries every pair with the whole `ON` as its filter, and
+/// `ORDER BY … LIMIT` sorts everything: the plain plan the random test compares the rules
+/// against.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Rules {
+    pub(super) pushdown: bool,
     pub(super) join_keys: bool,
     pub(super) index_joins: bool,
     pub(super) index_scans: bool,
@@ -228,6 +232,7 @@ pub(super) struct Rules {
 
 impl Rules {
     pub(super) const ALL: Rules = Rules {
+        pushdown: true,
         join_keys: true,
         index_joins: true,
         index_scans: true,
@@ -235,6 +240,7 @@ impl Rules {
     };
     #[cfg(test)]
     pub(super) const NONE: Rules = Rules {
+        pushdown: false,
         join_keys: false,
         index_joins: false,
         index_scans: false,
@@ -242,11 +248,17 @@ impl Rules {
     };
 }
 
+/// The physical plan of `plan` under `rules`: first the filters pushed down, so that the rules
+/// of the translation find them on the tables and in the `ON`s.
 pub(super) fn plan_physical_with(
     plan: LogicalPlan,
     catalog: &Catalog,
     rules: Rules,
 ) -> Result<PhysicalPlan, PlannerError> {
+    let plan = match rules.pushdown {
+        true => push_down_filters(plan),
+        false => plan,
+    };
     Planner { catalog, rules }.plan(plan)
 }
 
@@ -487,10 +499,12 @@ impl Planner<'_> {
         Ok(None)
     }
 
-    /// The types of the columns of a `FROM`, from the tables of its scans; `None` for anything
-    /// else, which has no types until there is a type system.
+    /// The types of the columns of a `FROM`, from the tables of its scans, through the filters
+    /// pushed down onto them (a filter keeps its input's columns); `None` for anything else,
+    /// which has no types until there is a type system.
     fn column_types(&self, plan: &LogicalPlan) -> Result<Option<Vec<DataType>>, PlannerError> {
         Ok(match plan {
+            LogicalPlan::Filter { input, .. } => self.column_types(input)?,
             LogicalPlan::Scan { table, .. } => Some(
                 self.catalog
                     .table(table)?
@@ -570,119 +584,6 @@ fn join_key(conjunct: &Expr, left_width: usize) -> Option<JoinKey> {
         right: rebased(right, left_width),
         equality: conjunct.clone(),
     })
-}
-
-/// Which side of a join the columns of an expression come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Neither,
-    Left,
-    Right,
-    Both,
-}
-
-fn side(expr: &Expr, left_width: usize) -> Side {
-    let mut positions = Vec::new();
-    columns_read(expr, &mut positions);
-    let reads_left = positions.iter().any(|position| *position < left_width);
-    let reads_right = positions.iter().any(|position| *position >= left_width);
-    match (reads_left, reads_right) {
-        (false, false) => Side::Neither,
-        (true, false) => Side::Left,
-        (false, true) => Side::Right,
-        (true, true) => Side::Both,
-    }
-}
-
-fn columns_read(expr: &Expr, positions: &mut Vec<usize>) {
-    match expr {
-        Expr::Column(position) => positions.push(*position),
-        Expr::Literal(_) => {}
-        Expr::Binary { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
-            columns_read(left, positions);
-            columns_read(right, positions);
-        }
-        Expr::Not(expr)
-        | Expr::Negate(expr)
-        | Expr::IsNull { expr, .. }
-        | Expr::Test { expr, .. }
-        | Expr::Cast { expr, .. } => columns_read(expr, positions),
-    }
-}
-
-/// `expr` with every column moved `by` positions to the left: from the joined row to the right
-/// row of a join.
-fn rebased(expr: &Expr, by: usize) -> Expr {
-    let rebase = |expr: &Expr| Box::new(rebased(expr, by));
-    match expr {
-        Expr::Column(position) => Expr::Column(position.saturating_sub(by)),
-        Expr::Literal(value) => Expr::Literal(value.clone()),
-        Expr::Binary { op, left, right } => Expr::Binary {
-            op: *op,
-            left: rebase(left),
-            right: rebase(right),
-        },
-        Expr::Not(expr) => Expr::Not(rebase(expr)),
-        Expr::Negate(expr) => Expr::Negate(rebase(expr)),
-        Expr::IsNull { expr, negated } => Expr::IsNull {
-            expr: rebase(expr),
-            negated: *negated,
-        },
-        Expr::Test {
-            expr,
-            test,
-            negated,
-        } => Expr::Test {
-            expr: rebase(expr),
-            test: *test,
-            negated: *negated,
-        },
-        Expr::IsDistinctFrom {
-            left,
-            right,
-            negated,
-        } => Expr::IsDistinctFrom {
-            left: rebase(left),
-            right: rebase(right),
-            negated: *negated,
-        },
-        Expr::Cast { expr, to } => Expr::Cast {
-            expr: rebase(expr),
-            to: *to,
-        },
-    }
-}
-
-/// The operands of the `AND`s at the top of `expr`, borrowed, to look at them without copying a
-/// predicate that may be large (an `IN` of many values).
-fn conjunct_refs(expr: &Expr) -> Vec<&Expr> {
-    match expr {
-        Expr::Binary {
-            op: BinaryOp::And,
-            left,
-            right,
-        } => [conjunct_refs(left), conjunct_refs(right)].concat(),
-        other => vec![other],
-    }
-}
-
-/// The operands of the `AND`s at the top of `expr`.
-fn conjuncts(expr: Expr) -> Vec<Expr> {
-    match expr {
-        Expr::Binary {
-            op: BinaryOp::And,
-            left,
-            right,
-        } => [conjuncts(*left), conjuncts(*right)].concat(),
-        other => vec![other],
-    }
-}
-
-/// The conjuncts joined by `AND` again, or nothing for none.
-fn conjunction(conjuncts: Vec<Expr>) -> Option<Expr> {
-    conjuncts
-        .into_iter()
-        .reduce(|all, next| Expr::binary(BinaryOp::And, all, next))
 }
 
 /// The column and the literal of `column = literal`, written either way round.
@@ -1185,8 +1086,13 @@ mod tests {
         assert_eq!(join("o.user_id = u.id"), "HashJoin INNER: u.id = o.user_id");
         assert_eq!(join("u.id = o.user_id"), "HashJoin INNER: u.id = o.user_id");
         assert_eq!(
+            join("o.user_id = u.id AND o.total > u.id"),
+            "HashJoin INNER: u.id = o.user_id; filter: o.total > u.id"
+        );
+        // A condition on one table goes down to it instead (see pushdown.rs).
+        assert_eq!(
             join("o.user_id = u.id AND o.total > 10"),
-            "HashJoin INNER: u.id = o.user_id; filter: o.total > 10"
+            "HashJoin INNER: u.id = o.user_id"
         );
         assert_eq!(
             join("o.user_id = u.id AND u.id + 0 = o.id - 10"),
@@ -1205,7 +1111,8 @@ mod tests {
             )
         };
 
-        assert_eq!(join("u.id = 1"), "HashJoin INNER: filter: u.id = 1");
+        // A condition on one table leaves the join for the table: the join is a cross product.
+        assert_eq!(join("u.id = 1"), "HashJoin CROSS");
         assert_eq!(
             join("u.id + o.user_id = 2"),
             "HashJoin INNER: filter: (u.id + o.user_id) = 2"
@@ -1266,9 +1173,9 @@ mod tests {
             "IndexNestedLoopJoin INNER: u.id = o.user_id (index users_id ON users AS u)"
         );
         assert_eq!(
-            join("LEFT", "u.id = o.user_id AND u.name = 'ana'"),
+            join("LEFT", "u.id = o.user_id AND u.id < o.total"),
             "IndexNestedLoopJoin LEFT: u.id = o.user_id (index users_id ON users AS u); \
-             filter: u.name = 'ana'"
+             filter: u.id < o.total"
         );
         assert_eq!(
             join("", "o.id = u.id + 9 AND o.user_id = u.id"),
@@ -1421,8 +1328,8 @@ mod tests {
             "SELECT 1 FROM users WHERE id + 0 = 1",
             "SELECT 1 FROM users WHERE name = 'ana'",
             "SELECT 1 FROM users WHERE id > 1",
-            // The filter of a join is above the join, not on a table.
-            "SELECT 1 FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id = 1",
+            // A LEFT join pads its right rows: the WHERE stays above it, off the table.
+            "SELECT 1 FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE u.id = 1",
         ];
 
         for sql in cases {
@@ -1566,6 +1473,9 @@ mod tests {
     struct QueryGen {
         rng: Rng,
         tables: Vec<Table>,
+        /// The query compares two kinds, which fails on the rows it is evaluated on: then one
+        /// plan may fail where the other does not, since they evaluate it on other rows.
+        has_failing_comparison: bool,
     }
 
     impl QueryGen {
@@ -1646,7 +1556,10 @@ mod tests {
                 Kind::Text => Kind::Number,
             };
             let left_kind = match self.rng.chance(25) {
-                true => other_kind,
+                true => {
+                    self.has_failing_comparison = true;
+                    other_kind
+                }
                 false => kind,
             };
             let Some(left_column) = self.column(Some(left_kind)) else {
@@ -1666,6 +1579,7 @@ mod tests {
 
         /// The text of a query, and whether its `ORDER BY` fixes the order of every row.
         fn select(&mut self) -> (String, bool) {
+            self.has_failing_comparison = false;
             let mut order: Vec<Table> = TABLES.to_vec();
             for index in (1..order.len()).rev() {
                 order.swap(index, self.rng.below(index + 1));
@@ -1753,12 +1667,16 @@ mod tests {
         let mut queries = QueryGen {
             rng,
             tables: Vec::new(),
+            has_failing_comparison: false,
         };
         let mut used = std::collections::BTreeMap::<&str, usize>::new();
 
         for _ in 0..1_000 {
             let (sql, is_ordered) = queries.select();
             let logical = logical(&db, &sql);
+            if push_down_filters(logical.clone()) != logical {
+                *used.entry("pushdown").or_default() += 1;
+            }
             let chosen = plan_physical_with(logical.clone(), &db.catalog, Rules::ALL).unwrap();
             let plain = plan_physical_with(logical, &db.catalog, Rules::NONE).unwrap();
             let text = chosen.to_string();
@@ -1785,6 +1703,10 @@ mod tests {
                     assert_eq!(with_rules, without, "{sql}\n{text}");
                 }
                 (Err(with_rules), Err(without)) => assert_eq!(with_rules, without, "{sql}"),
+                // An expression that fails on some rows fails in the plan that evaluates it on
+                // them (documented); every other query must give the same outcome.
+                (Ok(_), Err("42883")) | (Err("42883"), Ok(_)) if queries.has_failing_comparison => {
+                }
                 (with_rules, without) => {
                     panic!("{sql}\n{text}\nwith the rules {with_rules:?}\nwithout {without:?}")
                 }
@@ -1797,6 +1719,7 @@ mod tests {
             "TopN",
             "HashJoin keys",
             "index d_code",
+            "pushdown",
         ] {
             assert!(used.get(node).copied().unwrap_or(0) >= 10, "{used:?}");
         }
@@ -1918,5 +1841,131 @@ mod tests {
             assert!(line.contains(&format!("index {index} =")), "{sql}: {line}");
             assert_eq!(outcomes, [Ok(expected.clone()), Ok(expected)], "{sql}");
         }
+    }
+
+    #[test]
+    fn a_where_on_a_joined_table_should_reach_its_index() {
+        let mut db = db();
+        let sql = "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.id = 2";
+
+        let plan = physical(&db, sql);
+        let text = plan.to_string();
+        let found = rows(&mut db, plan);
+
+        assert!(
+            text.contains("IndexScan: users AS u (index users_id = 2)"),
+            "{text}"
+        );
+        // The inner table is filtered now: the join hashes its one row instead of looking the
+        // index up once per order.
+        assert!(text.contains("HashJoin INNER: o.user_id = u.id"), "{text}");
+        assert_eq!(found, [vec![Value::Integer(12)]]);
+    }
+
+    #[test]
+    fn an_equality_in_the_where_should_turn_a_cross_product_into_a_hash_join() {
+        let mut db = db();
+        let sql = "SELECT count(*) FROM users u, orders o WHERE o.user_id = u.id";
+
+        let plan = physical(&db, sql);
+        let text = plan.to_string();
+        let found = rows(&mut db, plan);
+
+        assert!(text.contains("HashJoin INNER: u.id = o.user_id"), "{text}");
+        assert!(!text.contains("CROSS"), "{text}");
+        assert_eq!(found, [vec![Value::BigInt(3)]]);
+    }
+
+    #[test]
+    fn without_the_rules_the_where_should_stay_above_the_join() {
+        let db = db();
+        let sql = "SELECT count(*) FROM users u, orders o WHERE o.user_id = u.id";
+
+        let plain = plan_physical_with(logical(&db, sql), &db.catalog, Rules::NONE).unwrap();
+
+        assert_eq!(
+            plan_nodes(&plain),
+            [
+                "Projection",
+                "Aggregation",
+                "Filter",
+                "HashJoin",
+                "SeqScan",
+                "SeqScan"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_filter_pushed_onto_the_outer_table_should_keep_the_index_join() {
+        let mut db = db();
+        let sql = "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE o.total > 30";
+
+        let plan = physical(&db, sql);
+        let text = plan.to_string();
+        let mut found = rows(&mut db, plan);
+        sort_rows(&mut found);
+
+        assert_eq!(
+            text,
+            "Projection: o.id AS id\n\
+             \x20 IndexNestedLoopJoin INNER: u.id = o.user_id (index users_id ON users AS u)\n\
+             \x20   Filter: o.total > 30\n\
+             \x20     SeqScan: orders AS o"
+        );
+        assert_eq!(found, [vec![Value::Integer(10)], vec![Value::Integer(11)]]);
+    }
+
+    #[test]
+    fn an_anti_join_should_give_the_rows_without_a_match() {
+        let mut db = db();
+
+        let outcomes = with_and_without_rules(
+            &mut db,
+            "SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id WHERE o.id IS NULL",
+        );
+
+        assert_eq!(
+            outcomes,
+            [
+                Ok(vec![vec![Value::Integer(3)]]),
+                Ok(vec![vec![Value::Integer(3)]])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_filter_above_an_outer_join_should_keep_the_index_join_above_it() {
+        let mut db = db();
+        let sql = "SELECT t.label FROM orders o LEFT JOIN tags t ON t.user_id = o.user_id \
+                   JOIN users u ON u.id = o.user_id WHERE t.label IS NULL";
+
+        let text = physical(&db, sql).to_string();
+        let outcomes = with_and_without_rules(&mut db, sql);
+
+        // The WHERE stays above the LEFT join (it reads its padded side), and the index join
+        // above still reads the types of its outer columns through that filter.
+        assert_eq!(
+            text,
+            "Projection: t.label AS label\n\
+             \x20 IndexNestedLoopJoin INNER: u.id = o.user_id (index users_id ON users AS u)\n\
+             \x20   Filter: t.label IS NULL\n\
+             \x20     HashJoin LEFT: o.user_id = t.user_id\n\
+             \x20       SeqScan: orders AS o\n\
+             \x20       SeqScan: tags AS t"
+        );
+        assert_eq!(
+            outcomes,
+            [Ok(vec![vec![Value::Null]]), Ok(vec![vec![Value::Null]])]
+        );
+    }
+
+    #[test]
+    fn a_select_without_from_should_keep_its_filter() {
+        let mut db = db();
+
+        let outcomes = with_and_without_rules(&mut db, "SELECT 1 WHERE FALSE");
+
+        assert_eq!(outcomes, [Ok(Vec::new()), Ok(Vec::new())]);
     }
 }

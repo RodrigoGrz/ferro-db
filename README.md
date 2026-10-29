@@ -13,7 +13,7 @@ ferroDB exists so I can understand how a relational database works by implementi
 
 It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not production-ready**.
 
-**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,391 tests). Tables and unique indexes are created, rows inserted, updated and deleted, and queries run, all with SQL, from the `ferro-db` command-line client or `run_sql`: a `SELECT` is validated, planned and run by executors chosen by fixed rules, and `EXPLAIN` shows the plan. See the [roadmap](ROADMAP.md) for the full checklist.
+**Current status:** the storage engine, a typed table layer, a persistent catalog, a B+Tree index, query executors and an SQL layer work and are tested (1,416 tests). Tables and unique indexes are created, rows inserted, updated and deleted, and queries run, all with SQL, from the `ferro-db` command-line client or `run_sql`: a `SELECT` is validated, planned and run by executors chosen by fixed rules, and `EXPLAIN` shows the plan. See the [roadmap](ROADMAP.md) for the full checklist.
 
 ## What works today
 
@@ -38,7 +38,7 @@ It is **not** meant to compete with PostgreSQL, MySQL or SQLite, and it is **not
 
 **Partially there:**
 
-- Plans are chosen by fixed rules, without statistics or costs: an index serves only an equality with a literal on one table and the right table of an index join, filters stay above joins, and joins run in the order written.
+- Plans are chosen by fixed rules, without statistics or costs: an index serves only an equality with a literal on a table and the right table of an index join; filters go down to their tables, but joins run in the order written.
 - A query's rows are collected in memory and returned all at once; there is no client to stream them to yet.
 - Every page reserves an LSN for write-ahead logging, but there is no WAL yet.
 
@@ -117,8 +117,8 @@ ferro->   GROUP BY c.name ORDER BY spent DESC;
 
 ferro=> EXPLAIN SELECT c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.total > 30;
 Projection: c.name AS name
-  Filter: o.total > 30
-    IndexNestedLoopJoin INNER: c.id = o.customer_id (index customers_id ON customers AS c)
+  IndexNestedLoopJoin INNER: c.id = o.customer_id (index customers_id ON customers AS c)
+    Filter: o.total > 30
       SeqScan: orders AS o
 
 ferro=> \d customers
@@ -142,7 +142,7 @@ Without a terminal it reads a script instead, without prompts: `cargo run -- sho
 ## Testing
 
 ```sh
-cargo test --all-targets   # 1,283 unit tests + 108 integration tests
+cargo test --all-targets   # 1,308 unit tests + 108 integration tests
 ```
 
 The suite is the main way the implementation is verified:

@@ -113,7 +113,8 @@ Logical and physical plans are tracked under [Query Planning](#query-planning).
 - [ ] Cost Model
 - [ ] Statistics
 - [ ] Cardinality Estimation
-- [ ] Index Selection. A fixed rule already reads an index for `column = literal` in the `WHERE` of one table, and an index join uses the right table's index; ranges, filters above joins and choosing between indexes wait for costs.
+- [x] Predicate Pushdown: each conjunct of a `WHERE` or an `ON` goes down to the table it reads, or into the `ON` of the inner join whose tables it compares, never down the padded side of an outer join nor below an `Aggregate`, `Sort`, `Limit` or `Project` ([`pushdown.rs`](src/planner/pushdown.rs), [`physical_plan.rs`](src/planner/physical_plan.rs), [`tests/planner_physical.rs`](tests/planner_physical.rs), [docs](docs/planner.md#pushing-filters-down))
+- [ ] Index Selection. A fixed rule reads an index for `column = literal` in a filter on a table (pushed down from the `WHERE` of a join too), and an index join uses the right table's index; ranges and choosing between indexes wait for costs.
 - [ ] Join Ordering
 
 ## Constraints
